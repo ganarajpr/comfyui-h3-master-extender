@@ -1,31 +1,45 @@
-# ComfyUI MiniMax H3 Master Extender
+# comfyui-h3-master-extender
 
-Multi-clip MiniMax H3 video generation with two-pass HyperFlow 8-step (or Turbo LoRA) acceleration, learned latent upscaling, motion and audio continuity, clip validation, and project save/load.
+Multi-clip MiniMax H3 video generation for ComfyUI. It runs a two-pass render (HyperFlow 8-step or Turbo LoRA draft, learned 3D latent upscale, refine pass), carries motion and audio continuity from clip to clip, and adds clip validation, project save/load, a built-in prompt rewriter and two story engines that plan a whole film from a story.
 
-Custom build prepared with assistance from Astra 6. This is a community integration, not an official MiniMax or ComfyUI release. Original project authors are credited below.
+This is a community integration, not an official MiniMax or ComfyUI release.
 
+## Origin
 
-<img width="2047" height="1216" alt="Screenshot 2026-09-11 020707" src="https://github.com/user-attachments/assets/95bce67e-3703-4238-874d-0e763f0d83d7" />
+This repository started as a fork of [only2uuuu-hub/ComfyUI-MiniMax-H3-Master-Extender-Custom-built-with-Astra-6-](https://github.com/only2uuuu-hub/ComfyUI-MiniMax-H3-Master-Extender-Custom-built-with-Astra-6-), the "Custom built with Astra 6" Master Extender published on 2026-09-11. Thank you to only2uuuu-hub for that build: the two-pass Master Extender node, the Final Decode node, the blank workflow and the installation guide all come from it. Its three commits (`9219cce`, `086b4a4`, `e72acce`) are the base of this repository's history.
 
+Since then the code has diverged a long way (about 150 commits), so on 2026-10-23 the repository was detached from the fork network and renamed `comfyui-h3-master-extender`. The node names, the node folder name and saved workflows are unchanged. The original build itself adapted earlier projects; everyone is credited under [Credits and license](#credits-and-license).
 
 ## Features
 
-- Master Extender: draft generation, 3D latent upscale, and a second refinement pass.
-- Clip-by-clip review or full-batch generation, with per-clip prompts, seeds, and LoRAs.
-- Up to nine reference pictures and motion continuity between clips.
-- Project save/load, cached previews, and final video with audio.
-- Final Decode with automatic H.264 NVENC when available and CPU encoding fallback.
+- **Two-pass render:** a draft pass, a learned 3D latent upscale and a refine pass. HyperFlow 8-step is the default draft engine, with Turbo LoRA as the alternative. A panel preset dropdown fills the engine settings in one click.
+- **Clips:** clip-by-clip review or full-batch generation, with per-clip prompts, seeds, durations (5-30 s) and LoRAs. Clips can be validated, re-rolled or rewritten, and every render and cache state shows on the clip card.
+- **References:** up to nine reference pictures, plus video and audio references. A clip can use a subset of the pictures (per-clip refs).
+- **Continuity:** motion context between clips, run in RAM, and continuation seams decoded from the tail of the previous clip.
+- **Caching:** a per-project disk cache. A pass-1 cache survives pass-2 changes, so changing the output size, the refiner or the decode does not re-render the draft. There is also a pass-1-only mode for fast drafts.
+- **Prompt rewriter:** a built-in rewriter on a local model that sees the reference pictures. It has a story planner (`auto_clips`) and continuity between clips.
+- **Story engines:** `builder`, or the frozen E4.10 / E4.11 story-to-film engines, which plan the film, bind your pictures to its characters and write every clip's final prompt.
+- **H3 Story Writer node:** turns a short brief into a story with exactly N beats for the story engine.
+- **Decoding:** Final Decode encodes with H.264 NVENC when available and falls back to the CPU. An optional X2 Detail VAE decodes at 2x the refine size.
+- **Prompt From Video node:** reads the clip prompts back out of a rendered MP4 or PNG.
+- **Speed and memory:** sparse attention (SLA / sol-attn / VSA) with per-pass settings, and VRAM released between passes and clips.
 
-The included workflow is deliberately blank: one empty prompt, no reference images, no validated clips, and no saved project content. No model weights, generated media, or cache files are included.
+The included workflows contain no prompts, references or saved project content beyond small samples. No model weights, generated media or cache files are included.
 
 ## Installation
 
-1. Use a ComfyUI installation with native MiniMax H3 support. This package was prepared against **ComfyUI 0.34.5**, core commit `7fd919f0caff66a52289ea5b19cb6eaca0da04ef`. That is a source compatibility reference, not a claim of testing on every hardware configuration.
+1. Use a ComfyUI installation with native MiniMax H3 support. The original build was prepared against **ComfyUI 0.34.5** (core commit `7fd919f0caff66a52289ea5b19cb6eaca0da04ef`). Current development runs on a ComfyUI master build from late September 2026. Neither is a claim of testing on every hardware configuration.
 2. Open a terminal in `ComfyUI/custom_nodes` and run:
 
    ```sh
-   git clone https://github.com/only2uuuu-hub/ComfyUI-MiniMax-H3-Master-Extender-Custom-built-with-Astra-6-.git ComfyUI_MiniMax_H3_Master_Extender
-   git clone https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler.git
+   git clone https://github.com/ganarajpr/comfyui-h3-master-extender.git ComfyUI_MiniMax_H3_Master_Extender
+   git clone https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler.git
+   ```
+
+   Keep the folder name `ComfyUI_MiniMax_H3_Master_Extender`. If you installed from the old fork URL, point the existing checkout at this repository instead of cloning a second copy:
+
+   ```sh
+   git -C ComfyUI_MiniMax_H3_Master_Extender remote set-url origin https://github.com/ganarajpr/comfyui-h3-master-extender.git
    ```
 
    Alternatively, extract this project's ZIP into `ComfyUI/custom_nodes/ComfyUI_MiniMax_H3_Master_Extender`. The `__init__.py` file must be directly inside that folder. Install the dependency repository separately; it is not bundled. If already installed, update the existing copies instead of installing duplicates.
@@ -55,12 +69,24 @@ The included workflow is deliberately blank: one empty prompt, no reference imag
    - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_Action.json` — the locked action preset: HyperFlow 8-step (pruned file, curve refit on, LoRA mode bypass) with an empty LoRA stack (any LoRA disables the curve fit), SLA 0.9, and the taomate 3-step LoRA replacing the engine LoRA on pass 2. Base model: Singularity v1.3 int8.
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Builder.json` — the HyperFlow action preset set up for building a story clip by clip: built-in rewriter on `pending clips`, continuity `final prompts` (clip N continues from clip N-1's final rewritten prompt, written one after another) and a sample `rewrite_story` (the whole film's story; each clip's writer uses it only to pick that clip's beat). Two clips, the second saying "Continue the story from previous."
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Auto.json` — the Story Builder preset with one empty clip, a five-sentence sample `rewrite_story` and `auto_clips` = 4: the first run plans the story into four clips, then rewrites them one after another.
+   - `example_workflows/MiniMax_H3_Master_Extender_Story_Writer.json` — Story Auto with the H3 Story Writer node feeding `rewrite_story` and `story_engine` = `e4.10` (see [H3 Story Writer](#h3-story-writer-brief-to-story)).
+   - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_DualSampling.json` and `MiniMax_H3_Master_Extender_Action_v2_DualSampling.json` — HyperFlow dual sampling (see [HyperFlow dual sampling](#hyperflow-dual-sampling-opt-in)).
 
    Start with `clip_by_clip` and one clip. Inspect the preview and validate a clip before continuing the chain.
 
-ComfyUI-MiniMax-H3-PDD-Acc is no longer needed: the PDD 8-step mode was removed. HyperFlow 8-step needs ComfyUI-HyperFlow-H3 (see HYPERFLOW.md). H3 Turbo is not a dependency of this workflow. Avoid duplicate installations of the same node classes. The standalone Motion Context pack is not required: the adapted motion-context implementation is included here.
+### Other node packs
 
-   **Optional: semantic bridge.** The Master node has `semantic_bridge` / `semantic_bridge_alpha` / `semantic_bridge_match` widgets that run the [BUNNY H3 Conditioning Bridge](https://github.com/aa335615543-ux/BUNNY_H3_Conditioning_Bridge) on the conditioning of both passes (model: [JOKER141/BUNNY_H3_Conditioning_Bridge](https://huggingface.co/JOKER141/BUNNY_H3_Conditioning_Bridge)). Install that node and put the adapter in its `models/` folder or in `models/semantic_bridge`; leave `semantic_bridge` at `none` when it is not installed.
+| Pack | Needed for |
+| --- | --- |
+| [ComfyUI-HyperFlow-H3](https://github.com/Adudeguyman/ComfyUI-HyperFlow-H3) | **Required** for the default engine, HyperFlow 8-step. See [HYPERFLOW.md](HYPERFLOW.md). |
+| [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) | **Required.** Provides `MinimaxH3LatentUpscaler3D`, the upscale between the passes. |
+| [MiniMax-H3-Prompt-Rewriter-ComfyUI](https://github.com/pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI) | The built-in prompt rewriter, the story engines and the Story Writer node. |
+| [ComfyUI-MiniMaxH3_LatentUpscaler](https://github.com/TripleHeadedMonkey/ComfyUI-MiniMaxH3_LatentUpscaler) | The X2 Detail final decode (`final_decode`). |
+| [BUNNY H3 Conditioning Bridge](https://github.com/aa335615543-ux/BUNNY_H3_Conditioning_Bridge) | The optional semantic bridge (below). |
+
+You no longer need ComfyUI-MiniMax-H3-PDD-Acc, because the PDD 8-step mode was removed, and H3 Turbo is not a dependency. The standalone Motion Context pack isn't required either, since the adapted motion-context implementation is included here. Avoid duplicate installations of the same node classes.
+
+**Optional: semantic bridge.** The Master node has `semantic_bridge` / `semantic_bridge_alpha` / `semantic_bridge_match` widgets that run the [BUNNY H3 Conditioning Bridge](https://github.com/aa335615543-ux/BUNNY_H3_Conditioning_Bridge) on the conditioning of both passes (model: [JOKER141/BUNNY_H3_Conditioning_Bridge](https://huggingface.co/JOKER141/BUNNY_H3_Conditioning_Bridge)). Install that node and put the adapter in its `models/` folder or in `models/semantic_bridge`; leave `semantic_bridge` at `none` when it is not installed.
 
 ## Built-in prompt rewriter: system prompt, continuity, story planner
 
@@ -157,7 +183,23 @@ Add a preset by adding one entry to `MASTER_PRESETS` in `web/presets.js`.
 
 ## HyperFlow 8-step mode
 
-The default acceleration mode (the other is Turbo LoRA). See [HYPERFLOW.md](HYPERFLOW.md) for the node pack, weights, base/build pairing and the pass-2 rule.
+The default acceleration mode (the other is Turbo LoRA). See [HYPERFLOW.md](HYPERFLOW.md) for the node pack, weights, base/build pairing, the pass-2 rule and the sparse attention recipe inputs (`sparse_start_percent`, `sparse_dense_blocks`, `sparse_sink`).
+
+## Render controls
+
+All of these inputs are appended after the existing ones, so saved workflows keep their widget positions. A workflow that does not send an input renders as before, unless noted. [CHANGELOG.md](CHANGELOG.md) has the full detail for each.
+
+| Input / feature | What it does |
+| --- | --- |
+| `pass2_resolution` = `off (pass 1 only)` | Skips pass 2 and decodes the draft at the pass-1 size (2x that with the X2 decode). Its text encode runs at the 720p size, so a draft matches the pass 1 of a 720p render. |
+| Pass-1 cache | The draft chain on disk is keyed only on pass-1 inputs. Changing the pass-2 resolution, the pass-2 LoRA or steps, `final_decode`, or turning pass 2 on or off reuses the cached pass 1 (`Clip N: PASS 1 LOADED FROM CACHE`). The log says why when it can't. |
+| `pass1_steps` | Default 0, the full 8 steps. k = 1..7 stops HyperFlow pass 1 after k steps and hands the clean x0 estimate to the normal upscale and refine. It is ignored with dual sampling or Turbo LoRA. |
+| Per-clip refs | In `clips_json`, a clip with `"refs": [i, j, ...]` (1-based indices into the job's pictures) is conditioned only on those pictures, numbered `<Picture 1..k>` in that order. A clip without it gets every picture. A bad list fails before any clip renders. The prompt rewriter still writes against all job pictures. |
+| `final_decode` | `standard`, or a 2x VAE such as MiniMax-H3-X2-Detail, which decodes the final video at 2x the refine size (about +23 s per 15 s clip). Only final clips use it, and the VAE is found by its safetensors header. |
+| `pass2_sla_sparsity` | Default 0, which means the same as `sla_sparsity`. Otherwise it sets a pass-2-only keep rate for the sla / vsa methods (0.95 keeps 5% of key blocks) while pass 1 keeps `sla_sparsity`. sol-attn ignores it. |
+| `pass2_chunk_when` | `above 720p` (default) or `always`. See [HyperFlow dual sampling](#hyperflow-dual-sampling-opt-in). This one does change the default at 720p: those clips are now refined in one window. |
+| VRAM release | No input. Node-scoped VRAM is released between passes and between clips. ComfyUI's "unload all models" also frees the extender's cached X2 VAE and empties the CUDA cache, so an external model server is not starved after a job. |
+| MiniMax H3 Prompt From Video | A separate node. It reads the prompt graph a render embedded in its MP4/PNG and returns the Master Extender clip prompts as STRING outputs that plug into `clip_prompt_1..4`. |
 
 ## HyperFlow dual sampling (opt-in)
 
@@ -205,15 +247,17 @@ Prints a table per step, writes `analysis.json` and `contact_sheet.png` (rows = 
 
 ## Model files (not included)
 
-These are the filenames selected in the source workflow. Choose compatible alternatives in the dropdowns if you use another supported precision or filename; renaming an incompatible model does not make it compatible.
+These are the filenames selected in the example workflows. Choose compatible alternatives in the dropdowns if you use another supported precision or filename; renaming an incompatible model does not make it compatible.
 
-| Purpose | Folder under `ComfyUI/models` | Source workflow selection |
+| Purpose | Folder under `ComfyUI/models` | Example workflow selection |
 | --- | --- | --- |
-| Ref2VA diffusion model | `diffusion_models` | `MiniMax_H3_Ref2VA_pruned_int8_convrot.safetensors` |
-| Qwen3-VL text encoder | `text_encoders` | `qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors` |
+| Ref2VA diffusion model | `diffusion_models` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` (the action presets use `Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8` / `_v2_pruned_int8`) |
+| Qwen3-VL text encoder | `text_encoders` | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` |
 | Video VAE | `vae` | `minimax_h3_video_vae_int8_convrot.safetensors` |
 | Audio VAE | `vae` | `minimax_h3_audio_vae_fp32.safetensors` |
 | Learned 3D latent upscaler | `latent_upscale_models` | `minimax_h3_latent_upscaler_3d_fp16.safetensors` |
+| HyperFlow 8-step | `hyperflow` | `custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors` (pruned bases) or the build without `_pruned` (full base) |
+| Pass-2 refiner LoRA (default) | `loras/h3` | `minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors` (optional; with none, pass 2 runs on HyperFlow's own grid tail) |
 
 Keep the CLIPLoader type set to `minimax`. The selected quantized models require compatible ComfyUI kernels and hardware; they are not universal defaults.
 
@@ -271,9 +315,14 @@ This project brings together adapted code and separately installed dependencies.
 
 | Original author / project | Contribution |
 | --- | --- |
+| [only2uuuu-hub / ComfyUI-MiniMax-H3-Master-Extender-Custom-built-with-Astra-6-](https://github.com/only2uuuu-hub/ComfyUI-MiniMax-H3-Master-Extender-Custom-built-with-Astra-6-) | The original Master Extender build (2026-09-11) this repository was forked from: the two-pass Master node, Final Decode, the blank workflow and the installation guide. |
 | [tritant / ComfyUI_MiniMax_H3_Extender](https://github.com/tritant/ComfyUI_MiniMax_H3_Extender) | Extender foundation and inherited continuity/decode implementation. |
 | [NikoDemon80 / ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | GPL-3.0 motion-context temporal anchor and payload patch foundation. |
-| [xmarre / Comfyui_Minimax_h3_latent_Upscaler](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler) | External learned latent upscaling dependency. |
+| [LBH-123-AI / Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) | External learned latent upscaling dependency and its weights. The original build linked xmarre's copy, now [xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus). |
+| [Adudeguyman / ComfyUI-HyperFlow-H3](https://github.com/Adudeguyman/ComfyUI-HyperFlow-H3) | External HyperFlow 8-step node pack (Video Rebirth's HyperFlow). |
+| [pytraveler / MiniMax-H3-Prompt-Rewriter-ComfyUI](https://github.com/pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI) | External prompt-rewriter pack the built-in rewriter runs on. |
 | [Comfy-Org / ComfyUI](https://github.com/Comfy-Org/ComfyUI) | Runtime and native MiniMax H3 model integration. |
 
 The combined source distribution is provided under **GNU GPL version 3**. Preserve the upstream notices and Apache-2.0 terms for the portions originally provided under Apache-2.0. See [LICENSE](LICENSE), [THIRD_PARTY_NOTICE.md](THIRD_PARTY_NOTICE.md), and [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt). External dependencies retain their own licenses.
+
+**Modifications.** As GPL-3.0 section 5(a) requires, this repository is a modified version of the work above. Ganaraj Permunda has modified it continuously from 2026-09-11, and [CHANGELOG.md](CHANGELOG.md) and the git history record every change.
