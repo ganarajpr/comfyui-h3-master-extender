@@ -129,6 +129,32 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([list(range(len(clips)))], run.rec.plans)
         self.assertEqual(len(clips), len([s for s in run.rec.streams if s[2] == "done"]))
 
+    def reload_from_saved(self, **extra):
+        """What dragging a story-mode video back into ComfyUI does: the embedded clip list and the same widgets, rendered again."""
+        run = self.run_engine("ninfer")
+        saved = json.loads(json.dumps(run.clips))
+        settings = settings_for(self.story, **extra)
+        with e4_mock_llm.MockLLM(REPLAY, mapping=default_mapping) as llm:
+            refs = stub_pack.make_pictures([n - 1 for n in self.labels])
+            rec, notes, clips = stub_pack.run_rewrite(ROOT, settings, saved, refs=refs, writer_suffix=".ninfer", server_base=llm.url,
+                                                      model_id="mock-model", user_dir=Path(tempfile.mkdtemp(dir=self.user)))
+        return run, rec, notes, clips, llm
+
+    def test_a_reloaded_full_clip_list_is_used_as_is(self):
+        run, rec, notes, clips, llm = self.reload_from_saved()
+        self.assertEqual(run.clips, clips, "no clip is replanned or rewritten")
+        self.assertEqual([], rec.plans)
+        self.assertEqual([], rec.chats)
+        self.assertEqual([], llm.requests, "no model call at all")
+        self.assertEqual(["rewriter: nothing pending"], notes)
+
+    def test_a_reloaded_list_shorter_than_auto_clips_is_not_planned_further(self):
+        """auto_clips only switches e4 planning on; the engine chose the film's length, so auto_clips 40 over a shorter saved film adds nothing."""
+        run, rec, notes, clips, llm = self.reload_from_saved(auto_clips=40)
+        self.assertEqual(run.clips, clips)
+        self.assertEqual([], rec.plans)
+        self.assertEqual([], llm.requests)
+
     def test_a_visible_state_change_is_carried_into_every_later_clip(self):
         """E4.10: the boat's oil sheen (set by clip 1 in the stored plan) is in the boat's subject line of clips 2 and 3, and not in clip 1; the line holds no opening wording ("dry hull")."""
         run = self.run_engine("ninfer")
@@ -564,6 +590,21 @@ class BuilderUnchanged(unittest.TestCase):
         data = json.loads(self.GOLDEN.read_text(encoding="utf-8"))
         data["story_auto_raw_asks"]["chats"][0]["kw"]["seed"] += 1
         self.assertNotEqual(self.GOLDEN.read_text(encoding="utf-8"), stub_pack.dumps(data) + "\n")
+
+
+@needs_imaging
+class BuilderReload(unittest.TestCase):
+    def test_a_reloaded_builder_film_is_used_as_is(self):
+        """The saved workflow of a story-mode (builder) run: the clips it ended with, auto_clips equal to their count, nothing pending."""
+        settings, clips = builder_scenario.scenarios()["story_auto_raw_asks"]
+        reply = lambda m: "FINAL " + stub_pack.digest(json.dumps(stub_pack.plain(m)))  # noqa: E731
+        rec, notes, done = stub_pack.run_rewrite(ROOT, dict(settings), json.loads(json.dumps(clips)), refs=stub_pack.make_pictures((0, 1)), reply=reply)
+        self.assertTrue(rec.chats and len(done) == settings["auto_clips"])
+        saved = json.loads(json.dumps(done))
+        rec2, notes2, again = stub_pack.run_rewrite(ROOT, dict(settings), saved, refs=stub_pack.make_pictures((0, 1)), reply=reply)
+        self.assertEqual(done, again)
+        self.assertEqual([], rec2.chats)
+        self.assertEqual([], rec2.plans)
 
 
 # --------------------------------------------------------------------------- the vendored copy
