@@ -24,6 +24,7 @@ import folder_paths
 import nodes
 from .master_projects import load_reference_images, clip_picture_keys, _clip_identity, _chain_key, _clip_fingerprint, _pass1_fingerprint, _audio_refine_signature
 from . import prompt_rewriter
+from . import clips_metadata
 
 from . import motion_context_disk
 from .motion_context_disk import (
@@ -700,6 +701,7 @@ class MiniMaxH3MasterExtender:
             for note in rewrite_notes:
                 _LOG.info("Rewriter: %s", note)
             _send_clips(owner, clips, fields=["prompt", "prompt_raw", "prompt_rewritten", "rewrite_text", "rewrite_meta", "validated"])
+            clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)
 
         # Setup persistent disk caching
         chain_key = _chain_key(clips)
@@ -1129,6 +1131,7 @@ class MiniMaxH3MasterExtender:
         if rewrite_notes:
             status_msg += " | " + "; ".join(rewrite_notes)
         _send_clips(owner, clips, fields=["seed", "validated"] if unvalidated_any else ["seed"], chain=chain_key)
+        clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)
         return (
             previous_handle,
             len(clips),

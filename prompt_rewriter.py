@@ -717,7 +717,12 @@ def rewrite_clips(clips: list, refs: dict, settings: dict, *, aspect_text: str, 
     # film that was planned once (only the new clips are planned, after the existing ones).
     plan_ctx = story_planner.plan_around(clips, auto_clips, plan_slots) if plan_slots else None
     if not plan_slots and auto_clips and story:
-        plan_ctx = story_planner.plan_more(clips, auto_clips)
+        # An e4 film has the number of clips the engine chose, not auto_clips (which only switches planning on): a list
+        # it wrote is complete, so a reload of its saved workflow must not plan the difference as 'more' clips.
+        written_by_e4 = e4_engine.is_e4(story_engine) and any(
+            isinstance(c, dict) and isinstance(c.get("rewrite_meta"), dict) and c["rewrite_meta"].get("engine") == "e4" for c in clips)
+        if not written_by_e4:
+            plan_ctx = story_planner.plan_more(clips, auto_clips)
     planning = bool(plan_slots) or bool(plan_ctx)
     plan_n = len(plan_ctx["numbers"]) if plan_ctx else auto_clips
     # story_engine=e4.10 / e4.11 plans and writes a whole film in one run: only a first plan of a clip list that holds no text qualifies.
