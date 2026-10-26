@@ -12,6 +12,7 @@ import math
 import logging
 import os
 import sys
+import time
 import torch
 import comfy.model_management
 import comfy.sample
@@ -33,6 +34,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 from . import x0_debug
+from .upfront_encode import tree_to
 
 _LOG = logging.getLogger("minimax_h3_master_extender.engine")
 
@@ -525,6 +527,32 @@ class MasterEngine:
         _LOG.info("Clip %d: single text encode: 1 encoder pass (pass-1 refs re-encoded at %dx%d)",
                   clip_index + 1, w1, h1)
         return cond_p1, latent
+
+    @staticmethod
+    def _take_pre_encoded(pre_encoded):
+        device = comfy.model_management.intermediate_device()
+        return tree_to(tuple(pre_encoded), device)
+
+    def encode_clip_text(self, prompt, duration_sec, pass2_res, pass1_res, ref_images, pass2_enabled=True,
+                         p1_text_size=None, ref_videos=None, ref_video_audios=None, ref_audios=None):
+        """The one text+reference encode a clip's render runs (single text encode: at the pass-2 size, or at
+        ``p1_text_size`` with pass 2 off). render_clip's own encode and the up-front encode both go through here."""
+        w2, h2 = pass2_res
+        enc_w, enc_h = (w2, h2) if pass2_enabled or not p1_text_size else p1_text_size
+        return MiniMaxH3ReferenceToVideo.execute(
+            clip=self.clip,
+            vae=self.vae,
+            audio_vae=self.audio_vae,
+            prompt=prompt,
+            width=enc_w,
+            height=enc_h,
+            length=duration_to_h3_frames(duration_sec),
+            ref_image_size="match",
+            ref_images=dict(ref_images or {}),
+            ref_videos=ref_videos or None,
+            ref_video_audios=ref_video_audios or None,
+            ref_audios=ref_audios or None,
+        )
 
     def _bridge(self, positive, label=""):
         if getattr(self, "semantic_bridge", None) is None:
@@ -1156,6 +1184,7 @@ class MasterEngine:
         cached_pass1: dict = None,
         cached_trim: int = 0,
         p1_text_size: tuple = None,
+        pre_encoded: tuple = None,
     ):
         """Execute the complete 2-Stage 2-Pass Pipeline for a single clip.
 
@@ -1170,7 +1199,12 @@ class MasterEngine:
         an earlier pass-1 result for this exact clip; pass-1 conditioning and sampling are skipped
         and it is used as if just sampled (``cached_trim`` is its motion-context trim, needed only
         when pass 2 is off).
+
+        ``pre_encoded`` is the (positive, latent) pair ``encode_clip_text`` returned for this clip's exact inputs
+        earlier in the job (the up-front text encode); it replaces the encoder call that would run here.
         """
+        timing = {"encode": 0.0, "pass1": 0.0, "upscale": 0.0, "pass2": 0.0}
+        self.last_timing = timing
         model, sigmas_p1 = self.initialize_model()
 
         frame_count = duration_to_h3_frames(duration_sec)
@@ -1212,23 +1246,17 @@ class MasterEngine:
             # The text encoder sees the reference pictures at the encode size, so with pass 2 off the
             # single encode runs at ``p1_text_size`` (the size a standard final would use) to give the
             # same pass-1 conditioning as a full render that is finalised at that size.
-            enc_w, enc_h = (w2, h2) if pass2_enabled or not p1_text_size else p1_text_size
-            out_p2 = MiniMaxH3ReferenceToVideo.execute(
-                clip=self.clip,
-                vae=self.vae,
-                audio_vae=self.audio_vae,
-                prompt=prompt,
-                width=enc_w,
-                height=enc_h,
-                length=frame_count,
-                ref_image_size="match",
-                ref_images=ref_images,
-                ref_videos=ref_videos or None,
-                ref_video_audios=ref_video_audios or None,
-                ref_audios=ref_audios or None,
-            )
+            t0 = time.perf_counter()
+            out_p2 = self._take_pre_encoded(pre_encoded) if pre_encoded is not None else self.encode_clip_text(
+                prompt, duration_sec, pass2_res, pass1_res, ref_images, pass2_enabled, p1_text_size,
+                ref_videos, ref_video_audios, ref_audios)
+            timing["encode"] += time.perf_counter() - t0
+            pre_encoded = None
+            t0 = time.perf_counter()
             out_p1 = self._pass1_from_pass2(out_p2, ref_images, w1, h1, frame_count, clip_index)
+            timing["encode"] += time.perf_counter() - t0
         if out_p1 is None and not cached:
+            t0 = time.perf_counter()
             out_p1 = MiniMaxH3ReferenceToVideo.execute(
                 clip=self.clip,
                 vae=self.vae,
@@ -1243,6 +1271,7 @@ class MasterEngine:
                 ref_video_audios=ref_video_audios or None,
                 ref_audios=ref_audios or None,
             )
+            timing["encode"] += time.perf_counter() - t0
         if not cached:
             pos_p1 = self._bridge(_safe_get_output(out_p1, 0, "positive"), "pass 1")
             latent_p1 = _safe_get_output(out_p1, 1, "latent")
@@ -1267,20 +1296,11 @@ class MasterEngine:
         # UNet can stay resident straight through pass 1 -> upscale -> pass 2
         # and the text-encoder/UNet round trip per clip is halved.
         if pass2_enabled and out_p2 is None:
-            out_p2 = MiniMaxH3ReferenceToVideo.execute(
-                clip=self.clip,
-                vae=self.vae,
-                audio_vae=self.audio_vae,
-                prompt=prompt,
-                width=w2,
-                height=h2,
-                length=frame_count,
-                ref_image_size="match",
-                ref_images=ref_images,
-                ref_videos=ref_videos or None,
-                ref_video_audios=ref_video_audios or None,
-                ref_audios=ref_audios or None,
-            )
+            t0 = time.perf_counter()
+            out_p2 = self._take_pre_encoded(pre_encoded) if pre_encoded is not None else self.encode_clip_text(
+                prompt, duration_sec, pass2_res, pass1_res, ref_images, pass2_enabled, p1_text_size,
+                ref_videos, ref_video_audios, ref_audios)
+            timing["encode"] += time.perf_counter() - t0
         if pass2_enabled:
             pos_p2 = self._bridge(_safe_get_output(out_p2, 0, "positive"), "pass 2")
             latent_p2 = _safe_get_output(out_p2, 1, "latent")
@@ -1316,6 +1336,7 @@ class MasterEngine:
                 _LOG.info("Clip %d: dual sampling early stop, pass 1 runs grid[:%d] (%d steps): %s",
                           clip_index + 1, len(sigmas_p1), len(sigmas_p1) - 1,
                           [round(float(x), 4) for x in sigmas_p1])
+            t0 = time.perf_counter()
             sampled_p1 = self._sample_euler(
                 model=model,
                 positive=pos_p1,
@@ -1324,6 +1345,7 @@ class MasterEngine:
                 seed=seed,
                 return_denoised=early_stop,
             )
+            timing["pass1"] = time.perf_counter() - t0
 
         if not pass2_enabled:
             self.last_draft = None if cached else sampled_p1
@@ -1342,7 +1364,9 @@ class MasterEngine:
         video_p1, audio_p1 = _streams_from_latent(sampled_p1, "samples")
 
         # 3D Latent Upscaling on video stream
+        t0 = time.perf_counter()
         video_upscaled = self._run_3d_upscaler(video_p1, w2, h2)
+        timing["upscale"] = time.perf_counter() - t0
 
         actual_hw = tuple(int(x) for x in video_upscaled.shape[-2:])
         if actual_hw != (h2 // 16, w2 // 16):
@@ -1374,6 +1398,7 @@ class MasterEngine:
 
         # Sample Pass 2 (High-Res Refine): whole clip, or overlapping temporal
         # windows when the clip is longer than pass2_chunk_frames.
+        t0 = time.perf_counter()
         if self._pass2_chunking_active(frame_count, w2, h2):
             final_sampled = self._sample_pass2_chunked(
                 model=model_p2,
@@ -1395,6 +1420,7 @@ class MasterEngine:
             if progress_cb:
                 progress_cb("audio_refine", f"Clip {clip_index + 1} - Audio-only refine ({self.audio_refine_steps} steps)...", 0.85)
             final_sampled = self._refine_audio(final_sampled, pos_p2, seed, clip_index)
+        timing["pass2"] = time.perf_counter() - t0
 
         # The disk renderer extracts the guide from the corrected preview decode.
         return final_sampled, None

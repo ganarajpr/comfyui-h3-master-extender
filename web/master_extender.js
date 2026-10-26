@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2RowBinding } from "./widget_migration.js";
+import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, upfrontTextEncodeValue, pass2RowBinding } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -305,6 +305,8 @@ function repairDualWidgets(node) {
     if (chunkWhen) chunkWhen.value = pass2ChunkWhenValue(chunkWhen.value);
     const p2Sla = node.widgets?.find(x => x.name === "pass2_sla_sparsity");
     if (p2Sla) p2Sla.value = pass2SlaSparsityValue(p2Sla.value);
+    const upfront = node.widgets?.find(x => x.name === "upfront_text_encode");
+    if (upfront) upfront.value = upfrontTextEncodeValue(upfront.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -1128,6 +1130,7 @@ app.registerExtension({
                 // them would shift every later saved widget value (final_decode, master_ui).
                 wrap.appendChild(uiRow("offload upscaler after use", bindToggle("smart_offload")));
                 wrap.appendChild(uiRow("background decode (experimental)", bindSelect("async_decode")));
+                if (W("upfront_text_encode")) wrap.appendChild(uiRow("encode all clips up front", bindToggle("upfront_text_encode")));
             }
 
             function fitNodeToContent() {

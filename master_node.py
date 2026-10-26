@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 import torch
+import comfy.model_management
 import comfy.samplers
 from server import PromptServer
 
@@ -24,6 +25,7 @@ import folder_paths
 import nodes
 from .master_projects import load_reference_images, clip_picture_keys, _clip_identity, _chain_key, _clip_fingerprint, _pass1_fingerprint, _audio_refine_signature
 from . import prompt_rewriter
+from .upfront_encode import UpfrontEncodeCache, first_render_index, upfront_indices
 
 from . import motion_context_disk
 from .motion_context_disk import (
@@ -504,6 +506,7 @@ class MiniMaxH3MasterExtender:
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
+                "upfront_text_encode": ("BOOLEAN", {"default": False, "tooltip": "Encodes every clip's text and reference pictures once before clip 1 (the text encoder loads once per job and the UNet is not evicted around each clip's encode), keeping the results on the CPU. Needs identity_continuity off: with it on, only clip 1 is encoded up front and clips 2+ encode per clip."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -883,6 +886,24 @@ class MiniMaxH3MasterExtender:
                     _LOG.info("Clip %d: per-clip refs %s -> %d of %d job pictures (<Picture 1..%d> in that order)",
                               n + 1, c.get("refs"), len(clip_pictures[n]), len(refs), len(clip_pictures[n]))
 
+        upfront_cache = UpfrontEncodeCache()
+        if kwargs.get("upfront_text_encode") is True:
+            first = first_render_index(
+                clips, len(manifest.get("segments", [])), _stored_fingerprints(data_path, manifest_path),
+                lambda prev, cfg: _clip_fingerprint(prev, cfg, cfg.get("seed", 42), audio_refine, single_te))
+            pending = upfront_indices(clips, first, run_mode, identity_continuity)
+            if identity_continuity and first < len(clips):
+                _LOG.info("Up-front text encode: identity_continuity is on, so only clip 1 is encoded up front; clips 2+ encode per clip")
+            if pending:
+                def encode_up_front(index):
+                    cfg = clips[index]
+                    return engine.encode_clip_text(
+                        cfg.get("prompt", ""), float(cfg.get("duration", 15)), (w2, h2), (w1, h1),
+                        refs if clip_pictures[index] is None else clip_pictures[index], pass2_enabled,
+                        _nominal_final_size(w1, h1), ref_videos, ref_video_audios, ref_audios)
+                upfront_cache.fill(pending, encode_up_front)
+                _LOG.info(upfront_cache.summary())
+
         previous_handle = None
         previous_proxy = None
         draft_handle = None
@@ -984,6 +1005,7 @@ class MiniMaxH3MasterExtender:
             if len(state["segments"]) > i:
                 _truncate_chain(data_path, manifest_path, state, i)
             _LOG.info(f"Rendering Clip {i + 1}/{len(clips)}: '{clip_cfg.get('prompt', '')[:60]}...'")
+            clip_started = time.perf_counter()
 
             def progress_hook(stage, msg, pct):
                 _send_progress(owner, i, len(clips), stage, msg, pct)
@@ -1021,6 +1043,9 @@ class MiniMaxH3MasterExtender:
                 if len(state["segments"]) > i:
                     _truncate_chain(draft_path, draft_manifest_path, state, i)
 
+            pre_encoded = upfront_cache.take(i, comfy.model_management.intermediate_device())
+            used_upfront = pre_encoded is not None
+
             # Render clip through Master Engine
             sampled_latent, _ = engine.render_clip(
                 clip_index=i,
@@ -1044,7 +1069,10 @@ class MiniMaxH3MasterExtender:
                 cached_pass1=cached_p1,
                 cached_trim=cached_trim,
                 p1_text_size=_nominal_final_size(w1, h1),
+                pre_encoded=pre_encoded,
             )
+            pre_encoded = None
+            decode_started = time.perf_counter()
 
             # Save clip to disk cache (the manifest is shared with a running
             # background decode, so that must be finished first).
@@ -1114,6 +1142,11 @@ class MiniMaxH3MasterExtender:
                 )
                 last_frame_tensor = _load_guide_frame(data_path, state["segments"][i])
                 progress_hook("done", f"Clip {i + 1} completed!", 1.0)
+            clip_done = time.perf_counter()
+            stage = engine.last_timing
+            _LOG.info("Clip %d timing: encode %.1f s%s | pass1 %.1f s | upscale %.1f s | pass2 %.1f s | decode %.1f s | total %.1f s",
+                      i + 1, stage["encode"], " (up-front)" if used_upfront else "", stage["pass1"], stage["upscale"],
+                      stage["pass2"], clip_done - decode_started, clip_done - clip_started)
             rendered_count += 1
 
             # In clip_by_clip mode: stop after rendering the first pending clip so user can validate!
@@ -1121,6 +1154,7 @@ class MiniMaxH3MasterExtender:
                 _LOG.info(f"Clip-by-clip mode: paused after rendering Clip {i + 1} for user validation.")
                 break
 
+        upfront_cache.clear()
         _finish_background()
         # Re-apply after any background decode rewrote the manifest.
         _store_fingerprints(data_path, manifest_path, fingerprints)

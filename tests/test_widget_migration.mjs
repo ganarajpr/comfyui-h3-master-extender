@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, DUAL_DEFAULTS } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, upfrontTextEncodeValue, DUAL_DEFAULTS } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -54,6 +54,11 @@ for (const file of workflows) {
 }
 
 assert.equal(dropCaptionModelValue(["rewrite_writer_model"], ["w"]), null);
+
+// upfront_text_encode: master_ui's "" or a missing value -> off; a real boolean is kept
+for (const bad of [undefined, "", null, 0, 1, "true"]) assert.equal(upfrontTextEncodeValue(bad), false, String(bad));
+assert.equal(upfrontTextEncodeValue(true), true);
+assert.equal(upfrontTextEncodeValue(false), false);
 
 // dual sampling widgets: old arrays leave them undefined or hold master_ui's "" -> defaults; real values are kept
 for (const name of Object.keys(DUAL_DEFAULTS)) {

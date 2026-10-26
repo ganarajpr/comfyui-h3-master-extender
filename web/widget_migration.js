@@ -62,6 +62,10 @@ export function pass2ChunkWhenValue(value) {
 export function pass2SlaSparsityValue(value) {
     return typeof value === "number" && Number.isFinite(value) && value >= 0.5 && value <= 0.99 ? value : 0;
 }
+// upfront_text_encode is appended after pass2_sla_sparsity: a workflow saved before it has master_ui's "" there. false = per-clip encode.
+export function upfrontTextEncodeValue(value) {
+    return value === true;
+}
 export function dualWidgetValue(name, value) {
     const fallback = DUAL_DEFAULTS[name];
     if (typeof fallback === "boolean") return typeof value === "boolean" ? value : fallback;
