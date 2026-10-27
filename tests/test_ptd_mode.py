@@ -271,7 +271,7 @@ class EngineWiring(unittest.TestCase):
     def test_ptd_mode_needs_an_adapter(self):
         e = make(adapter=None)
         e.configure_pass2_lora("dmad.safetensors", 1.0, "replace engine LoRA", 4)
-        with self.assertRaisesRegex(ValueError, "needs a ptd_adapter"):
+        with self.assertRaisesRegex(ValueError, "pick a PTD adapter"):
             e.configure_pass2_engine(ptd.PASS2_ENGINE_LORA)
 
     def test_unknown_engine_is_refused(self):

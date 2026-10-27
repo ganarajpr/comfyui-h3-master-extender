@@ -432,7 +432,7 @@ class MasterEngine:
             raise ValueError(f"pass2_engine '{engine}' not in {ptd_mode.PASS2_ENGINES}")
         self.pass2_engine = engine
         if self.ptd_mode and self.ptd_adapter is None:
-            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a ptd_adapter (models/ptd)")
+            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a PTD adapter (models/ptd): pick a PTD adapter in the panel's pass-1 section (ptd_adapter)")
         if engine == ptd_mode.PASS2_ENGINE_PTD:
             if not self.ptd_mode:
                 raise ValueError(f"pass2_engine '{engine}' needs accel_mode '{ptd_mode.PTD_ACCEL_MODE}'")
@@ -655,7 +655,7 @@ class MasterEngine:
         the checkpoint's own hop grid as the pass-1 schedule. The per-hop factors stay in host RAM; the pack uploads
         only the active layer's expert per forward, so no adapter weights sit on the GPU between calls."""
         if self.ptd_adapter is None:
-            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a ptd_adapter (models/ptd)")
+            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a PTD adapter (models/ptd): pick a PTD adapter in the panel's pass-1 section (ptd_adapter)")
         import folder_paths
         pack = ptd_mode.ptd_pack()
         path = folder_paths.get_full_path_or_raise(ptd_mode.PTD_FOLDER, self.ptd_adapter)
