@@ -262,11 +262,12 @@ class EngineWiring(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs a pass2_lora"):
             e.initialize_pass2_model()
 
-    def test_ptd_last_hop_needs_ptd_mode(self):
+    def test_ptd_last_hop_without_ptd_mode_falls_back_to_lora_refine(self):
+        # The panel hides pass2_engine outside PTD mode, so a leftover "PTD last hop" must not fail a HyperFlow run.
         e = make(ptd_on=False)
         e.configure_pass2_lora("dmad.safetensors", 1.0, "replace engine LoRA", 4)
-        with self.assertRaisesRegex(ValueError, "needs accel_mode"):
-            e.configure_pass2_engine(ptd.PASS2_ENGINE_PTD)
+        e.configure_pass2_engine(ptd.PASS2_ENGINE_PTD)
+        self.assertEqual(e.pass2_engine, ptd.PASS2_ENGINE_LORA)
 
     def test_ptd_mode_needs_an_adapter(self):
         e = make(adapter=None)

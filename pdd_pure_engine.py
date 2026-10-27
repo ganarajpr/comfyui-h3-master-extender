@@ -435,7 +435,12 @@ class MasterEngine:
             raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a PTD adapter (models/ptd): pick a PTD adapter in the panel's pass-1 section (ptd_adapter)")
         if engine == ptd_mode.PASS2_ENGINE_PTD:
             if not self.ptd_mode:
-                raise ValueError(f"pass2_engine '{engine}' needs accel_mode '{ptd_mode.PTD_ACCEL_MODE}'")
+                # The panel hides pass2_engine outside PTD mode, so a value left over from a PTD run must not block the
+                # job: without a PTD pass 1 there is no adapter to run, so pass 2 is the normal LoRA refine.
+                _LOG.warning("pass2_engine '%s' needs accel_mode '%s'; running the normal pass-2 refine instead",
+                             engine, ptd_mode.PTD_ACCEL_MODE)
+                self.pass2_engine = ptd_mode.PASS2_ENGINE_LORA
+                return
             if self._pass2_lora_active():
                 _LOG.info("PTD last hop: pass-2 LoRA %s is not used", self.pass2_lora)
 

@@ -1012,6 +1012,10 @@ app.registerExtension({
                         const pick = defaultPtdAdapter(comboValues(W("ptd_adapter")));
                         if (pick) setW("ptd_adapter", pick, { rerender: false });
                     }
+                    // pass2_engine is hidden outside PTD mode: don't leave "PTD last hop" behind for a non-PTD pass 1.
+                    if (!isPtdMode(v) && String(getW("pass2_engine", "LoRA refine")) === "PTD last hop") {
+                        setW("pass2_engine", "LoRA refine", { rerender: false });
+                    }
                     renderUI();
                 });
                 wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count. HyperFlow 8-step: Video Rebirth's 8-step LoRA with two-time conditioning. HyperFlow 8-step \u00b7 dual sampling: HyperFlow with pass 2 as the grid tail over the whole clip in one window." }));
