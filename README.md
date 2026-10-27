@@ -201,6 +201,24 @@ All of these inputs are appended after the existing ones, so saved workflows kee
 | VRAM release | No input. Node-scoped VRAM is released between passes and between clips. ComfyUI's "unload all models" also frees the extender's cached X2 VAE and empties the CUDA cache, so an external model server is not starved after a job. |
 | MiniMax H3 Prompt From Video | A separate node. It reads the prompt graph a render embedded in its MP4/PNG and returns the Master Extender clip prompts as STRING outputs that plug into `clip_prompt_1..4`. |
 
+## PTD sampling (opt-in, A/B)
+
+`accel_mode = PTD (adapter)` runs pass 1 with a PTD adapter (per-hop LoRA + PDD heads, one model evaluation per trained hop) from
+[ComfyUI-MiniMaxH3-PTD](https://github.com/dheeai/comfyui-minimaxh3-ptd) (which needs
+[ComfyUI-PTD](https://github.com/vita-epfl/PTD-inference)). Pick the file with `ptd_adapter` (`models/ptd`). The pack's loader, controller
+and sampler do all the PTD numerics; the extender only wires them in under its attention backend and SLA.
+
+| arm | `accel_mode` | `ptd_adapter` | `pass2_engine` | pass 2 |
+|---|---|---|---|---|
+| A (existing) | `Turbo LoRA` | `none` | `LoRA refine` | `pass2_lora` refine |
+| B | `PTD (adapter)` | the file | `LoRA refine` | unchanged refine; needs `pass2_lora` (replace mode is forced) |
+| C | `PTD (adapter)` | the file | `PTD last hop` | the adapter's final hop only, at pass-2 size, on the re-noised upscaled draft (one evaluation; `pass2_lora`, `pass2_steps`, `pass2_denoise` unused) |
+
+Notes: a 6-hop file has grid 0.999, 0.9826, 0.9590, 0.9222, 0.8563, 0.7052, 0, so arm C re-noises to sigma 0.7052. Arm C refines the whole
+clip in one pass (a windowed pass 2, i.e. `above 720p` output over 800 px short side, is refused). Adapter factors live in host RAM and are
+uploaded per layer per forward; nothing adapter-sized stays on the GPU. The final-clip disk cache fingerprint does not include the model or
+accel settings, so clear the cache by hand when switching arms.
+
 ## HyperFlow dual sampling (opt-in)
 
 Three inputs at the end of the node, all off by default (a workflow or API graph that does not send them renders exactly as before):

@@ -33,6 +33,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 from . import x0_debug
+from . import ptd_mode
 
 _LOG = logging.getLogger("minimax_h3_master_extender.engine")
 
@@ -286,11 +287,17 @@ class MasterEngine:
         sparse_dense_blocks="auto",
         sparse_sink="auto",
         pass2_sla_sparsity=0.0,
+        ptd_adapter="none",
     ):
         self.raw_model = model
         self.accel_mode = str(accel_mode)
         self.turbo_mode = self.accel_mode.lower().startswith("turbo")
-        self.hyperflow_mode = not self.turbo_mode
+        self.ptd_mode = ptd_mode.is_ptd_mode(self.accel_mode)
+        self.hyperflow_mode = not (self.turbo_mode or self.ptd_mode)
+        self.ptd_adapter = ptd_adapter if ptd_adapter and ptd_adapter != "none" else None
+        self.ptd_controller = None
+        self.ptd_base = None
+        self.pass2_engine = ptd_mode.PASS2_ENGINE_LORA
         self.hyperflow_file = str(hyperflow_file)
         self.hyperflow_curve_refit = bool(hyperflow_curve_refit)
         self.hyperflow_strength = float(hyperflow_strength)
@@ -338,7 +345,9 @@ class MasterEngine:
         if self.prepared_model is not None:
             return self.prepared_model, self.pass1_sigmas
 
-        if self.turbo_mode:
+        if self.ptd_mode:
+            accel_desc = f"PTD adapter: {self.ptd_adapter or 'none'}"
+        elif self.turbo_mode:
             accel_desc = f"Turbo LoRA: {self.turbo_lora or 'none'} ({self.turbo_steps} steps)"
         else:
             accel_desc = f"HyperFlow 8-step: {self.hyperflow_file}"
@@ -359,7 +368,9 @@ class MasterEngine:
         self.shifted_model = shifted_model
 
         # 2. Acceleration: a plain turbo / lightning LoRA, or HyperFlow
-        if self.turbo_mode:
+        if self.ptd_mode:
+            accelerated, sigmas_p1 = self._prepare_ptd_model(shifted_model)
+        elif self.turbo_mode:
             accelerated, sigmas_p1 = self._prepare_turbo_model(shifted_model)
         else:
             accelerated, sigmas_p1 = self._prepare_hyperflow_model(shifted_model)
@@ -406,9 +417,30 @@ class MasterEngine:
             _LOG.info("HyperFlow: pass-2 LoRA forces 'replace' mode (pass 2 runs on the SigmaShift model + this "
                       "LoRA, without HyperFlow, so HyperFlow never sees a non-trained sigma tail)")
             self.pass2_lora_mode = "replace"
+        if self.ptd_mode and self.pass2_lora and self.pass2_lora_mode != "replace":
+            _LOG.info("PTD: pass-2 LoRA forces 'replace' mode (a PTD model only samples under an active hop)")
+            self.pass2_lora_mode = "replace"
         self.pass2_steps = int(steps or 0)
         self.pass2_model = None
         self.pass2_sla_model = None
+
+    def configure_pass2_engine(self, engine=ptd_mode.PASS2_ENGINE_LORA):
+        """"PTD last hop": pass 2 is the PTD adapter's final hop at pass-2 size (needs accel_mode PTD (adapter)).
+        The default keeps the normal pass-2 refine. Call after configure_pass2_lora."""
+        engine = str(engine or ptd_mode.PASS2_ENGINE_LORA)
+        if engine not in ptd_mode.PASS2_ENGINES:
+            raise ValueError(f"pass2_engine '{engine}' not in {ptd_mode.PASS2_ENGINES}")
+        self.pass2_engine = engine
+        if self.ptd_mode and self.ptd_adapter is None:
+            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a ptd_adapter (models/ptd)")
+        if engine == ptd_mode.PASS2_ENGINE_PTD:
+            if not self.ptd_mode:
+                raise ValueError(f"pass2_engine '{engine}' needs accel_mode '{ptd_mode.PTD_ACCEL_MODE}'")
+            if self._pass2_lora_active():
+                _LOG.info("PTD last hop: pass-2 LoRA %s is not used", self.pass2_lora)
+
+    def _ptd_last_hop(self):
+        return self.ptd_controller.hops - 1
 
     def configure_dual_sampling(self, enabled=False, split_step=2, early_stop=False):
         """HyperFlow dual sampling: pass 2 is the tail of the trained grid from index `split_step`, with no pass-2
@@ -419,8 +451,8 @@ class MasterEngine:
         self.dual_split_step = int(split_step)
         if not enabled:
             return
-        if self.turbo_mode:
-            _LOG.warning("Dual sampling needs HyperFlow 8-step; Turbo LoRA mode runs the normal two passes")
+        if self.turbo_mode or getattr(self, "ptd_mode", False):
+            _LOG.warning("Dual sampling needs HyperFlow 8-step; Turbo LoRA / PTD mode runs the normal two passes")
             return
         if self.pass2_lora:
             _LOG.warning("Dual sampling: pass 2 runs the HyperFlow grid tail without a refine LoRA; ignoring pass-2 LoRA %s",
@@ -438,8 +470,8 @@ class MasterEngine:
         steps = int(steps or 0)
         if steps <= 0:
             return
-        if self.turbo_mode:
-            _LOG.warning("pass1_steps=%d ignored: it needs HyperFlow 8-step, Turbo LoRA mode runs the full pass 1", steps)
+        if self.turbo_mode or getattr(self, "ptd_mode", False):
+            _LOG.warning("pass1_steps=%d ignored: it needs HyperFlow 8-step, Turbo LoRA / PTD mode runs the full pass 1", steps)
             return
         if self.dual_active:
             _LOG.warning("pass1_steps=%d ignored: dual sampling sets the pass-1 length (dual_split_step)", steps)
@@ -539,6 +571,15 @@ class MasterEngine:
         """Model used for the refine pass: the pass-1 model unless a pass-2 LoRA is set."""
         prepared, _ = self.initialize_model()
         p2_sparsity = self._pass2_sla_override()
+        if getattr(self, "ptd_mode", False) and self.pass2_engine == ptd_mode.PASS2_ENGINE_PTD:
+            if p2_sparsity is None:
+                return prepared
+            if self.pass2_sla_model is None:
+                self.pass2_sla_model = self._finish_model(self.ptd_base, sparsity=p2_sparsity)
+            return self.pass2_sla_model
+        if getattr(self, "ptd_mode", False) and not self._pass2_lora_active():
+            raise ValueError("PTD (adapter) with pass2_engine 'LoRA refine' needs a pass2_lora (e.g. the DMAD LoRA): "
+                             "the PTD model cannot sample outside its trained hops")
         if not self._pass2_lora_active():
             if p2_sparsity is None:
                 return prepared
@@ -608,6 +649,26 @@ class MasterEngine:
                   self.turbo_lora_strength, steps, self.sampler_name, self.scheduler_name)
 
         return model, self._basic_sigmas(model, steps, 1.0)
+
+    def _prepare_ptd_model(self, model):
+        """Patch the SigmaShift model with the PTD adapter bank + PDD heads (ComfyUI-MiniMaxH3-PTD) and return it with
+        the checkpoint's own hop grid as the pass-1 schedule. The per-hop factors stay in host RAM; the pack uploads
+        only the active layer's expert per forward, so no adapter weights sit on the GPU between calls."""
+        if self.ptd_adapter is None:
+            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a ptd_adapter (models/ptd)")
+        import folder_paths
+        pack = ptd_mode.ptd_pack()
+        path = folder_paths.get_full_path_or_raise(ptd_mode.PTD_FOLDER, self.ptd_adapter)
+        checkpoint = pack.loader.load_ptd_checkpoint(path)
+        patched = pack.patcher.patch_pdd_ptd_model(model, checkpoint, self.shift_video, self.shift_audio)
+        self.ptd_controller = pack.patcher.get_controller(patched)
+        self.ptd_pack = pack
+        self.ptd_base = patched
+        sigmas = self.ptd_controller.sigmas.float().cpu()
+        _LOG.info("PTD adapter %s: %d hops (rank %d), grid %s, pass 1 = %d model evaluations; SigmaShift (%.1f, %.1f)",
+                  self.ptd_adapter, checkpoint.num_hops, checkpoint.rank, [round(float(x), 4) for x in sigmas],
+                  checkpoint.num_hops, self.shift_video, self.shift_audio)
+        return patched, sigmas
 
     def _prepare_hyperflow_model(self, model):
         """HyperFlow 8-step (ComfyUI-HyperFlow-H3): backbone LoRA + two-time (t, r)
@@ -943,7 +1004,7 @@ class MasterEngine:
         model = self._with_ff_chunking(model, window_tokens)
         self._reclaim_vram(model, tokens=window_tokens)
 
-        sampler_name = pass_sampler_name(getattr(self, "turbo_mode", False), self.sampler_name)
+        sampler_name = pass_sampler_name(getattr(self, "turbo_mode", False) or getattr(self, "ptd_mode", False), self.sampler_name)
         res = split_cls.execute(
             latent=latent,
             conditioning=positive,
@@ -981,7 +1042,7 @@ class MasterEngine:
             _LOG.exception("x0 debug dump: setup failed, rendering without it")
             return None
 
-    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False):
+    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False, sampler=None):
         """Standard Euler sampling using ComfyUI core sampler internals directly.
 
         NOTE: Do NOT place any bare 'import comfy' statements inside this function.
@@ -1015,7 +1076,9 @@ class MasterEngine:
 
         # Build sampler object: HyperFlow was distilled for plain Euler; turbo mode
         # uses the user's sampler (res_multistep by default).
-        euler_sampler = comfy.samplers.sampler_object(pass_sampler_name(self.turbo_mode, self.sampler_name))
+        # PTD passes bring their own sampler; a PTD pass 1 followed by a LoRA refine uses the turbo sampler like Turbo mode.
+        euler_sampler = sampler if sampler is not None else comfy.samplers.sampler_object(
+            pass_sampler_name(self.turbo_mode or self.ptd_mode, self.sampler_name))
 
         # Fix empty latent channels if needed
         latent = dict(latent_image)
@@ -1316,6 +1379,13 @@ class MasterEngine:
                 _LOG.info("Clip %d: dual sampling early stop, pass 1 runs grid[:%d] (%d steps): %s",
                           clip_index + 1, len(sigmas_p1), len(sigmas_p1) - 1,
                           [round(float(x), 4) for x in sigmas_p1])
+            p1_sampler = None
+            if self.ptd_mode:
+                if latent_p1.get("noise_mask") is not None:
+                    raise ValueError("PTD pass 1 needs an empty generated latent without a noise mask")
+                p1_sampler = self.ptd_pack.sampler.make_sampler(self.ptd_controller)
+                _LOG.info("Clip %d: Pass 1 = PTD, %d hops (%d model evaluations)", clip_index + 1,
+                          self.ptd_controller.hops, self.ptd_controller.hops)
             sampled_p1 = self._sample_euler(
                 model=model,
                 positive=pos_p1,
@@ -1323,6 +1393,7 @@ class MasterEngine:
                 sigmas=sigmas_p1,
                 seed=seed,
                 return_denoised=early_stop,
+                sampler=p1_sampler,
             )
 
         if not pass2_enabled:
@@ -1369,27 +1440,47 @@ class MasterEngine:
         # Pass-2 model (a different LoRA for the refine tail when configured)
         model_p2 = self.initialize_pass2_model()
 
-        # Quality-tail sigmas (HyperFlow tail, or the turbo schedule's tail)
-        sigmas_p2 = self._pass2_sigmas(model_p2, pass2_denoise)
-
-        # Sample Pass 2 (High-Res Refine): whole clip, or overlapping temporal
-        # windows when the clip is longer than pass2_chunk_frames.
-        if self._pass2_chunking_active(frame_count, w2, h2):
-            final_sampled = self._sample_pass2_chunked(
-                model=model_p2,
-                positive=pos_p2,
-                latent=rejoined_latent,
-                sigmas=sigmas_p2,
-                seed=seed,
-            )
-        else:
+        if self.ptd_mode and self.pass2_engine == ptd_mode.PASS2_ENGINE_PTD:
+            # The adapter's final hop only: re-noise the upscaled draft to that hop's knot and evaluate it once.
+            if self._pass2_chunking_active(frame_count, w2, h2):
+                raise ValueError("pass2_engine 'PTD last hop' refines the whole clip in one pass; set pass2_chunk_frames "
+                                 "to 0 (or pass2_chunk_when 'above 720p' with a pass-2 short side under 800 px)")
+            hop = self._ptd_last_hop()
+            sigmas_p2 = ptd_mode.hop_tail_sigmas(self.ptd_controller.sigmas, hop).float().cpu()
+            _LOG.info("Clip %d: Pass 2 = PTD last hop (hop %d of %d, start sigma %.4f, 1 model evaluation); "
+                      "pass2_denoise %.2f is not used", clip_index + 1, hop + 1, self.ptd_controller.hops,
+                      float(sigmas_p2[0]), float(pass2_denoise))
             final_sampled = self._sample_euler(
                 model=model_p2,
                 positive=pos_p2,
                 latent_image=rejoined_latent,
                 sigmas=sigmas_p2,
                 seed=seed,
+                sampler=ptd_mode.make_hop_sampler(self.ptd_controller, hop),
             )
+
+        else:
+            # Quality-tail sigmas (HyperFlow tail, or the turbo schedule's tail)
+            sigmas_p2 = self._pass2_sigmas(model_p2, pass2_denoise)
+
+            # Sample Pass 2 (High-Res Refine): whole clip, or overlapping temporal
+            # windows when the clip is longer than pass2_chunk_frames.
+            if self._pass2_chunking_active(frame_count, w2, h2):
+                final_sampled = self._sample_pass2_chunked(
+                    model=model_p2,
+                    positive=pos_p2,
+                    latent=rejoined_latent,
+                    sigmas=sigmas_p2,
+                    seed=seed,
+                )
+            else:
+                final_sampled = self._sample_euler(
+                    model=model_p2,
+                    positive=pos_p2,
+                    latent_image=rejoined_latent,
+                    sigmas=sigmas_p2,
+                    seed=seed,
+                )
 
         if getattr(self, "audio_refine_steps", 0) > 0:
             if progress_cb:
