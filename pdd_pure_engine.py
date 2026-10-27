@@ -700,23 +700,21 @@ class MasterEngine:
         return model, self._basic_sigmas(model, steps, 1.0)
 
     def _prepare_ptd_model(self, model):
-        """Patch the SigmaShift model with the PTD adapter bank + PDD heads (ComfyUI-MiniMaxH3-PTD) and return it with
-        the checkpoint's own hop grid as the pass-1 schedule. The per-hop factors stay in host RAM; the pack uploads
-        only the active layer's expert per forward, so no adapter weights sit on the GPU between calls."""
+        """Patch the SigmaShift model with a Ref2VA PTD adapter bank + PDD heads (ComfyUI-PTD-Compact, bf16 or int8) and
+        return it with the checkpoint's own hop grid as the pass-1 schedule. The per-hop factors stay in host RAM; each
+        layer uploads only the active hop's factors per forward, so no adapter weights sit on the GPU between calls."""
         if self.ptd_adapter is None:
             raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a PTD adapter (models/ptd): pick a PTD adapter in the panel's pass-1 section (ptd_adapter)")
         import folder_paths
         pack = ptd_mode.ptd_pack()
         path = folder_paths.get_full_path_or_raise(ptd_mode.PTD_FOLDER, self.ptd_adapter)
-        checkpoint = pack.loader.load_ptd_checkpoint(path)
-        patched = pack.patcher.patch_pdd_ptd_model(model, checkpoint, self.shift_video, self.shift_audio)
-        self.ptd_controller = pack.patcher.get_controller(patched)
+        patched, self.ptd_controller = ptd_mode.load_ptd_model(model, path, pack)
         self.ptd_pack = pack
         self.ptd_base = patched
         sigmas = self.ptd_controller.sigmas.float().cpu()
-        _LOG.info("PTD adapter %s: %d hops (rank %d), grid %s, pass 1 = %d model evaluations; SigmaShift (%.1f, %.1f)",
-                  self.ptd_adapter, checkpoint.num_hops, checkpoint.rank, [round(float(x), 4) for x in sigmas],
-                  checkpoint.num_hops, self.shift_video, self.shift_audio)
+        _LOG.info("PTD adapter %s: %d hops, grid %s, pass 1 = %d model evaluations",
+                  self.ptd_adapter, self.ptd_controller.hops, [round(float(x), 4) for x in sigmas],
+                  self.ptd_controller.hops)
         return patched, sigmas
 
     def _prepare_hyperflow_model(self, model):
@@ -1433,7 +1431,7 @@ class MasterEngine:
             if self.ptd_mode:
                 if latent_p1.get("noise_mask") is not None:
                     raise ValueError("PTD pass 1 needs an empty generated latent without a noise mask")
-                p1_sampler = self.ptd_pack.sampler.make_sampler(self.ptd_controller)
+                p1_sampler = self.ptd_pack.compact.make_sampler(self.ptd_base)
                 _LOG.info("Clip %d: Pass 1 = PTD, %d hops (%d model evaluations)", clip_index + 1,
                           self.ptd_controller.hops, self.ptd_controller.hops)
             sampled_p1 = self._sample_euler(
@@ -1505,7 +1503,7 @@ class MasterEngine:
                 latent_image=rejoined_latent,
                 sigmas=sigmas_p2,
                 seed=seed,
-                sampler=ptd_mode.make_hop_sampler(self.ptd_controller, hop),
+                sampler=ptd_mode.make_hop_sampler(self.ptd_controller, hop, self.ptd_pack.sampling),
             )
 
         else:

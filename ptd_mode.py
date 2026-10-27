@@ -1,11 +1,12 @@
 """Opt-in PTD sampling for the Master Extender (A/B against the turbo-LoRA recipe).
 
-accel_mode "PTD (adapter)" runs pass 1 with the per-hop PTD adapters from ComfyUI-MiniMaxH3-PTD (one model
-evaluation per trained hop). pass2_engine "PTD last hop" replaces the pass-2 refine with the adapter's FINAL hop
-only, run at pass-2 size on the re-noised, upscaled pass-1 latent.
+accel_mode "PTD (adapter)" runs pass 1 with the per-hop Ref2VA PTD adapters, loaded by ComfyUI-PTD-Compact (one
+model evaluation per trained hop). The compact loader takes taobao-content-ai's bf16 files and nynxz's int8 versions
+of them, on the full or the pruned (curve) base. pass2_engine "PTD last hop" replaces the pass-2 refine with the
+adapter's FINAL hop only, run at pass-2 size on the re-noised, upscaled pass-1 latent.
 
-All PTD numerics (loader, controller, hop clocks, heads, audio clock, x0 -> velocity) come from the installed
-pack and ComfyUI-PTD; this module only adds the start-from-hop sampler and the glue.
+All PTD numerics (loader, controller, hop clocks, heads, audio clock, x0 -> velocity) come from ComfyUI-PTD-Compact
+and the official ComfyUI-PTD under it; this module only adds the start-from-hop sampler and the glue.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ PASS2_ENGINE_LORA = "LoRA refine"
 PASS2_ENGINE_PTD = "PTD last hop"
 PASS2_ENGINES = [PASS2_ENGINE_LORA, PASS2_ENGINE_PTD]
 PTD_FOLDER = "ptd"
-PACK_URL = "https://github.com/dheeai/comfyui-minimaxh3-ptd"
+PACK_URL = "https://github.com/Nynxz/ComfyUI-PTD-Compact"
 
 
 def is_ptd_mode(accel_mode):
@@ -53,22 +54,30 @@ def default_ptd_adapter(choices=None):
 
 
 def ptd_pack():
-    """The registered ComfyUI-MiniMaxH3-PTD modules (loader, patcher, sampler), looked up the way the pack
-    itself finds ComfyUI-PTD: ComfyUI imports a custom-node folder under a path-derived module name."""
+    """The registered ComfyUI-PTD-Compact module plus the official ComfyUI-PTD patcher and sampling modules it drives,
+    looked up the way the pack itself does: ComfyUI imports a custom-node folder under a path-derived module name."""
     import nodes
 
-    loader_node = nodes.NODE_CLASS_MAPPINGS.get("MiniMaxH3PTDLoader")
+    loader_node = nodes.NODE_CLASS_MAPPINGS.get("PTDH3CompactLoader")
     if loader_node is None:
         raise RuntimeError(
-            f"accel_mode '{PTD_ACCEL_MODE}' needs the ComfyUI-MiniMaxH3-PTD node pack (and ComfyUI-PTD) in "
-            f"custom_nodes: {PACK_URL}. It is not loaded (no MiniMaxH3PTDLoader node)."
+            f"accel_mode '{PTD_ACCEL_MODE}' needs the ComfyUI-PTD-Compact node pack and the official ComfyUI-PTD "
+            f"(release/comfyui-inference) in custom_nodes: {PACK_URL}. It is not loaded (no PTDH3CompactLoader node)."
         )
-    package = loader_node.__module__.rsplit(".", 1)[0]
-    return SimpleNamespace(
-        loader=importlib.import_module(package + ".loader"),
-        patcher=importlib.import_module(package + ".patcher"),
-        sampler=importlib.import_module(package + ".sampler"),
-    )
+    compact = importlib.import_module(loader_node.__module__.rsplit(".", 1)[0] + ".compact")
+    patcher = compact.ptd_modules()[1]
+    return SimpleNamespace(compact=compact, patcher=patcher, sampling=compact._sampling(patcher))
+
+
+def load_ptd_model(model, path, pack=None):
+    """(patched MODEL, controller) for a Ref2VA PTD file. EPFL fl2va files have no per-file hop grid and are refused."""
+    pack = ptd_pack() if pack is None else pack
+    patched = pack.compact.patch_compact(model, path)
+    controller = pack.patcher.get_ptd_controller(patched)
+    if not hasattr(controller, "sigmas"):
+        raise ValueError(f"{Path(path).name} is an EPFL fl2va PTD file; the extender needs a Ref2VA PTD adapter "
+                         "(taobao-content-ai, or nynxz's ptd_h3_ref2va_* int8 files)")
+    return patched, controller
 
 
 def with_ptd_p1_settings(settings, adapter):
@@ -126,7 +135,7 @@ def sample_pdd_ptd_from_hop(model, x, sigmas, extra_args=None, callback=None, di
     state is ``(1-t) * latent + t * noise`` at the hop's knot, with the audio stream on PTD's audio clock."""
     del disable
     if upstream is None:
-        upstream = ptd_pack().patcher.ptd_modules()[1]
+        upstream = ptd_pack().sampling
     grid = controller.sigmas
     tail = hop_tail_sigmas(grid, start_hop)
     if (not isinstance(sigmas, torch.Tensor) or sigmas.ndim != 1 or sigmas.shape != tail.shape
@@ -158,9 +167,13 @@ def sample_pdd_ptd_from_hop(model, x, sigmas, extra_args=None, callback=None, di
     return state
 
 
-def make_hop_sampler(controller, start_hop):
-    """A ComfyUI SAMPLER running hops ``start_hop..`` of one loaded checkpoint."""
+def make_hop_sampler(controller, start_hop, upstream=None):
+    """A ComfyUI SAMPLER running hops ``start_hop..`` of one loaded checkpoint. ``upstream`` is ComfyUI-PTD's
+    sampling module (audio clock, x0 -> velocity)."""
     from comfy.samplers import KSAMPLER
 
     hop_tail_sigmas(controller.sigmas, start_hop)
-    return KSAMPLER(sample_pdd_ptd_from_hop, extra_options={"controller": controller, "start_hop": int(start_hop)})
+    options = {"controller": controller, "start_hop": int(start_hop)}
+    if upstream is not None:
+        options["upstream"] = upstream
+    return KSAMPLER(sample_pdd_ptd_from_hop, extra_options=options)

@@ -17,8 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "pdd_pure_engine.py"
 NODE = ROOT / "master_node.py"
 
-PACK_SCHEDULE = Path(os.environ.get(
-    "PTD_PACK_DIR", str(Path.home() / "Projects/comfyui-minimaxh3-ptd/comfyui_node/ComfyUI-MiniMaxH3-PTD"))) / "schedule.py"
+PACK_SCHEDULE = Path(os.environ.get("PTD_COMPACT_DIR", str(ROOT.parent / "ComfyUI-PTD-Compact"))) / "pdd.py"
 
 
 def _load_ptd_mode():
@@ -90,15 +89,24 @@ class GridTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ptd.hop_tail_sigmas(GRID6, bad)
 
-    @unittest.skipUnless(PACK_SCHEDULE.exists(), "PTD pack checkout not found (set PTD_PACK_DIR)")
-    def test_grid_matches_the_packs_schedule_for_the_six_hop_file(self):
-        spec = importlib.util.spec_from_file_location("ptd_pack_schedule", PACK_SCHEDULE)
+    def _schedule(self):
+        spec = importlib.util.spec_from_file_location("ptd_compact_pdd", PACK_SCHEDULE)
         schedule = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(schedule)
-        grid = schedule.hop_sigmas(6, 6, 12.0)
+        return schedule
+
+    @unittest.skipUnless(PACK_SCHEDULE.exists(), "ComfyUI-PTD-Compact checkout not found (set PTD_COMPACT_DIR)")
+    def test_grid_matches_the_packs_schedule_for_the_six_hop_file(self):
+        grid = self._schedule().hop_sigmas(6, 6, 12.0)
         self.assertEqual(len(grid), 7)
         self.assertTrue(torch.allclose(grid, GRID6, atol=1e-6))
         self.assertAlmostEqual(float(grid[-2]), 0.7052, places=4)
+
+    @unittest.skipUnless(PACK_SCHEDULE.exists(), "ComfyUI-PTD-Compact checkout not found (set PTD_COMPACT_DIR)")
+    def test_eight_hop_file_has_a_one_evaluation_last_hop(self):
+        grid = self._schedule().hop_sigmas(8, 32, 12.0)
+        self.assertEqual(len(grid), 9)
+        self.assertEqual(len(ptd.hop_tail_sigmas(grid, 7)) - 1, 1)
 
 
 class RenoiseTests(unittest.TestCase):
@@ -329,8 +337,8 @@ class ModeWiring(unittest.TestCase):
         self.assertEqual(a["ptd"], "a.safetensors")
 
     def test_pass1_ptd_uses_the_packs_sampler_and_pass2_the_hop_sampler(self):
-        self.assertIn("self.ptd_pack.sampler.make_sampler(self.ptd_controller)", self.engine_text)
-        self.assertIn("ptd_mode.make_hop_sampler(self.ptd_controller, hop)", self.engine_text)
+        self.assertIn("self.ptd_pack.compact.make_sampler(self.ptd_base)", self.engine_text)
+        self.assertIn("ptd_mode.make_hop_sampler(self.ptd_controller, hop, self.ptd_pack.sampling)", self.engine_text)
 
     def test_missing_pack_is_a_clear_error(self):
         fake_nodes = types.ModuleType("nodes")
@@ -338,7 +346,7 @@ class ModeWiring(unittest.TestCase):
         old = sys.modules.get("nodes")
         sys.modules["nodes"] = fake_nodes
         try:
-            with self.assertRaisesRegex(RuntimeError, "ComfyUI-MiniMaxH3-PTD"):
+            with self.assertRaisesRegex(RuntimeError, "ComfyUI-PTD-Compact"):
                 ptd.ptd_pack()
         finally:
             if old is None:
