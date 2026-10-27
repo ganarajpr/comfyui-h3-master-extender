@@ -45,6 +45,13 @@ def ptd_adapter_choices():
     return ["none"] + files
 
 
+def default_ptd_adapter(choices=None):
+    """The adapter to use when PTD mode is on but none is selected: the first RefAsymOPD file, else the first adapter,
+    else None (nothing installed in models/ptd). The panel makes the same pick when PTD mode is switched on."""
+    files = [f for f in (ptd_adapter_choices() if choices is None else choices) if f and f != "none"]
+    return next((f for f in files if "refasymopd" in f.lower()), files[0] if files else None)
+
+
 def ptd_pack():
     """The registered ComfyUI-MiniMaxH3-PTD modules (loader, patcher, sampler), looked up the way the pack
     itself finds ComfyUI-PTD: ComfyUI imports a custom-node folder under a path-derived module name."""

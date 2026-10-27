@@ -203,13 +203,17 @@ def _engine_class():
     tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MasterEngine")
     names = ("configure_pass2_lora", "configure_pass2_engine", "_ptd_last_hop", "initialize_pass2_model",
-             "_pass2_sla_override", "_finish_model", "_pass2_lora_active", "_apply_sla")
+             "_pass2_sla_override", "_finish_model", "_pass2_lora_active", "_apply_sla",
+             "configure_dual_sampling", "configure_pass1_steps", "_resolve_windowed_last_hop",
+             "_pass2_chunking_active", "_match_hyperflow_build")
     body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     stub = ast.ClassDef(name="Engine", bases=[], keywords=[], body=body, decorator_list=[])
     ns = {
         "_LOG": logging.getLogger("test_ptd_mode"),
         "ptd_mode": ptd,
-        "nodes": types.SimpleNamespace(NODE_CLASS_MAPPINGS={"LoraLoaderModelOnly": Lora}),
+        "nodes": types.SimpleNamespace(NODE_CLASS_MAPPINGS={"LoraLoaderModelOnly": Lora, "MMH3SplitUpscale": object,
+                                                            "MMH3TemporalSplitParamsV10": object}),
+        "PASS2_CHUNK_MIN_SHORT_SIDE": 800,
         "_safe_get_output": lambda res, i, name: res[i],
         "get_attention_function": lambda name, _: object(),
     }
@@ -255,12 +259,12 @@ class EngineWiring(unittest.TestCase):
         self.assertEqual(e.pass2_lora_mode, "replace")
         self.assertEqual(e.initialize_pass2_model().tag, "shifted+lora")
 
-    def test_arm_b_without_a_pass2_lora_is_refused(self):
+    def test_arm_b_without_a_pass2_lora_falls_back_to_the_last_hop(self):
         e = make()
         e.configure_pass2_lora("none", 1.0, "replace engine LoRA", 4)
         e.configure_pass2_engine(ptd.PASS2_ENGINE_LORA)
-        with self.assertRaisesRegex(ValueError, "needs a pass2_lora"):
-            e.initialize_pass2_model()
+        self.assertEqual(e.pass2_engine, ptd.PASS2_ENGINE_PTD)
+        self.assertIs(e.initialize_pass2_model(), e.prepared)
 
     def test_ptd_last_hop_without_ptd_mode_falls_back_to_lora_refine(self):
         # The panel hides pass2_engine outside PTD mode, so a leftover "PTD last hop" must not fail a HyperFlow run.
@@ -269,11 +273,14 @@ class EngineWiring(unittest.TestCase):
         e.configure_pass2_engine(ptd.PASS2_ENGINE_PTD)
         self.assertEqual(e.pass2_engine, ptd.PASS2_ENGINE_LORA)
 
-    def test_ptd_mode_needs_an_adapter(self):
+    def test_ptd_mode_without_an_adapter_uses_the_default_one(self):
         e = make(adapter=None)
+        e.ptd_adapter = None
         e.configure_pass2_lora("dmad.safetensors", 1.0, "replace engine LoRA", 4)
-        with self.assertRaisesRegex(ValueError, "pick a PTD adapter"):
+        with patched_choices(["none", "MiniMax-H3-Ref2VA-PTD-8Step_r64.safetensors",
+                              "MiniMax-H3-Ref2VA-PTD-RefAsymOPD-6Step.safetensors"]):
             e.configure_pass2_engine(ptd.PASS2_ENGINE_LORA)
+        self.assertEqual(e.ptd_adapter, "MiniMax-H3-Ref2VA-PTD-RefAsymOPD-6Step.safetensors")
 
     def test_unknown_engine_is_refused(self):
         with self.assertRaises(ValueError):
@@ -338,6 +345,96 @@ class ModeWiring(unittest.TestCase):
                 del sys.modules["nodes"]
             else:
                 sys.modules["nodes"] = old
+
+
+
+
+class EveryPanelCombinationConfigures(unittest.TestCase):
+    """Every combination of the settings that pick the sampling path must configure without an error and land on a
+    path that can actually run. This walks the node's own configure calls in master_node's order (pass-2 LoRA,
+    pass-2 engine, dual sampling, pass1_steps), then the per-clip windowing decision and the pass-2 model build.
+    No sampling: these are the calls that raised on the founder's runs (2026-10-27)."""
+
+    ACCEL = ("HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step · dual sampling", "PTD (adapter)")
+
+    def _engine(self, accel, adapter):
+        e = Engine()
+        e.ptd_mode = accel == "PTD (adapter)"
+        e.turbo_mode = accel == "Turbo LoRA"
+        e.hyperflow_mode = not (e.ptd_mode or e.turbo_mode)
+        e.ptd_adapter = adapter if adapter != "none" else None
+        e.sla_enabled = False
+        e.attention_backend = "comfy kitchen attention"
+        e.prepared = Model("prepared")
+        e.initialize_model = lambda: (e.prepared, None)
+        e.ptd_base = Model("ptd")
+        e.accel_model = Model("accel")
+        e.shifted_model = Model("shifted")
+        e.pass2_sla_sparsity = 0.0
+        e.pass2_model = None
+        e.pass2_sla_model = None
+        e.ptd_controller = FakeController()
+        return e
+
+    def test_no_combination_raises(self):
+        import itertools
+        checked = 0
+        with patched_choices(["none", "MiniMax-H3-Ref2VA-PTD-RefAsymOPD-6Step.safetensors"]):
+            for accel, adapter, engine, p2lora, p2mode, dual, p1steps, size, when in itertools.product(
+                    self.ACCEL, ("none", "MiniMax-H3-Ref2VA-PTD-RefAsymOPD-6Step.safetensors"),
+                    ptd.PASS2_ENGINES, ("none", "dmad.safetensors"), ("replace engine LoRA", "stack on engine LoRA"),
+                    ("off", "on", "on+early"), (0, 4), ((1280, 736), (1920, 1088)), ("above 720p", "always")):
+                with self.subTest(accel=accel, adapter=adapter, engine=engine, p2lora=p2lora, p2mode=p2mode,
+                                  dual=dual, p1steps=p1steps, size=size, when=when):
+                    e = self._engine(accel, adapter)
+                    e.pass2_chunk_frames, e.pass2_chunk_when = 124, when
+                    e.configure_pass2_lora(p2lora, 1.0, p2mode, 4)
+                    e.configure_pass2_engine(engine)
+                    dual_mode = accel.endswith("dual sampling")
+                    e.configure_dual_sampling(dual != "off" or dual_mode, 2, dual == "on+early")
+                    e.configure_pass1_steps(p1steps)
+                    e._resolve_windowed_last_hop(362, *size)
+                    model = e.initialize_pass2_model()
+                    self.assertIsNotNone(model)
+                    # the path it lands on must be runnable
+                    if e.ptd_mode:
+                        self.assertIsNotNone(e.ptd_adapter)
+                        if e.pass2_engine == ptd.PASS2_ENGINE_LORA:
+                            self.assertTrue(e._pass2_lora_active())
+                    else:
+                        self.assertEqual(e.pass2_engine, ptd.PASS2_ENGINE_LORA)
+                    checked += 1
+        self.assertEqual(checked, 4 * 2 * 2 * 2 * 2 * 3 * 2 * 2 * 2)
+
+    def test_ptd_without_any_installed_adapter_says_so(self):
+        with patched_choices(["none"]):
+            e = self._engine("PTD (adapter)", "none")
+            e.configure_pass2_lora("dmad.safetensors", 1.0, "replace engine LoRA", 4)
+            with self.assertRaisesRegex(ValueError, "models/ptd has none"):
+                e.configure_pass2_engine(ptd.PASS2_ENGINE_LORA)
+
+    def test_hyperflow_build_is_matched_to_the_base(self):
+        both = ["custom_node_hyperflow_8step_v1.0_comfyui.safetensors",
+                "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors"]
+        e = Engine()
+        e.hyperflow_file = both[0]
+        e._match_hyperflow_build(pruned_base=True, installed=both)
+        self.assertEqual(e.hyperflow_file, both[1])
+        e._match_hyperflow_build(pruned_base=False, installed=both)
+        self.assertEqual(e.hyperflow_file, both[0])
+        e.hyperflow_file = both[0]
+        e._match_hyperflow_build(pruned_base=True, installed=both[:1])  # twin not installed: left alone
+        self.assertEqual(e.hyperflow_file, both[0])
+
+
+@contextmanager
+def patched_choices(choices):
+    original = ptd.ptd_adapter_choices
+    ptd.ptd_adapter_choices = lambda: list(choices)
+    try:
+        yield
+    finally:
+        ptd.ptd_adapter_choices = original
 
 
 if __name__ == "__main__":

@@ -432,7 +432,17 @@ class MasterEngine:
             raise ValueError(f"pass2_engine '{engine}' not in {ptd_mode.PASS2_ENGINES}")
         self.pass2_engine = engine
         if self.ptd_mode and self.ptd_adapter is None:
-            raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a PTD adapter (models/ptd): pick a PTD adapter in the panel's pass-1 section (ptd_adapter)")
+            # A workflow saved before the PTD inputs (or one left on "none") must still run: use the default adapter.
+            pick = ptd_mode.default_ptd_adapter()
+            if pick is None:
+                raise ValueError(f"accel_mode '{ptd_mode.PTD_ACCEL_MODE}' needs a PTD adapter, and models/ptd has none")
+            _LOG.warning("PTD: no ptd_adapter selected; using %s", pick)
+            self.ptd_adapter = pick
+        if self.ptd_mode and engine == ptd_mode.PASS2_ENGINE_LORA and not self._pass2_lora_active():
+            # A PTD model only samples at its trained hops, so a LoRA refine without a LoRA has nothing to run on.
+            # The adapter's own final hop is the PTD-native refine.
+            _LOG.warning("PTD: pass2_engine 'LoRA refine' without a pass2_lora; running the adapter's last hop instead")
+            self.pass2_engine = engine = ptd_mode.PASS2_ENGINE_PTD
         if engine == ptd_mode.PASS2_ENGINE_PTD:
             if not self.ptd_mode:
                 # The panel hides pass2_engine outside PTD mode, so a value left over from a PTD run must not block the
@@ -443,6 +453,40 @@ class MasterEngine:
                 return
             if self._pass2_lora_active():
                 _LOG.info("PTD last hop: pass-2 LoRA %s is not used", self.pass2_lora)
+
+    def _match_hyperflow_build(self, pruned_base, installed=None):
+        """A HyperFlow build that does not fit the loaded base (pruned vs full) is swapped for its twin when that is
+        installed; the two builds differ only by '_pruned' in the name. Leaves the choice alone otherwise."""
+        pruned_file = "_pruned" in self.hyperflow_file.lower()
+        if pruned_base == pruned_file:
+            return
+        twin = (self.hyperflow_file.replace(".safetensors", "_pruned.safetensors") if pruned_base
+                else self.hyperflow_file.replace("_pruned", ""))
+        if installed is None:
+            try:
+                import folder_paths
+                installed = folder_paths.get_filename_list("hyperflow")
+            except Exception:
+                installed = []
+        if twin in installed:
+            _LOG.warning("HyperFlow: %s is the %s-base build but the loaded base is %s; using %s", self.hyperflow_file,
+                         "pruned" if pruned_file else "full", "pruned" if pruned_base else "full", twin)
+            self.hyperflow_file = twin
+
+    def _resolve_windowed_last_hop(self, frame_count, width, height, clip_index=0):
+        """"PTD last hop" refines the whole clip in one evaluation; it has no windowed form. When the settings ask for a
+        windowed pass 2 (1080p-class output, or pass2_chunk_when "always"), use the windowed LoRA refine if a pass-2
+        LoRA is set; otherwise run the last hop on the whole clip anyway. Never raises."""
+        if not (self.ptd_mode and self.pass2_engine == ptd_mode.PASS2_ENGINE_PTD
+                and self._pass2_chunking_active(frame_count, width, height)):
+            return
+        if self._pass2_lora_active():
+            _LOG.warning("Clip %d: 'PTD last hop' has no windowed form; this pass 2 is windowed, so it runs the "
+                         "windowed LoRA refine (%s) instead", clip_index + 1, self.pass2_lora)
+            self.pass2_engine = ptd_mode.PASS2_ENGINE_LORA
+        else:
+            _LOG.warning("Clip %d: 'PTD last hop' has no windowed form; refining the whole clip in one pass",
+                         clip_index + 1)
 
     def _ptd_last_hop(self):
         return self.ptd_controller.hops - 1
@@ -686,6 +730,7 @@ class MasterEngine:
         self.turbo_steps = "8"
         dm = model.get_model_object("diffusion_model")
         pruned_base = hasattr(dm, "adaln_t_table") or not hasattr(dm, "time_embedder")
+        self._match_hyperflow_build(pruned_base)
         pruned_file = "_pruned" in self.hyperflow_file.lower()
         if pruned_base and not pruned_file:
             raise ValueError(f"{self.hyperflow_file} is the FULL-base build but the loaded base is a pruned/curve "
@@ -1442,14 +1487,13 @@ class MasterEngine:
             f"Clip {clip_index + 1}: Pass 2 refining at {w2}x{h2} (conditioning pre-encoded), quality tail denoise={pass2_denoise}"
         )
 
+        self._resolve_windowed_last_hop(frame_count, w2, h2, clip_index)
+
         # Pass-2 model (a different LoRA for the refine tail when configured)
         model_p2 = self.initialize_pass2_model()
 
         if self.ptd_mode and self.pass2_engine == ptd_mode.PASS2_ENGINE_PTD:
             # The adapter's final hop only: re-noise the upscaled draft to that hop's knot and evaluate it once.
-            if self._pass2_chunking_active(frame_count, w2, h2):
-                raise ValueError("pass2_engine 'PTD last hop' refines the whole clip in one pass; set pass2_chunk_frames "
-                                 "to 0 (or pass2_chunk_when 'above 720p' with a pass-2 short side under 800 px)")
             hop = self._ptd_last_hop()
             sigmas_p2 = ptd_mode.hop_tail_sigmas(self.ptd_controller.sigmas, hop).float().cpu()
             _LOG.info("Clip %d: Pass 2 = PTD last hop (hop %d of %d, start sigma %.4f, 1 model evaluation); "
