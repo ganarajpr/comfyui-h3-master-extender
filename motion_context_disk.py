@@ -451,6 +451,24 @@ def _ensure_audio_cache_file(path):
         raise ValueError(f"H3 decoded audio cache: invalid cache data file: {path}")
 
 
+def _replace_with_retry(src, dst, attempts=12):
+    """os.replace that survives a transient lock. On Windows the swap fails with PermissionError (WinError 5 / 32)
+    while another process holds the destination open without delete sharing: the panel fetching a manifest or
+    streaming a preview, Defender scanning a fresh file, the asset seeder. Those holds last milliseconds, so retry
+    with a short backoff (~3 s in all) before giving up. 2026-10-27: a finished 2-clip render failed in FinalDecode
+    on exactly this."""
+    delay = 0.02
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
+
+
 def _write_json_atomic(path, payload):
     """Durably replace one JSON file without sharing a fixed temp filename."""
     path = Path(path)
@@ -462,7 +480,7 @@ def _write_json_atomic(path, payload):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -1928,7 +1946,7 @@ def _replace_output_from_preview(
                 os.link(Path(preview_path), tmp)
             except OSError:
                 shutil.copy2(Path(preview_path), tmp)
-        os.replace(tmp, destination)
+        _replace_with_retry(tmp, destination)
     finally:
         try:
             if tmp.exists():
@@ -2625,7 +2643,7 @@ def _embed_final_metadata_in_place(source_path, workflow=None, prompt=None):
             raise RuntimeError(
                 f"H3 Final Decode metadata embedding failed with ffmpeg code {proc.returncode}.\n{tail}"
             )
-        os.replace(temp_path, source)
+        _replace_with_retry(temp_path, source)
         return source
     finally:
         for path in (metadata_path, log_path, temp_path):
@@ -3181,7 +3199,7 @@ def _ensure_ref2va_final_segment_cache(
                 profile,
                 adjustment,
             )
-        os.replace(temp, path)
+        _replace_with_retry(temp, path)
         manifest, _ = _tag_ref2va_final_segment_cache(
             manifest_path, manifest, idx, profile, adjustment
         )
@@ -3738,7 +3756,7 @@ def _cache_guide_frame(data_path, manifest_path, manifest, index, video):
     temp = path.with_suffix(".tmp")
     try:
         torch.save(video[-1:].to(device="cpu").clone(), temp)
-        os.replace(temp, path)
+        _replace_with_retry(temp, path)
     finally:
         temp.unlink(missing_ok=True)
     manifest = dict(manifest)
@@ -4160,8 +4178,8 @@ def _sync_committed_preview(
             mux_log,
         )
 
-        os.replace(joined_video_tmp, committed_video_path)
-        os.replace(committed_tmp, committed_path)
+        _replace_with_retry(joined_video_tmp, committed_video_path)
+        _replace_with_retry(committed_tmp, committed_path)
     finally:
         for p in temp_segments:
             try:
@@ -4510,7 +4528,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         )
 
         preview_path = _reserve_preview_temp_path(final_id)
-        os.replace(temp_preview, preview_path)
+        _replace_with_retry(temp_preview, preview_path)
 
         return {
             "path": preview_path,

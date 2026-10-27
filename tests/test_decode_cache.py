@@ -35,7 +35,7 @@ class DecodeCacheTests(unittest.TestCase):
             "normalize_full_batch_export_profile": lambda p: p,
             "_normalize_color_adjustment": lambda p: p,
             "_load_manifest_from_paths": lambda *a: copy.deepcopy(self.state),
-            "_write_json_atomic": self.write_manifest,
+            "_write_json_atomic": self.write_manifest, "_replace_with_retry": os.replace,
             "_ensure_cache_root": lambda: self.root,
             "_find_ffmpeg": lambda: "ffmpeg",
             "_render_one_final_video_segment": self.decode_video,
