@@ -414,6 +414,10 @@ class EveryPanelCombinationConfigures(unittest.TestCase):
                     checked += 1
         self.assertEqual(checked, 4 * 2 * 2 * 2 * 2 * 3 * 2 * 2 * 2)
 
+    def test_default_adapter_finds_the_int8_refasymopd_file(self):
+        files = ["none", "ptd_h3_ref2va_8step_int8.safetensors", "ptd_h3_ref2va_refasymopd_8step_int8.safetensors"]
+        self.assertEqual(ptd.default_ptd_adapter(files), "ptd_h3_ref2va_refasymopd_8step_int8.safetensors")
+
     def test_ptd_without_any_installed_adapter_says_so(self):
         with patched_choices(["none"]):
             e = self._engine("PTD (adapter)", "none")

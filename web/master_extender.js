@@ -220,7 +220,7 @@ const REPAIRED_WIDGETS = [...HYPERFLOW_ONLY_WIDGETS, ...AUDIO_REFINE_WIDGETS, ..
 // The adapter picked when the engine is switched to PTD with none selected: RefAsymOPD if installed, else the first file.
 function defaultPtdAdapter(values) {
     const real = (values || []).filter(v => v && v !== "none");
-    return real.find(v => v.includes("RefAsymOPD")) ?? real[0];
+    return real.find(v => v.toLowerCase().includes("refasymopd")) ?? real[0];
 }
 // Pass-1 badge/summary name: the adapter's short name and hop count when its name says it ("...-6Step.safetensors").
 function ptdLabel(adapter) {
@@ -337,6 +337,13 @@ function repairHyperflowWidgets(node, defaults) {
             if (values.length && !values.includes(fallback)) fallback = values[0];
         }
         if (fallback !== undefined) w.value = fallback;
+    }
+    // A PTD workflow whose adapter file is gone (or was never set) gets the installed default, as the panel does on switching to PTD.
+    const ptd = node.widgets?.find(x => x.name === "ptd_adapter");
+    const accel = node.widgets?.find(x => x.name === "accel_mode");
+    if (ptd && isPtdMode(accel?.value) && String(ptd.value ?? "none") === "none") {
+        const pick = defaultPtdAdapter(comboValues(ptd));
+        if (pick) ptd.value = pick;
     }
 }
 
