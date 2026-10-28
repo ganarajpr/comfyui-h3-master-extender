@@ -66,7 +66,11 @@ export function pass2SlaSparsityValue(value) {
 // pass2_audio and nothing in pass2_sigmas. Both mean the defaults (refined audio, the usual pass-2 schedule).
 export const PASS2_AUDIO_DEFAULT = "refine";
 export function pass2AudioValue(value) {
-    return value === "pass 1" ? "pass 1" : PASS2_AUDIO_DEFAULT;
+    return value === "pass 1" || value === "frozen" ? value : PASS2_AUDIO_DEFAULT;
+}
+// pass1_audio_finish is appended after pass2_sigmas: a workflow saved before it has nothing there. Off by default.
+export function pass1AudioFinishValue(value) {
+    return value === true;
 }
 export function pass2SigmasValue(value) {
     return typeof value === "string" ? value : "";

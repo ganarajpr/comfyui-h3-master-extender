@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2AudioValue, pass2SigmasValue, pass2RowBinding } from "./widget_migration.js";
+import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2AudioValue, pass2SigmasValue, pass1AudioFinishValue, pass2RowBinding } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -202,6 +202,7 @@ const DUAL_WIDGET = "dual_sampling";
 const DUAL_DETAIL_WIDGETS = ["dual_split_step", "pass1_early_stop"];
 // pass1_steps (appended after pass1_early_stop): HyperFlow without dual sampling only; 0 = the full 8-step pass 1.
 const PASS1_STEPS_WIDGET = "pass1_steps";
+const PASS1_AUDIO_FINISH_WIDGET = "pass1_audio_finish";
 // The engine combo value that is HyperFlow with dual sampling forced on (the dual_sampling toggle is then redundant).
 const DUAL_MODE = "HyperFlow 8-step \u00b7 dual sampling";
 const isDualMode = (value) => String(value ?? "") === DUAL_MODE;
@@ -309,6 +310,8 @@ function repairDualWidgets(node) {
     if (p2Audio) p2Audio.value = pass2AudioValue(p2Audio.value);
     const p2Sigmas = node.widgets?.find(x => x.name === "pass2_sigmas");
     if (p2Sigmas) p2Sigmas.value = pass2SigmasValue(p2Sigmas.value);
+    const p1Audio = node.widgets?.find(x => x.name === PASS1_AUDIO_FINISH_WIDGET);
+    if (p1Audio) p1Audio.value = pass1AudioFinishValue(p1Audio.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -346,6 +349,7 @@ function setupModeWidgets(node) {
         setWidgetVisible(byName(DUAL_WIDGET), hyperflow && !dualMode);
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
+        setWidgetVisible(byName(PASS1_AUDIO_FINISH_WIDGET), hyperflow && !dualOn);
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
         TURBO_STEPS_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         SLA_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), slaOn));
@@ -1014,6 +1018,10 @@ app.registerExtension({
                     if (W(PASS1_STEPS_WIDGET) && !(dualMode || getW(DUAL_WIDGET, false))) {
                         wrap.appendChild(uiRow("pass 1 steps", bindNumber(PASS1_STEPS_WIDGET),
                             { hint: "0 = all 8 HyperFlow steps. 1-7: stop pass 1 early, upscale its clean estimate, then the normal refine (same LoRA, windows, denoise). Saves the skipped steps." }));
+                        if (W(PASS1_AUDIO_FINISH_WIDGET) && Number(getW(PASS1_STEPS_WIDGET, 0)) > 0) {
+                            wrap.appendChild(uiRow("finish pass 1 audio", bindToggle(PASS1_AUDIO_FINISH_WIDGET),
+                                { indent: true, hint: "Hold the video frozen and run the audio through the rest of the HyperFlow grid, so the clip starts from finished audio. Needs ComfyUI-H3-AudioRefine." }));
+                        }
                     }
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));
@@ -1078,7 +1086,7 @@ app.registerExtension({
                     if (W("pass2_sigmas")) wrap.appendChild(uiRow("refine sigmas", uiText(getW("pass2_sigmas", ""), (v) => setW("pass2_sigmas", v), { width: 180 }), { indent: true,
                         hint: "Explicit refine schedule, e.g. 0.909375, 0.857143, 0.666667, 0 (descending, ends in 0). Empty = the usual schedule. Ignored with dual sampling." }));
                     if (W("pass2_audio")) wrap.appendChild(uiRow("clip audio from", bindSelect("pass2_audio"), { indent: true,
-                        hint: "pass 1 = keep the draft pass's audio and take only the video from the refine pass." }));
+                        hint: "pass 1 = keep the draft pass's audio and take only the video from the refine pass. frozen = also refine the video against that audio (held fixed as clean context)." }));
                 } else {
                     wrap.appendChild(uiHint(qualitySummary().split(" · ").slice(2).join(" · ")));
                 }

@@ -119,7 +119,15 @@ console.log("widget migration ok");
     assert.equal(pass2AudioValue(""), "refine");
     assert.equal(pass2AudioValue(undefined), "refine");
     assert.equal(pass2AudioValue("pass 1"), "pass 1");
+    assert.equal(pass2AudioValue("frozen"), "frozen");
     assert.equal(pass2SigmasValue(undefined), "");
     assert.equal(pass2SigmasValue(0.5), "");
     assert.equal(pass2SigmasValue("0.9, 0.5, 0"), "0.9, 0.5, 0");
+}
+
+{
+    const { pass1AudioFinishValue } = await import("../web/widget_migration.js");
+    assert.equal(pass1AudioFinishValue(undefined), false);
+    assert.equal(pass1AudioFinishValue(""), false);
+    assert.equal(pass1AudioFinishValue(true), true);
 }

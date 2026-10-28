@@ -12,6 +12,7 @@ import math
 import logging
 import os
 import sys
+import time
 import torch
 import comfy.model_management
 import comfy.sample
@@ -231,6 +232,20 @@ def pass1_steps_sigmas(grid, steps):
     return grid[:int(steps) + 1]
 
 
+def pass1_audio_finish_active(enabled, steps, grid_steps=8):
+    """The audio finish only acts after a HyperFlow pass 1 that stopped early (0 < steps < the grid's step count)."""
+    return bool(enabled) and 0 < int(steps or 0) < int(grid_steps)
+
+
+def with_pass1_audio_finish_p1_settings(settings, active):
+    """Add the audio finish to the pass-1 fingerprint settings, only when it is on, so existing pass-1 caches keep
+    hitting. It changes the audio the pass-1 draft carries."""
+    if active:
+        settings = dict(settings)
+        settings["pass1_audio_finish"] = True
+    return settings
+
+
 PASS2_CHUNK_WHEN = ("above 720p", "always")
 PASS2_CHUNK_MIN_SHORT_SIDE = 800
 
@@ -433,9 +448,12 @@ class MasterEngine:
 
     def configure_pass2_extras(self, audio="refine", sigmas=""):
         """Opt-in pass-2 overrides; the defaults change nothing. audio: 'pass 1' swaps the pass-1 audio latent back in
-        after pass 2. sigmas: an explicit descending sigma list that replaces the pass-2 schedule (not with dual
+        after pass 2; 'frozen' also holds that audio fixed as clean context while pass 2 samples the video (and keeps
+        it after). sigmas: an explicit descending sigma list that replaces the pass-2 schedule (not with dual
         sampling). Call after configure_dual_sampling."""
-        self.pass2_audio_from_p1 = str(audio or "").strip().lower() == "pass 1"
+        audio = str(audio or "").strip().lower()
+        self.pass2_audio_frozen = audio == "frozen"
+        self.pass2_audio_from_p1 = audio in ("pass 1", "frozen")
         self.pass2_sigmas_override = parse_pass2_sigmas(sigmas)
         if self.pass2_sigmas_override and getattr(self, "dual_active", False):
             _LOG.warning("pass2_sigmas ignored: dual sampling sets the pass-2 schedule")
@@ -476,6 +494,50 @@ class MasterEngine:
             _LOG.warning("pass1_steps=%d ignored: dual sampling sets the pass-1 length (dual_split_step)", steps)
             return
         self.pass1_steps = steps
+
+    def configure_pass1_audio_finish(self, enabled=False):
+        """Opt-in: after an early-stopped HyperFlow pass 1 (pass1_steps), finish the audio along the rest of the grid with
+        the video held frozen. Call after configure_pass1_steps. Needs ComfyUI-H3-AudioRefine (H3FrozenVideoCache)."""
+        self.pass1_audio_finish = False
+        if not enabled:
+            return
+        if not pass1_audio_finish_active(True, self.pass1_steps):
+            _LOG.warning("pass1_audio_finish ignored: it needs HyperFlow 8-step with pass1_steps 1-7 (not dual sampling or Turbo LoRA mode)")
+            return
+        if nodes.NODE_CLASS_MAPPINGS.get("H3FrozenVideoCache") is None:
+            raise RuntimeError("pass1_audio_finish needs the ComfyUI-H3-AudioRefine node pack "
+                               "(H3FrozenVideoCache) in custom_nodes: "
+                               "git clone https://github.com/Adudeguyman/ComfyUI-H3-AudioRefine.git")
+        self.pass1_audio_finish = True
+
+    @staticmethod
+    def _av_noise_mask(samples, video_free, audio_free):
+        """Per-stream denoise mask for a packed AV latent (1 = sampled, 0 = held as clean context), the same masks
+        ComfyUI-H3-AudioRefine builds. Core's reshape_mask broadcasts the single channel."""
+        video, audio = _streams_from_latent({"samples": samples}, "samples")
+        v = torch.full((1, 1, video.shape[2], video.shape[3], video.shape[4]), 1.0 if video_free else 0.0, dtype=torch.float32)
+        a = torch.full((1, 1, audio.shape[2], audio.shape[3]), 1.0 if audio_free else 0.0, dtype=torch.float32)
+        return comfy.nested_tensor.NestedTensor((v, a))
+
+    def _finish_pass1_audio(self, model, positive, sampled, sigmas, seed, clip_index):
+        """Finish the audio of an early-stopped pass 1 along HyperFlow's remaining grid sigmas (`sigmas` = grid[k:]).
+
+        The video stays frozen at its step-k x0 through a per-stream denoise mask (the masked path H3AudioRefineSampler
+        uses, fed through _sample_euler with explicit sigmas because that node only takes steps/scheduler/denoise). The
+        audio starts from sigma_k * noise + (1 - sigma_k) * audio_x0, the same noise as pass 1 (same seed), on the
+        same model pass 1 used, Euler, CFG 1."""
+        tokens = self._packed_tokens(sampled["samples"])
+        model = nodes.NODE_CLASS_MAPPINGS["H3FrozenVideoCache"]().patch(
+            model, enabled=True, cache_contents="hidden", backend="auto", precision="int4",
+            refresh_interval=0, verbose=False, allow_disk=False, free_after_pass=True)[0]
+        _LOG.info("Clip %d: pass-1 audio finish, %d steps on sigmas %s, %d tokens, video frozen, frozen cache on (hidden/int4)",
+                  clip_index + 1, len(sigmas) - 1, [round(float(x), 4) for x in sigmas], tokens)
+        started = time.time()
+        latent = {**sampled, "noise_mask": self._av_noise_mask(sampled["samples"], False, True)}
+        out = self._sample_euler(model=model, positive=positive, latent_image=latent, sigmas=sigmas, seed=seed)
+        out.pop("noise_mask", None)
+        _LOG.info("Clip %d: pass-1 audio finish took %.1f s", clip_index + 1, time.time() - started)
+        return out
 
     def configure_audio_refine(self, steps=0, denoise=0.5, cache=True):
         """Audio-only refine after pass 2 (ComfyUI-H3-AudioRefine). steps 0 = off."""
@@ -1339,10 +1401,13 @@ class MasterEngine:
         else:
             # Sample Pass 1 with the pass-1 sigmas
             early_stop = self.dual_active and self.pass1_early_stop and pass2_enabled
+            grid_p1 = sigmas_p1
+            finish_audio = False
             if (not early_stop and self.pass1_steps > 0 and not self.dual_active and pass2_enabled
                     and self.pass1_steps < len(sigmas_p1) - 1):
                 k = self.pass1_steps
                 early_stop = True
+                finish_audio = bool(getattr(self, "pass1_audio_finish", False))
                 _LOG.info("Clip %d: Pass 1 early stop: %d of %d HyperFlow steps (sigma %.4f), x0 estimate -> upscale -> normal refine",
                           clip_index + 1, k, len(sigmas_p1) - 1, float(sigmas_p1[k]))
                 sigmas_p1 = pass1_steps_sigmas(sigmas_p1, k)
@@ -1359,6 +1424,10 @@ class MasterEngine:
                 seed=seed,
                 return_denoised=early_stop,
             )
+            if finish_audio:
+                if progress_cb:
+                    progress_cb("pass1_audio", f"Clip {clip_index + 1} - Finishing the pass-1 audio...", 0.45)
+                sampled_p1 = self._finish_pass1_audio(model, pos_p1, sampled_p1, grid_p1[self.pass1_steps:], seed, clip_index)
 
         if not pass2_enabled:
             self.last_draft = None if cached else sampled_p1
@@ -1409,7 +1478,12 @@ class MasterEngine:
 
         # Sample Pass 2 (High-Res Refine): whole clip, or overlapping temporal
         # windows when the clip is longer than pass2_chunk_frames.
+        audio_frozen = getattr(self, "pass2_audio_frozen", False)
         if self._pass2_chunking_active(frame_count, w2, h2):
+            if audio_frozen:
+                # MMH3SplitUpscale already holds each window's audio slice at denoise mask 0 (clean context) and
+                # stitches the audio back from those slices, so the windows are generated against the real audio.
+                _LOG.info("Clip %d: pass 2 in windows with the audio held fixed (pass2_audio = frozen)", clip_index + 1)
             final_sampled = self._sample_pass2_chunked(
                 model=model_p2,
                 positive=pos_p2,
@@ -1418,6 +1492,10 @@ class MasterEngine:
                 seed=seed,
             )
         else:
+            if audio_frozen:
+                _LOG.info("Clip %d: pass 2 samples the video against the held pass-1 audio (pass2_audio = frozen)", clip_index + 1)
+                rejoined_latent = {**rejoined_latent,
+                                   "noise_mask": self._av_noise_mask(rejoined_latent["samples"], True, False)}
             final_sampled = self._sample_euler(
                 model=model_p2,
                 positive=pos_p2,
@@ -1425,10 +1503,12 @@ class MasterEngine:
                 sigmas=sigmas_p2,
                 seed=seed,
             )
+            final_sampled.pop("noise_mask", None)
 
         if getattr(self, "pass2_audio_from_p1", False):
             video_p2, _ = _streams_from_latent(final_sampled, "samples")
-            _LOG.info("Clip %d: pass-2 video with the pass-1 audio latent (pass2_audio = pass 1)", clip_index + 1)
+            _LOG.info("Clip %d: pass-2 video with the pass-1 audio latent (pass2_audio = %s)", clip_index + 1,
+                      "frozen" if audio_frozen else "pass 1")
             final_sampled = {**final_sampled, "samples": comfy.nested_tensor.NestedTensor((video_p2, audio_p1))}
 
         if getattr(self, "audio_refine_steps", 0) > 0:

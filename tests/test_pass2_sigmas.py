@@ -141,15 +141,22 @@ class Override(unittest.TestCase):
         self.assertTrue(e.pass2_audio_from_p1)
         e.configure_pass2_extras("refine")
         self.assertFalse(e.pass2_audio_from_p1)
+        self.assertFalse(e.pass2_audio_frozen)
+
+    def test_frozen_option_keeps_the_pass1_audio(self):
+        e = make()
+        e.configure_pass2_extras("frozen")
+        self.assertTrue(e.pass2_audio_frozen)
+        self.assertTrue(e.pass2_audio_from_p1)
 
 
 class NodeAndFingerprint(unittest.TestCase):
     def test_inputs_appended_last(self):
         text = NODE.read_text(encoding="utf-8")
-        self.assertRegex(text, r'"pass2_audio": \(\["refine", "pass 1"\], \{"default": "refine"')
+        self.assertRegex(text, r'"pass2_audio": \(\["refine", "pass 1", "frozen"\], \{"default": "refine"')
         self.assertRegex(text, r'"pass2_sigmas": \("STRING", \{"default": ""')
         names = re.findall(r'^\s{16}"(\w+)": \(', text[text.index("def INPUT_TYPES"):], re.M)
-        self.assertEqual(names[-2:], ["pass2_audio", "pass2_sigmas"])
+        self.assertEqual(names[-3:], ["pass2_audio", "pass2_sigmas", "pass1_audio_finish"])
 
     def test_fingerprint_changes_only_when_set(self):
         tree = ast.parse(PROJECTS.read_text(encoding="utf-8"))

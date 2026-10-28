@@ -56,6 +56,7 @@ from .pdd_pure_engine import (
     duration_to_h3_frames,
     with_dual_p1_settings,
     with_pass1_steps_p1_settings,
+    with_pass1_audio_finish_p1_settings,
 )
 
 PASS2_OFF = "off (pass 1 only)"
@@ -506,8 +507,9 @@ class MiniMaxH3MasterExtender:
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
-                "pass2_audio": (["refine", "pass 1"], {"default": "refine", "tooltip": "Which audio the clip keeps. refine = the audio pass 2 re-sampled (the long-standing behaviour). pass 1 = the pass-1 audio latent is swapped back in after pass 2, so only the video comes from pass 2."}),
+                "pass2_audio": (["refine", "pass 1", "frozen"], {"default": "refine", "tooltip": "Which audio the clip keeps. refine = the audio pass 2 re-sampled (the long-standing behaviour). pass 1 = the pass-1 audio latent is swapped back in after pass 2, so only the video comes from pass 2. frozen = like pass 1, and pass 2 also samples the video with that audio held fixed as clean context, so the lips are generated against the real audio (windowed refines already do this)."}),
                 "pass2_sigmas": ("STRING", {"default": "", "tooltip": "Explicit pass-2 sigma schedule: comma-separated, strictly descending, ending in 0, e.g. 0.909375, 0.857143, 0.666667, 0. The refine starts from the upscaled draft noised to the first value and runs one step per gap. Empty = the usual schedule (denoise / scheduler / HyperFlow tail). Replaces it in every mode except dual sampling, which ignores this."}),
+                "pass1_audio_finish": ("BOOLEAN", {"default": False, "tooltip": "Only with pass1_steps 1-7 (HyperFlow 8-step, not dual sampling). After the early stop the video is held frozen and the audio is finished along the rest of HyperFlow's own grid (e.g. sigma 0.6969 to 0 for pass1_steps 6) on the pass-1 model, so pass 2 and the clip start from finished audio instead of the step-k estimate. Needs the ComfyUI-H3-AudioRefine pack."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -837,7 +839,9 @@ class MiniMaxH3MasterExtender:
         )
         engine.configure_pass1_steps(kwargs.get("pass1_steps", 0) if pass2_enabled else 0)
         engine.configure_pass2_extras(kwargs.get("pass2_audio", "refine"), kwargs.get("pass2_sigmas", ""))
-        pass2_audio_p1 = engine.pass2_audio_from_p1 and pass2_enabled
+        engine.configure_pass1_audio_finish(kwargs.get("pass1_audio_finish", False) if pass2_enabled else False)
+        pass2_audio_p1 = engine.pass2_audio_from_p1 and not engine.pass2_audio_frozen and pass2_enabled
+        pass2_audio_frozen = engine.pass2_audio_frozen and pass2_enabled
         pass2_sigmas_fp = engine.pass2_sigmas_override if pass2_enabled else None
         audio_refine = _audio_refine_signature(
             kwargs.get("audio_refine_steps", 0), kwargs.get("audio_refine_denoise", 0.5),
@@ -881,6 +885,7 @@ class MiniMaxH3MasterExtender:
             bool(kwargs.get("pass1_early_stop", False)))
 
         p1_settings = with_pass1_steps_p1_settings(p1_settings, engine.pass1_steps)
+        p1_settings = with_pass1_audio_finish_p1_settings(p1_settings, engine.pass1_audio_finish)
 
         clip_pictures = [clip_picture_keys(c, refs, n + 1) for n, c in enumerate(clips)]
         if any(p is not None for p in clip_pictures):
@@ -922,7 +927,7 @@ class MiniMaxH3MasterExtender:
             reuse = False
             if is_on_disk and (is_validated or not rerolls):
                 try:
-                    expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te, pass2_audio_p1, pass2_sigmas_fp)
+                    expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te, pass2_audio_p1, pass2_sigmas_fp, pass2_audio_frozen, engine.pass1_audio_finish)
                 except (TypeError, ValueError):
                     expected_fp = None
                 stored = _stored_fingerprints(data_path, manifest_path)
@@ -1008,7 +1013,7 @@ class MiniMaxH3MasterExtender:
             elif seed_mode == "decrement":
                 seed_val = max(0, seed_val - 1)
                 clip_cfg["seed"] = seed_val
-            clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te, pass2_audio_p1, pass2_sigmas_fp)
+            clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te, pass2_audio_p1, pass2_sigmas_fp, pass2_audio_frozen, engine.pass1_audio_finish)
             clip_p1_fp = _pass1_fingerprint(previous_p1_fp, clip_cfg, seed_val, p1_settings)
 
             # A pass-1 result rendered from exactly these pass-1 inputs is loaded instead of
