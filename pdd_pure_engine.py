@@ -182,6 +182,27 @@ def dual_pass1_sigmas(grid, split):
     return grid[:dual_split_index(grid, split) + 1]
 
 
+def parse_pass2_sigmas(text):
+    """'0.909375, 0.857143, 0.666667, 0' -> [0.909375, 0.857143, 0.666667, 0.0]; None for an empty string.
+    Strictly descending, all in [0, 1], at least two values, last exactly 0."""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    try:
+        values = [float(x) for x in text.replace(";", ",").split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(f"pass2_sigmas must be comma-separated numbers, got {text!r}") from None
+    if len(values) < 2:
+        raise ValueError(f"pass2_sigmas needs at least 2 values (e.g. '0.9, 0.5, 0'), got {text!r}")
+    if any(not math.isfinite(v) or v < 0.0 or v > 1.0 for v in values):
+        raise ValueError(f"pass2_sigmas values must be within [0, 1], got {text!r}")
+    if any(b >= a for a, b in zip(values, values[1:])):
+        raise ValueError(f"pass2_sigmas must be strictly descending, got {text!r}")
+    if values[-1] != 0.0:
+        raise ValueError(f"pass2_sigmas must end in 0, got {text!r}")
+    return values
+
+
 def dual_pass2_sigmas(grid, split):
     """Pass 2 of dual sampling: the grid tail from index k, i.e. len(grid) - 1 - k steps."""
     return grid[dual_split_index(grid, split):]
@@ -409,6 +430,16 @@ class MasterEngine:
         self.pass2_steps = int(steps or 0)
         self.pass2_model = None
         self.pass2_sla_model = None
+
+    def configure_pass2_extras(self, audio="refine", sigmas=""):
+        """Opt-in pass-2 overrides; the defaults change nothing. audio: 'pass 1' swaps the pass-1 audio latent back in
+        after pass 2. sigmas: an explicit descending sigma list that replaces the pass-2 schedule (not with dual
+        sampling). Call after configure_dual_sampling."""
+        self.pass2_audio_from_p1 = str(audio or "").strip().lower() == "pass 1"
+        self.pass2_sigmas_override = parse_pass2_sigmas(sigmas)
+        if self.pass2_sigmas_override and getattr(self, "dual_active", False):
+            _LOG.warning("pass2_sigmas ignored: dual sampling sets the pass-2 schedule")
+            self.pass2_sigmas_override = None
 
     def configure_dual_sampling(self, enabled=False, split_step=2, early_stop=False):
         """HyperFlow dual sampling: pass 2 is the tail of the trained grid from index `split_step`, with no pass-2
@@ -728,7 +759,11 @@ class MasterEngine:
         """Quality-tail schedule for pass 2: the tail of HyperFlow's own grid, or the last
         round(steps x denoise) steps of the turbo schedule. With a pass-2 LoRA
         the schedule length can differ from pass 1 (pass2_steps), and in
-        "replace" mode the pass-1 grid no longer applies."""
+        "replace" mode the pass-1 grid no longer applies. pass2_sigmas, when set, replaces all of it."""
+        override = getattr(self, "pass2_sigmas_override", None)
+        if override and not self.dual_active:
+            _LOG.info("Pass 2 sigmas (pass2_sigmas override, %d steps): %s", len(override) - 1, override)
+            return torch.tensor(override, dtype=torch.float32)
         if self.dual_active:
             tail = dual_pass2_sigmas(self.pass1_sigmas, self.dual_split_step)
             _LOG.info("HyperFlow dual sampling: pass 2 runs grid[%d:] (%d steps): %s",
@@ -1390,6 +1425,11 @@ class MasterEngine:
                 sigmas=sigmas_p2,
                 seed=seed,
             )
+
+        if getattr(self, "pass2_audio_from_p1", False):
+            video_p2, _ = _streams_from_latent(final_sampled, "samples")
+            _LOG.info("Clip %d: pass-2 video with the pass-1 audio latent (pass2_audio = pass 1)", clip_index + 1)
+            final_sampled = {**final_sampled, "samples": comfy.nested_tensor.NestedTensor((video_p2, audio_p1))}
 
         if getattr(self, "audio_refine_steps", 0) > 0:
             if progress_cb:

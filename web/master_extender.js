@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2RowBinding } from "./widget_migration.js";
+import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2AudioValue, pass2SigmasValue, pass2RowBinding } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -305,6 +305,10 @@ function repairDualWidgets(node) {
     if (chunkWhen) chunkWhen.value = pass2ChunkWhenValue(chunkWhen.value);
     const p2Sla = node.widgets?.find(x => x.name === "pass2_sla_sparsity");
     if (p2Sla) p2Sla.value = pass2SlaSparsityValue(p2Sla.value);
+    const p2Audio = node.widgets?.find(x => x.name === "pass2_audio");
+    if (p2Audio) p2Audio.value = pass2AudioValue(p2Audio.value);
+    const p2Sigmas = node.widgets?.find(x => x.name === "pass2_sigmas");
+    if (p2Sigmas) p2Sigmas.value = pass2SigmasValue(p2Sigmas.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -1071,6 +1075,10 @@ app.registerExtension({
                     wrap.appendChild(uiRow("draft resolution", bindSelect("pass1_resolution"), { indent: true }));
                     wrap.appendChild(uiRow("refine resolution", bindSelect("pass2_resolution"), { indent: true }));
                     wrap.appendChild(uiRow("refine denoise", bindNumber("pass2_denoise"), { indent: true }));
+                    if (W("pass2_sigmas")) wrap.appendChild(uiRow("refine sigmas", uiText(getW("pass2_sigmas", ""), (v) => setW("pass2_sigmas", v), { width: 180 }), { indent: true,
+                        hint: "Explicit refine schedule, e.g. 0.909375, 0.857143, 0.666667, 0 (descending, ends in 0). Empty = the usual schedule. Ignored with dual sampling." }));
+                    if (W("pass2_audio")) wrap.appendChild(uiRow("clip audio from", bindSelect("pass2_audio"), { indent: true,
+                        hint: "pass 1 = keep the draft pass's audio and take only the video from the refine pass." }));
                 } else {
                     wrap.appendChild(uiHint(qualitySummary().split(" · ").slice(2).join(" · ")));
                 }

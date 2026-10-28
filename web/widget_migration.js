@@ -62,6 +62,15 @@ export function pass2ChunkWhenValue(value) {
 export function pass2SlaSparsityValue(value) {
     return typeof value === "number" && Number.isFinite(value) && value >= 0.5 && value <= 0.99 ? value : 0;
 }
+// pass2_audio and pass2_sigmas are appended after pass2_sla_sparsity: a workflow saved before them has master_ui's "" in
+// pass2_audio and nothing in pass2_sigmas. Both mean the defaults (refined audio, the usual pass-2 schedule).
+export const PASS2_AUDIO_DEFAULT = "refine";
+export function pass2AudioValue(value) {
+    return value === "pass 1" ? "pass 1" : PASS2_AUDIO_DEFAULT;
+}
+export function pass2SigmasValue(value) {
+    return typeof value === "string" ? value : "";
+}
 export function dualWidgetValue(name, value) {
     const fallback = DUAL_DEFAULTS[name];
     if (typeof fallback === "boolean") return typeof value === "boolean" ? value : fallback;
