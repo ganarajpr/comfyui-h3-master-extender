@@ -72,7 +72,7 @@ class Script:
 
 
 def engine(chat, tmp, **kw):
-    values = dict(brief="Clip 1 - a fight.", clips=2, seconds=15, language="English", concurrency=1)
+    values = dict(brief="Clip 1 - a fight.", clips=2, seconds=15, language="English", concurrency=1, seams=False)
     values.update(kw)
     return sh.ShotEngine(chat, Path(tmp) / "work", **values)
 
@@ -795,6 +795,152 @@ class JsPanelTests(unittest.TestCase):
         self.assertIn("Re-import from writer", js)
         self.assertIn('i.name === "clips_in" && i.link != null', js)
         self.assertIn("incoming.from_writer === true", js)
+
+
+FIXED = [shot(0, "Kael, in her grey cloak and silver plate armour, sits upright behind the boulder"), shot(6, "She breathes, still", framing="close up")]
+
+
+def seams_json(total, flagged=(), inside=()):
+    rows = []
+    for n in range(2, total + 1):
+        hit = next((f for f in flagged if f["from"] == n - 1), None)
+        rows.append(dict({"from": n - 1, "to": n, "ok": True, "aspect": "", "problem": "", "fix_clip": 0, "fix": ""}, **({"ok": False, **hit} if hit else {})))
+    return json.dumps({"seams": rows, "inside": list(inside)})
+
+
+def seam_handler(seam_answer):
+    def handler(kind, messages, n):
+        if kind == "plan":
+            return plan_json(3)
+        if kind == "seams":
+            return seam_answer
+        if kind.startswith("seamfix"):
+            return shots_json(int(kind.split("_")[1]), FIXED)
+        return shots_json(int(kind.split("_")[1]), GOOD)
+    return handler
+
+
+SEAM_BAD = {"from": 1, "to": 2, "aspect": "posture", "fix_clip": 1, "problem": "Clip 1's last shot has Kael standing with her sword raised, but the plan ends it seated.",
+            "fix": "End clip 1 with Kael seated upright behind the boulder."}
+
+
+class SeamCheckTests(unittest.TestCase):
+    def run_engine(self, chat, tmp, **kw):
+        return engine(chat, tmp, clips=3, seams=True, **kw).run()
+
+    def test_all_seams_ok_is_one_call_and_no_rewrite(self):
+        chat = Script(seam_handler(seams_json(3)))
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = engine(chat, tmp, clips=3, seams=True)
+            out = eng.run()
+        self.assertEqual(sorted(chat.kinds()), ["plan", "seams", "shots_001", "shots_002", "shots_003"])
+        self.assertFalse(any(c.get("seam_fixed") for c in out["clips"]))
+        self.assertEqual(eng.seam_report["seams"], 2)
+        self.assertEqual(eng.seam_report["rewritten"], [])
+        call = next(c for c in chat.calls if c["kind"] == "seams")
+        self.assertEqual(call["budget"], sw.THINKING_BUDGET)
+        self.assertEqual(call["response_format"]["json_schema"]["name"], "seam_check")
+        text = user(call)
+        self.assertIn("SEAM 1 -> 2", text)
+        self.assertIn("SEAM 2 -> 3", text)
+        self.assertIn("CLIP 2 CHANGES INSIDE ITSELF", text)   # the planned change of clip 2 is wardrobe and props
+        self.assertNotIn("{{", text)
+
+    def test_flagged_seam_rewrites_only_the_fix_clip_with_the_complaint(self):
+        chat = Script(seam_handler(seams_json(3, [SEAM_BAD])))
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = engine(chat, tmp, clips=3, seams=True)
+            out = eng.run()
+        self.assertEqual(sorted(chat.kinds()), ["plan", "seamfix_001", "seams", "shots_001", "shots_002", "shots_003"])
+        retry = next(c for c in chat.calls if c["kind"] == "seamfix_001")
+        text = user(retry)
+        self.assertIn("SEAM CHECK (the cut from clip 1 to clip 2, posture): Clip 1's last shot has Kael standing with her sword raised", text)
+        self.assertIn("Fix: End clip 1 with Kael seated upright behind the boulder.", text)
+        self.assertIn("Shot 3 – 10s – wide shot: Kael raises her sword.", text)   # the first shot list is shown to the rewrite
+        first, second, third = out["clips"]
+        self.assertTrue(first["seam_fixed"])
+        self.assertIn("sits upright behind the boulder", first["raw"])
+        self.assertNotIn("seam_fixed", second)
+        self.assertNotIn("seam_fixed", third)
+        self.assertEqual(second["shots"], GOOD)
+        self.assertEqual(eng.seam_report["rewritten"], [1])
+        self.assertTrue(any("seam check: clip 1 -> 2 (posture)" in w for w in eng.warnings))
+
+    def test_fix_clip_is_the_next_clip_when_the_model_says_so_and_defaults_to_the_earlier(self):
+        found = sh.coerce_seams({"seams": [{"from": 1, "to": 2, "ok": False, "aspect": "wardrobe", "problem": "a", "fix_clip": 2, "fix": "x"},
+                                           {"from": 2, "to": 3, "ok": False, "aspect": "bogus", "problem": "b", "fix_clip": 9, "fix": "y"},
+                                           {"from": 3, "to": 4, "ok": False, "aspect": "props", "problem": "", "fix_clip": 3, "fix": "z"}], "inside": []}, 3)
+        self.assertEqual([(s["from"], s["fix_clip"], s["aspect"]) for s in found["seams"]], [(1, 2, "wardrobe"), (2, 2, "")])
+        self.assertEqual(sh.seam_complaints(found), {2: ["SEAM CHECK (the cut from clip 1 to clip 2, wardrobe): a Fix: x", "SEAM CHECK (the cut from clip 2 to clip 3): b Fix: y"]})
+
+    def test_inside_flag_rewrites_that_clip(self):
+        inside = [{"clip": 2, "ok": False, "problem": "The armour never appears in clip 2's shots.", "fix": "Show the plate armour forming around Kael."}]
+        chat = Script(seam_handler(seams_json(3, inside=inside)))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.run_engine(chat, tmp)
+        self.assertEqual(sorted(chat.kinds()), ["plan", "seamfix_002", "seams", "shots_001", "shots_002", "shots_003"])
+        text = user(next(c for c in chat.calls if c["kind"] == "seamfix_002"))
+        self.assertIn("SEAM CHECK (inside this clip): The armour never appears in clip 2's shots. Fix: Show the plate armour forming around Kael.", text)
+        self.assertEqual([bool(c.get("seam_fixed")) for c in out["clips"]], [False, True, False])
+
+    def test_rewritten_clip_goes_through_the_code_checks_again(self):
+        def handler(kind, messages, n):
+            if kind.startswith("seamfix"):
+                return shots_json(1, [shot(0, "Kael sits"), shot(1, "Kael waits")])   # a 1-second shot: breaks timing
+            return seam_handler(seams_json(3, [SEAM_BAD]))(kind, messages, n)
+
+        chat = Script(handler)
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = engine(chat, tmp, clips=3, seams=True)
+            eng.run()
+        self.assertEqual(chat.kinds().count("seamfix_001"), 2)   # the per-clip retry ran on the rewrite
+        self.assertIn("YOUR PREVIOUS ANSWER HAD THESE PROBLEMS", user([c for c in chat.calls if c["kind"] == "seamfix_001"][1]))
+
+    def test_unreadable_seam_answer_warns_and_changes_nothing(self):
+        chat = Script(seam_handler("I could not find anything wrong."))
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = engine(chat, tmp, clips=3, seams=True)
+            out = eng.run()
+        self.assertEqual(sorted(chat.kinds()), ["plan", "seams", "shots_001", "shots_002", "shots_003"])
+        self.assertTrue(any(w.startswith("seam check: the answer was not one JSON object") for w in eng.warnings))
+        self.assertEqual([c["shots"] for c in out["clips"]], [GOOD] * 3)
+
+    def test_resume_reads_the_cached_seam_result_and_makes_no_calls(self):
+        chat = Script(seam_handler(seams_json(3, [SEAM_BAD])))
+        with tempfile.TemporaryDirectory() as tmp:
+            first = engine(chat, tmp, clips=3, seams=True).run()
+            before = len(chat.calls)
+            again = engine(chat, tmp, clips=3, seams=True).run()
+        self.assertEqual(len(chat.calls), before)
+        self.assertEqual(again["clips"], first["clips"])
+        self.assertTrue(again["clips"][0]["seam_fixed"])
+
+    def test_resume_after_a_crash_between_the_seam_answer_and_the_rewrite_redoes_only_the_rewrite(self):
+        chat = Script(seam_handler(seams_json(3, [SEAM_BAD])))
+        with tempfile.TemporaryDirectory() as tmp:
+            engine(chat, tmp, clips=3, seams=True).run()
+            clip_file = Path(tmp) / "work" / "clips" / "001.json"
+            saved = json.loads(clip_file.read_text(encoding="utf-8"))
+            saved.pop("seam_fixed")
+            clip_file.write_text(json.dumps(saved), encoding="utf-8")
+            before = len(chat.calls)
+            engine(chat, tmp, clips=3, seams=True).run()
+        self.assertEqual([c["kind"] for c in chat.calls[before:]], ["seamfix_001"])
+
+    def test_pictures_ride_on_the_seam_call_in_the_same_layout_as_the_shot_calls(self):
+        pictures = [{"label": "Picture 1", "image": "data:image/png;base64,AAAA", "tokens": 10}]
+        chat = Script(seam_handler(seams_json(3)))
+        with tempfile.TemporaryDirectory() as tmp:
+            engine(chat, tmp, clips=3, seams=True, pictures=pictures).run()
+        shots_call = next(c for c in chat.calls if c["kind"] == "shots_001")
+        seams_call = next(c for c in chat.calls if c["kind"] == "seams")
+        self.assertEqual(shots_call["messages"][0]["content"][:-1], seams_call["messages"][0]["content"][:-1])
+
+    def test_a_single_clip_has_no_seams(self):
+        chat = Script(lambda kind, m, n: plan_json(1) if kind == "plan" else shots_json(1, GOOD))
+        with tempfile.TemporaryDirectory() as tmp:
+            engine(chat, tmp, clips=1, seams=True).run()
+        self.assertEqual(sorted(chat.kinds()), ["plan", "shots_001"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,11 @@ prompts carry the interpretation. Calls go to the same local model server the St
    in the target script, words that fit the shot, and the founder's own lines present verbatim. A clip that fails is asked again once with the specific
    complaint; whatever is best after that is kept and a warning logged.
 
+4. SEAM CHECK (one more call on the same server, ``prompts/shot_writer_seams.md``): the model reads every cut N-1 to N (how clip N-1's last shots really end
+   against the state it was planned to end in, and how clip N's first shots open against its planned start) and every clip that changes wardrobe or props
+   inside itself, and flags what does not hold: wardrobe, props held or worn, posture and position, visible condition. Only the flagged clips are written
+   again, once, with the complaint appended, and pass the same code checks. There is no second seam check; a seam answer that cannot be read is a warning.
+
 Every reply is requested with a JSON schema (``response_format``) and also described in the prompt; it is parsed tolerantly all the same.
 The pure engine (``ShotEngine``) takes any ``chat(messages, max_tokens=, budget=, kind=, temperature=, response_format=) -> Reply``. ComfyUI is imported
 lazily, so the engine runs and is tested without it.
@@ -50,12 +55,14 @@ except ImportError:  # imported as a top-level module (tests)
 
 _LOG = logging.getLogger("minimax_h3_master_extender.shot_writer")
 
-VERSION = "1"
+VERSION = "2"
 MIN_CLIPS, MIN_SECONDS, MAX_SECONDS = 0, 4, 30
 REF_SLOTS = 9             # the Extender's ref_image_1 .. ref_image_9
 PLAN_PART = 20            # clips planned per call; a longer film is planned in parts
 MIN_SHOT_SECONDS = 2
 MIN_SHOTS, MAX_SHOTS = 2, 6
+SEAM_SHORT_SHOT = 4       # a last shot shorter than this (s) is shown together with the shot before it
+SEAM_ASPECTS = ("wardrobe", "props", "posture", "position", "condition")
 WIDE_WORDS_FACTOR = 0.75  # a word of a non-Latin language is longer than an English one
 OUTPUT_SUBDIR = "h3_shot_writer"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
@@ -315,6 +322,16 @@ SHOTS_SCHEMA = {
 }
 
 
+SEAMS_SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["seams", "inside"],
+    "properties": {
+        "seams": _list_of(**{"from": {"type": "integer"}, "to": {"type": "integer"}, "ok": {"type": "boolean"}, "aspect": {"type": "string", "enum": [*SEAM_ASPECTS, ""]},
+                             "problem": {"type": "string"}, "fix_clip": {"type": "integer"}, "fix": {"type": "string"}}),
+        "inside": _list_of(clip={"type": "integer"}, ok={"type": "boolean"}, problem={"type": "string"}, fix={"type": "string"}),
+    },
+}
+
+
 def response_format(name: str, schema: dict) -> dict:
     return {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}
 
@@ -551,17 +568,18 @@ def repair_timing(shots: list, seconds: int) -> list:
 # --------------------------------------------------------------------------- output formatting
 
 
+def shot_line(number: int, shot: dict) -> str:
+    action = shot["action"].rstrip().rstrip(".")
+    head = f"Shot {number} – {shot['start']}s – {shot['framing']}: " if shot.get("framing") else f"Shot {number} – {shot['start']}s: "
+    text = head + action + "."
+    if shot.get("dialogue"):
+        text += f" {shot['dialogue']['speaker']} says \"{shot['dialogue']['line'].replace(chr(34), chr(0x201D))}\""
+    return text
+
+
 def raw_text(shots: list) -> str:
     """``Shot N – <start>s – <framing>: <action>.`` and, with dialogue, `` <Speaker> says "<line>"``, one shot a line."""
-    lines = []
-    for i, shot in enumerate(shots, start=1):
-        action = shot["action"].rstrip().rstrip(".")
-        head = f"Shot {i} – {shot['start']}s – {shot['framing']}: " if shot.get("framing") else f"Shot {i} – {shot['start']}s: "
-        text = head + action + "."
-        if shot.get("dialogue"):
-            text += f" {shot['dialogue']['speaker']} says \"{shot['dialogue']['line'].replace(chr(34), chr(0x201D))}\""
-        lines.append(text)
-    return "\n".join(lines)
+    return "\n".join(shot_line(i, shot) for i, shot in enumerate(shots, start=1))
 
 
 def story_text(plan: dict) -> str:
@@ -617,6 +635,88 @@ def has_prompt(clips) -> bool:
     return any(isinstance(c, dict) and str(c.get("prompt") or c.get("prompt_raw") or "").strip() for c in items or []) if isinstance(items, list) else False
 
 
+# --------------------------------------------------------------------------- seam check (the model judges; code only builds the ask and reads the answer)
+
+
+def _last_shots(clip: dict) -> list:
+    shots = clip["shots"]
+    take = 2 if len(shots) > 1 and clip["seconds"] - shots[-1]["start"] < SEAM_SHORT_SHOT else 1
+    first = len(shots) - take
+    return [shot_line(first + i + 1, s) for i, s in enumerate(shots[first:])]
+
+
+def _first_shots(clip: dict) -> list:
+    shots = clip["shots"]
+    names = [c["name"].casefold() for c in (clip.get("start_state") or {}).get("characters", [])]
+    seen = names and any(n in (shots[0]["action"] + " " + shots[0].get("framing", "")).casefold() for n in names)
+    return [shot_line(i + 1, s) for i, s in enumerate(shots[:1 if seen or len(shots) < 2 else 2])]
+
+
+def inside_changes(clip: dict) -> list:
+    """What a clip changes in wardrobe or props between its own start and end state: ``Kael wardrobe: <start> -> <end>``."""
+    start = {c["name"]: c for c in (clip.get("start_state") or {}).get("characters", [])}
+    out = []
+    for c in (clip.get("end_state") or {}).get("characters", []):
+        before = start.get(c["name"])
+        for key in ("wardrobe", "props"):
+            if before and normalize(before.get(key)) != normalize(c.get(key)):
+                out.append(f"{c['name']} {key}: {before.get(key) or 'nothing'} -> {c.get(key) or 'nothing'}")
+    return out
+
+
+def seam_input(clips: list) -> tuple:
+    """The seams text and the inside-clip text the seam call reads, and the number of clips that change wardrobe or props inside themselves."""
+    parts, inside = [], []
+    for n in range(2, len(clips) + 1):
+        a, b = clips[n - 2], clips[n - 1]
+        parts.append("\n".join([f"SEAM {n - 1} -> {n}", f"Clip {n - 1} planned end:", state_lines(a["end_state"]), f"Clip {n - 1} last shots as written:", *_last_shots(a),
+                                f"Clip {n} planned start:", state_lines(b["start_state"]), f"Clip {n} first shots as written:", *_first_shots(b)]))
+    for clip in clips:
+        changes = inside_changes(clip)
+        if changes:
+            inside.append("\n".join([f"CLIP {clip['clip']} CHANGES INSIDE ITSELF: " + "; ".join(changes), f"Clip {clip['clip']} all shots as written:", clip["raw"]]))
+    return "\n\n".join(parts), "\n\n".join(inside) or "(no clip changes wardrobe or props inside itself)", len(inside)
+
+
+def coerce_seams(obj, total: int) -> dict | None:
+    """The flagged seams and inside-clip problems of a parsed reply, each with the clip to fix. None when the reply holds neither list.
+
+    ``fix_clip`` must be one of the two clips of the seam; anything else is read as the earlier clip (the next clip was written from the planned end of that one,
+    so it is the one that drifts)."""
+    if not isinstance(obj, dict) or not (isinstance(obj.get("seams"), list) or isinstance(obj.get("inside"), list)):
+        return None
+    seams, inside = [], []
+    for item in obj.get("seams") if isinstance(obj.get("seams"), list) else []:
+        if not isinstance(item, dict) or item.get("ok") is not False:
+            continue
+        a, b = _num(item.get("from")), _num(item.get("to"))
+        problem = _text(item.get("problem"))
+        if a is None or b is None or int(b) != int(a) + 1 or not 1 <= int(a) < total or not problem:
+            continue
+        a, b = int(a), int(b)
+        fix_clip = _num(item.get("fix_clip"))
+        aspect = _text(item.get("aspect")).lower()
+        seams.append({"from": a, "to": b, "aspect": aspect if aspect in SEAM_ASPECTS else "", "problem": problem,
+                      "fix_clip": int(fix_clip) if fix_clip in (a, b) else a, "fix": _text(item.get("fix"))})
+    for item in obj.get("inside") if isinstance(obj.get("inside"), list) else []:
+        number = _num(item.get("clip")) if isinstance(item, dict) else None
+        if number is None or item.get("ok") is not False or not 1 <= int(number) <= total or not _text(item.get("problem")):
+            continue
+        inside.append({"clip": int(number), "problem": _text(item["problem"]), "fix": _text(item.get("fix"))})
+    return {"seams": seams, "inside": inside}
+
+
+def seam_complaints(found: dict) -> dict:
+    """Clip number -> the complaint sentences for it, from the flagged seams and inside problems."""
+    out: dict = {}
+    for s in found["seams"]:
+        where = f"the cut from clip {s['from']} to clip {s['to']}" + (f", {s['aspect']}" if s["aspect"] else "")
+        out.setdefault(s["fix_clip"], []).append(f"SEAM CHECK ({where}): {s['problem']} " + (f"Fix: {s['fix']}" if s["fix"] else ""))
+    for s in found["inside"]:
+        out.setdefault(s["clip"], []).append(f"SEAM CHECK (inside this clip): {s['problem']} " + (f"Fix: {s['fix']}" if s["fix"] else ""))
+    return {k: [v.strip() for v in vs] for k, vs in sorted(out.items())}
+
+
 # --------------------------------------------------------------------------- the engine
 
 
@@ -625,7 +725,7 @@ class ShotEngine:
 
     def __init__(self, chat, work_dir, *, brief: str, clips: int, seconds: int = DEFAULT_SECONDS, language: str = DEFAULT_LANGUAGE, slot_ctx: int = 65536,
                  budget: int = THINKING_BUDGET, concurrency: int = DEFAULT_CONCURRENCY, plan_part: int = PLAN_PART, pictures=None, sees: bool = True,
-                 progress=None, say=None):
+                 progress=None, say=None, seams: bool = True):
         self.chat = chat
         self.work = Path(work_dir)
         self.brief = brief.strip()
@@ -638,6 +738,8 @@ class ShotEngine:
         self.plan_part = max(1, int(plan_part))
         self.progress = progress or (lambda done, total: None)
         self.say = say or (lambda message: None)
+        self.seams = bool(seams)
+        self.seam_report: dict = {}
         self.sees = bool(sees)
         self.pictures = list(pictures or []) if self.sees else []
         self.picture_tokens = sum(p.get("tokens", 0) for p in self.pictures)
@@ -811,10 +913,15 @@ class ShotEngine:
         return self.work / "clips" / f"{number:03d}.json"
 
     def shots_for(self, plan: dict, index: int) -> dict:
-        number = index + 1
-        stored = self._clip_file(number)
+        stored = self._clip_file(index + 1)
         if stored.is_file():
             return json.loads(stored.read_text(encoding="utf-8"))
+        return self._write_clip(plan, index)
+
+    def _write_clip(self, plan: dict, index: int, complaints=(), before: str = "", kind: str = "shots") -> dict:
+        """One clip's shot list: ask, check, one retry, save. ``complaints`` (the seam check's) are appended to the first ask."""
+        number = index + 1
+        stored = self._clip_file(number)
         clips = plan["clips"]
         clip = clips[index]
         seconds = clip["seconds"]
@@ -830,14 +937,20 @@ class ShotEngine:
         shown = "; ".join(f"{p['label']}: {p['shows']}" for p in plan.get("pictures", []))
         values["pictures_note"] = (pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees) + (f" What they show (from the plan): {shown}." if shown else "")) if self.labels else ""
         messages = [message(fill(load_prompt("shots"), **values), self.pictures)]
+        if complaints:
+            messages = [with_complaint(messages[0], "\n\nYOUR PREVIOUS SHOT LIST FOR THIS CLIP:\n" + before + "\n\nIT HAS THESE PROBLEMS AT THE CUTS WITH THE CLIPS AROUND IT. Fix every one, "
+                                                    "change nothing else that is fine, and answer with the complete JSON object:\n" + "\n".join(f"- {c}" for c in complaints))]
         answer = 250 + MAX_SHOTS * (260 if is_wide(self.language) else 150)
 
         def check(parsed):
             return check_shots(parsed["shots"], seconds, self.language, required) + check_costume(parsed["shots"], clip["start_state"], {c["name"]: c["wardrobe"] for c in plan["cast"]})
 
-        parsed, problems = self._checked(f"shots_{number:03d}", messages, answer=answer, schema_name="clip_shots", schema=SHOTS_SCHEMA,
+        parsed, problems = self._checked(f"{kind}_{number:03d}", messages, answer=answer, schema_name="clip_shots", schema=SHOTS_SCHEMA,
                                          parse=lambda t: coerce_shots(parse_json_object(t)), check=check)
         if parsed is None:
+            if complaints:
+                self._warn(f"clip {number}: the rewrite after the seam check could not be read; the first shot list is kept")
+                return None
             raise StoryWriterError(f"clip {number}: the shots could not be read from the model's answer", work_dir=str(self.work))
         shots = parsed["shots"]
         if problems:
@@ -845,8 +958,11 @@ class ShotEngine:
             shots = repair_timing(shots, seconds) or shots
         result = {"clip": number, "seconds": seconds, "goal": clip["goal"], "raw": raw_text(shots), "shots": shots,
                   "start_state": clip["start_state"], "end_state": clip["end_state"], "new_recurring_visuals": clip["new_recurring_visuals"]}
+        if complaints:
+            result["seam_fixed"] = True
         stored.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
-        self.progress(number + 1, len(clips) + 1)
+        if not complaints:
+            self.progress(number + 1, len(clips) + 1)
         return result
 
     def check_film(self, out: list) -> None:
@@ -855,11 +971,61 @@ class ShotEngine:
             if not any(line in x for x in said):
                 self._warn(f"the founder's line \"{line}\" is not in any shot")
 
+    # ---- stage 3: the seam check
+
+    def seam_check(self, plan: dict, out: list) -> list:
+        """One model call over every cut and every change inside a clip; the flagged clips are written again once. Never fails the node."""
+        if not self.seams or len(out) < 2:
+            return out
+        stored = self.work / "seams.json"
+        record = json.loads(stored.read_text(encoding="utf-8")) if stored.is_file() else None
+        started = time.time()
+        if record is None:
+            seams_text, inside_text, inside_n = seam_input(out)
+            pictures_note_ = pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees) if self.labels else ""
+            values = dict(self._lang(), cast=sw.format_cast(plan["cast"]), seams=seams_text, inside=inside_text, total=len(out), pictures_note=pictures_note_)
+            messages = [message(fill(load_prompt("seams"), **values), self.pictures)]
+            answer = 400 + 70 * (len(out) - 1) + 150 * inside_n + 600
+            self.say(f"seam check: {len(out) - 1} seams")
+            try:
+                reply = self._ask("seams", messages, answer=answer, schema_name="seam_check", schema=SEAMS_SCHEMA)
+                found = coerce_seams(parse_json_object(reply.text), len(out))
+            except StoryWriterError as exc:
+                self._warn(f"seam check: the call failed ({exc}); the shot lists are kept as written")
+                return out
+            if found is None:
+                self._warn("seam check: the answer was not one JSON object in the shape described; the shot lists are kept as written")
+                return out
+            record = dict(found, checked=len(out) - 1, complaints={str(k): v for k, v in seam_complaints(found).items()})
+            stored.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
+        todo = {int(k): v for k, v in record["complaints"].items()}
+        redo = [n for n in todo if not out[n - 1].get("seam_fixed")]
+        if redo:
+            self.say(f"seam check: writing clips {redo} again")
+
+            def rewrite(n):
+                return self._write_clip(plan, n - 1, todo[n], out[n - 1]["raw"], kind="seamfix")
+
+            for n, fixed in zip(redo, self._map(rewrite, redo)):
+                if fixed is not None:
+                    out[n - 1] = fixed
+        secs = time.time() - started
+        flagged = [f"{s['from']}->{s['to']} {s['aspect'] or 'seam'}" for s in record["seams"]] + [f"inside {s['clip']}" for s in record["inside"]]
+        rewritten = sorted(n for n in todo if out[n - 1].get("seam_fixed"))
+        self.seam_report = {"seams": record["checked"], "flagged": record["seams"], "inside": record["inside"], "rewritten": rewritten, "seconds": round(secs, 1)}
+        _LOG.info("shot writer: seam check: %d seams, %d flagged (%s), rewrote clips %s in %.0f s", record["checked"], len(flagged), ", ".join(flagged) or "none", rewritten, secs)
+        for s in record["seams"]:
+            self._warn(f"seam check: clip {s['from']} -> {s['to']} ({s['aspect'] or 'continuity'}): {s['problem']} Fixed by writing clip {s['fix_clip']} again.")
+        for s in record["inside"]:
+            self._warn(f"seam check: inside clip {s['clip']}: {s['problem']} Fixed by writing the clip again.")
+        return out
+
     def run(self) -> dict:
         plan = self.plan()
         self.progress(1, len(plan["clips"]) + 1)
         self.say(f"shots: {len(plan['clips'])} clips")
         out = self._map(lambda i: self.shots_for(plan, i), range(len(plan["clips"])))
+        out = self.seam_check(plan, out)
         self.check_film(out)
         return {"clips": out, "plan": plan, "story": story_text(plan)}
 
@@ -900,7 +1066,7 @@ def write_outputs(root: Path, engine: ShotEngine, result: dict, *, model: str, s
         "new_recurring_visuals": {str(c["clip"]): c["new_recurring_visuals"] for c in result["clips"] if c["new_recurring_visuals"]},
         "shots_per_clip": [len(c["shots"]) for c in result["clips"]], "calls": len(calls),
         "tokens": {"prompt": sum(c["prompt_tokens"] for c in calls), "completion": sum(c["completion_tokens"] for c in calls), "thinking": sum(c["thinking_tokens"] for c in calls)},
-        "warnings": engine.warnings, "retries": engine.retries, "concurrency": engine.concurrency, "pictures": engine.labels, "wall_seconds": round(wall, 1), "work_dir": str(engine.work),
+        "seam_check": engine.seam_report, "warnings": engine.warnings, "retries": engine.retries, "concurrency": engine.concurrency, "pictures": engine.labels, "wall_seconds": round(wall, 1), "work_dir": str(engine.work),
         "call_log": calls, "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     json_path = root / f"{stem}.json"
@@ -910,7 +1076,7 @@ def write_outputs(root: Path, engine: ShotEngine, result: dict, *, model: str, s
 
 def write_shots(chat, *, brief: str, clips: int, seconds: int = DEFAULT_SECONDS, language: str = DEFAULT_LANGUAGE, seed: int = 0, model: str = "model", style: str = "",
                 budget: int = THINKING_BUDGET, slot_ctx: int = 65536, out_dir=None, progress=None, say=None, concurrency: int = DEFAULT_CONCURRENCY,
-                plan_part: int = PLAN_PART, pictures=None, sees: bool = True) -> dict:
+                plan_part: int = PLAN_PART, pictures=None, sees: bool = True, seams: bool = True) -> dict:
     """The whole job with an injected ``chat``: validate, resume or start, write, save. Returns ``{clips, story, clips_path, story_path, json_path, sidecar}``."""
     brief = str(brief or "").strip()
     if not brief:
@@ -922,7 +1088,7 @@ def write_shots(chat, *, brief: str, clips: int, seconds: int = DEFAULT_SECONDS,
     work = root / "_work" / job_hash(brief, clips, seconds, language, seed, model, budget, pictures)
     started = time.time()
     engine = ShotEngine(chat, work, brief=brief, clips=clips, seconds=seconds, language=language, slot_ctx=slot_ctx, budget=budget, concurrency=concurrency,
-                        plan_part=plan_part, pictures=pictures, sees=sees, progress=progress, say=say)
+                        plan_part=plan_part, pictures=pictures, sees=sees, progress=progress, say=say, seams=seams)
     result = engine.run()
     clips_path, story_path, json_path, side = write_outputs(root, engine, result, model=model, seed=seed, wall=time.time() - started, style=style)
     (work / ".done").write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
