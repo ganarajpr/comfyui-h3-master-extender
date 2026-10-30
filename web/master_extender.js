@@ -714,6 +714,23 @@ app.registerExtension({
                 return button;
             }
 
+            // An API-format graph (a video whose only tag is the queued prompt) never runs onConfigure: the loader sets
+            // clips_json after the node exists and then calls the widget's callback. Take the clips from there too.
+            const clipsCallback = clipsWidget.callback;
+            clipsWidget.callback = function (value) {
+                const result = clipsCallback?.apply(this, arguments);
+                try {
+                    const restored = JSON.parse(value || "[]");
+                    if (Array.isArray(restored)) {
+                        clipsState = ensureClipIds(restored);
+                        renderUI();
+                    }
+                } catch (error) {
+                    console.warn("MiniMax Master: invalid clips JSON", error);
+                }
+                return result;
+            };
+
             const originalConfigure = node.onConfigure;
             node.onConfigure = function (info) {
                 const result = originalConfigure?.apply(this, arguments);
