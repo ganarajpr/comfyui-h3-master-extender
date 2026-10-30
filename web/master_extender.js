@@ -2068,3 +2068,21 @@ app.registerExtension({
         };
     }
 });
+
+// The Shot Writer's last_output (what it wrote, saved in the video's metadata) is filled by the node and never edited: hidden, value and slot kept.
+app.registerExtension({
+    name: "MiniMaxH3.ShotWriterOutput",
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== "H3ShotWriter") return;
+        const onNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+            const widget = this.widgets?.find(w => w.name === "last_output");
+            if (widget) {
+                widget.type = "hidden";
+                widget.computeSize = () => [0, -4];
+            }
+            return r;
+        };
+    }
+});
