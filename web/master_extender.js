@@ -212,7 +212,23 @@ const AUTO_CLIPS_WIDGETS = ["auto_clips", "planner_refs", "auto_clip_seconds"];
 // story_engine and its E4 settings are appended after auto_clip_seconds, so the same empty master_ui value lands in story_engine.
 // Only the dropdowns are repaired: the two text widgets (e4_language, e4_picture_notes) read an empty value as their default.
 const STORY_ENGINE_WIDGETS = ["story_engine", "e4_score", "e4_decision_budget"];
-const REPAIRED_WIDGETS = [...HYPERFLOW_ONLY_WIDGETS, ...AUDIO_REFINE_WIDGETS, ...AUTO_CLIPS_WIDGETS, ...STORY_ENGINE_WIDGETS];
+// ptd_adapter and pass2_engine are appended after pass2_sla_sparsity; a workflow saved before them has master_ui's "" in ptd_adapter.
+const PTD_WIDGETS = ["ptd_adapter", "pass2_engine"];
+const PTD_MODE = "PTD (adapter)";
+const isPtdMode = (value) => String(value ?? "") === PTD_MODE;
+const REPAIRED_WIDGETS = [...HYPERFLOW_ONLY_WIDGETS, ...AUDIO_REFINE_WIDGETS, ...AUTO_CLIPS_WIDGETS, ...STORY_ENGINE_WIDGETS, ...PTD_WIDGETS];
+// The adapter picked when the engine is switched to PTD with none selected: RefAsymOPD if installed, else the first file.
+function defaultPtdAdapter(values) {
+    const real = (values || []).filter(v => v && v !== "none");
+    return real.find(v => v.toLowerCase().includes("refasymopd")) ?? real[0];
+}
+// Pass-1 badge/summary name: the adapter's short name and hop count when its name says it ("...-6Step.safetensors").
+function ptdLabel(adapter) {
+    const name = String(adapter ?? "none");
+    if (name === "none" || name === "") return "PTD";
+    const hops = /(\d+)\s*step/i.exec(name)?.[1];
+    return `PTD · ${shortModelName(name)}${hops ? ` · ${hops} hops` : ""}`;
+}
 
 function setWidgetVisible(widget, visible) {
     if (!widget) return;
@@ -322,6 +338,13 @@ function repairHyperflowWidgets(node, defaults) {
         }
         if (fallback !== undefined) w.value = fallback;
     }
+    // A PTD workflow whose adapter file is gone (or was never set) gets the installed default, as the panel does on switching to PTD.
+    const ptd = node.widgets?.find(x => x.name === "ptd_adapter");
+    const accel = node.widgets?.find(x => x.name === "accel_mode");
+    if (ptd && isPtdMode(accel?.value) && String(ptd.value ?? "none") === "none") {
+        const pick = defaultPtdAdapter(comboValues(ptd));
+        if (pick) ptd.value = pick;
+    }
 }
 
 function setupModeWidgets(node) {
@@ -333,7 +356,8 @@ function setupModeWidgets(node) {
     const apply = () => {
         const mode = String(accel?.value ?? "").toLowerCase();
         const turbo = mode.startsWith("turbo");
-        const hyperflow = !turbo;
+        const ptd = isPtdMode(accel?.value);
+        const hyperflow = !turbo && !ptd;
         const slaOn = sla ? !!sla.value : false;
         TURBO_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         HYPERFLOW_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), hyperflow));
@@ -342,6 +366,7 @@ function setupModeWidgets(node) {
         setWidgetVisible(byName(DUAL_WIDGET), hyperflow && !dualMode);
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
+        PTD_WIDGETS.forEach(n => setWidgetVisible(byName(n), ptd));
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
         TURBO_STEPS_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         SLA_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), slaOn));
@@ -779,7 +804,8 @@ app.registerExtension({
                 if (rerender) renderUI();
             };
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
-            const isHyperflow = () => !isTurbo();
+            const isPtd = () => isPtdMode(getW("accel_mode", ""));
+            const isHyperflow = () => !isTurbo() && !isPtd();
 
             function bindSelect(name, opts = {}) {
                 const w = W(name);
@@ -832,6 +858,7 @@ app.registerExtension({
                     ? ` · dual sampling (pass 2 from step ${getW("dual_split_step", 2)}${dualMode ? ", whole clip" : ""}${getW("pass1_early_stop", false) ? ", pass 1 early stop" : ""})` : "";
                 const p1s = Number(getW(PASS1_STEPS_WIDGET, 0));
                 const p1sNote = (isHyperflow() && !dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
+                if (isPtd()) return `${ptdLabel(getW("ptd_adapter", "none"))} · pass 2 ${getW("pass2_engine", "LoRA refine") === "PTD last hop" ? "last hop" : "refine" + p2note}${bridgeNote}`;
                 if (dualMode) return `HyperFlow · dual sampling · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${dualNote.replace(" · dual sampling", "")}${bridgeNote}`;
                 if (isHyperflow()) return `HyperFlow 8-step · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
@@ -994,6 +1021,14 @@ app.registerExtension({
                 const accelSel = uiSelect(comboValues(accelW), accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
                     setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") ? "4" : "8", { rerender: false });
+                    if (isPtdMode(v) && String(getW("ptd_adapter", "none")) === "none") {
+                        const pick = defaultPtdAdapter(comboValues(W("ptd_adapter")));
+                        if (pick) setW("ptd_adapter", pick, { rerender: false });
+                    }
+                    // pass2_engine is hidden outside PTD mode: don't leave "PTD last hop" behind for a non-PTD pass 1.
+                    if (!isPtdMode(v) && String(getW("pass2_engine", "LoRA refine")) === "PTD last hop") {
+                        setW("pass2_engine", "LoRA refine", { rerender: false });
+                    }
                     renderUI();
                 });
                 wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count. HyperFlow 8-step: Video Rebirth's 8-step LoRA with two-time conditioning. HyperFlow 8-step \u00b7 dual sampling: HyperFlow with pass 2 as the grid tail over the whole clip in one window." }));
@@ -1017,6 +1052,12 @@ app.registerExtension({
                         wrap.appendChild(uiRow("pass 1 steps", bindNumber(PASS1_STEPS_WIDGET),
                             { hint: "0 = all 8 HyperFlow steps. 1-7: stop pass 1 early, upscale its clean estimate, then the normal refine (same LoRA, windows, denoise). Saves the skipped steps." }));
                     }
+                } else if (isPtd()) {
+                    wrap.appendChild(uiRow("ptd adapter", bindSelect("ptd_adapter", { render: shortModelName }),
+                        { hint: "Per-hop PTD adapter from models/ptd. Pass 1 runs one model evaluation per trained hop (needs ComfyUI-MiniMaxH3-PTD)." }));
+                    wrap.appendChild(uiRow("pass 2 engine", bindSelect("pass2_engine"),
+                        { hint: "LoRA refine: the normal refine below (needs a refine lora, e.g. DMAD). PTD last hop: only the adapter's final hop at pass-2 size on the re-noised draft; the refine lora, steps and denoise are not used." }));
+                    if (String(getW("ptd_adapter", "none")) === "none") wrap.appendChild(uiHint("Pick a PTD adapter: the run fails with none selected."));
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
@@ -1029,9 +1070,12 @@ app.registerExtension({
                     }
                 }
                 // Pass 2: with dual sampling one row edits the split step and the refine LoRA is not used; otherwise the refine LoRA + schedule.
+                const ptdLastHop = isPtd() && getW("pass2_engine", "LoRA refine") === "PTD last hop";
                 const dualActive = isHyperflow() && Boolean(W(DUAL_WIDGET)) && (isDualMode(getW("accel_mode", "")) || Boolean(getW(DUAL_WIDGET, false)));
                 const p2b = pass2RowBinding(dualActive, getW("dual_split_step", 2));
-                if (dualActive) {
+                if (ptdLastHop) {
+                    wrap.appendChild(uiHint("Pass 2 is the PTD adapter's last hop: refine lora, strength, mode and steps are not used."));
+                } else if (dualActive) {
                     wrap.appendChild(uiRow("pass 2 steps", bindNumber(p2b.widget), { hint: p2b.hint }));
                     wrap.appendChild(uiHint("Refine lora, strength and mode are ignored in dual sampling."));
                 } else {
@@ -1482,7 +1526,7 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow · dual sampling" : `${isHyperflow() ? "HyperFlow" : "Turbo"} · ${isHyperflow() ? "8" : getW("pdd_nfe", "8")} steps · 2-pass`}</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isPtd() ? `${ptdLabel(getW("ptd_adapter", "none"))} · 2-pass` : isDualMode(getW("accel_mode", "")) ? "HyperFlow · dual sampling" : `${isHyperflow() ? "HyperFlow" : "Turbo"} · ${isHyperflow() ? "8" : getW("pdd_nfe", "8")} steps · 2-pass`}</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">

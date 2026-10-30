@@ -163,7 +163,9 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
     if inputs:
         accel = inputs.get("accel_mode", "HyperFlow 8-step")
         steps = inputs.get("pdd_nfe", "?")
-        if str(accel).lower().startswith("turbo"):
+        if str(accel) == "PTD (adapter)":
+            lines.append(f"Engine: PTD {inputs.get('ptd_adapter', '')} · pass 2 {inputs.get('pass2_engine', 'LoRA refine')}")
+        elif str(accel).lower().startswith("turbo"):
             lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
         else:
             refit = "curve refit on" if inputs.get("hyperflow_curve_refit", True) else "curve refit off"

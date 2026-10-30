@@ -25,6 +25,7 @@ import nodes
 from .master_projects import load_reference_images, clip_picture_keys, _clip_identity, _chain_key, _clip_fingerprint, _pass1_fingerprint, _audio_refine_signature
 from . import prompt_rewriter
 from . import clips_metadata
+from . import ptd_mode
 
 from . import motion_context_disk
 from .motion_context_disk import (
@@ -322,8 +323,8 @@ HYPERFLOW_DEFAULT_FILE = "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safete
 
 
 # Options are restored by name, so new ones are only ever appended.
-ACCEL_MODES = ["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling"]
-DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES[-1]
+ACCEL_MODES = ["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling", "PTD (adapter)"]
+DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES[2]
 
 
 def normalize_accel_mode(accel_mode):
@@ -424,7 +425,7 @@ class MiniMaxH3MasterExtender:
                 "sparse_method": (["sla", "sol-attn", "vsa"], {"default": "sla", "tooltip": "Selection method for core BlockSparseAttention when sla_enabled is on. sla: keep a fixed top-k percent of key blocks (1 - sla_sparsity). sol-attn: training-free adaptive threshold per head/query block (tau), the choice for models without an SLA-distilled LoRA such as HyperFlow. vsa: FastVideo cube attention, only with FastH3-VSA weights."}),
                 "sparse_tau": ("FLOAT", {"default": 1.3, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "sol-attn threshold in score sigmas. Higher = sparser: 1.0 keeps ~16% of key blocks, 1.5 ~7%, 2.0 ~2.7%."}),
                 # --- Acceleration: HyperFlow 8-step (default) or any turbo / lightning LoRA ---
-                "accel_mode": (ACCEL_MODES, {"default": "HyperFlow 8-step", "tooltip": "HyperFlow 8-step: Video Rebirth's 8-step LoRA + two-time conditioning (needs ComfyUI-HyperFlow-H3); always its own trained 8-step grid with Euler, 'steps' is ignored. Turbo LoRA: a plain step-distilled LoRA (turbo / lightning / lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count."}),
+                "accel_mode": (ACCEL_MODES, {"default": "HyperFlow 8-step", "tooltip": "HyperFlow 8-step: Video Rebirth's 8-step LoRA + two-time conditioning (needs ComfyUI-HyperFlow-H3); always its own trained 8-step grid with Euler, 'steps' is ignored. Turbo LoRA: a plain step-distilled LoRA (turbo / lightning / lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count. PTD (adapter): pass 1 runs the per-hop PTD adapter chosen in ptd_adapter (one model evaluation per trained hop; needs ComfyUI-MiniMaxH3-PTD + ComfyUI-PTD); turbo_lora, pdd_nfe and turbo_sampler are not used for pass 1."}),
                 "turbo_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "Turbo LoRA file (models/loras). Used only in Turbo LoRA mode."}),
                 "turbo_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "Turbo LoRA strength."}),
                 "turbo_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "res_multistep", "tooltip": "Sampler for Turbo LoRA mode (HyperFlow mode always uses euler)."}),
@@ -505,6 +506,8 @@ class MiniMaxH3MasterExtender:
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
+                "ptd_adapter": (ptd_mode.ptd_adapter_choices(), {"default": "none", "tooltip": "PTD adapter file (models/ptd), used only when accel_mode is 'PTD (adapter)'. Its hop count and knots come from the checkpoint (e.g. a 6-hop file runs 6 model evaluations in pass 1)."}),
+                "pass2_engine": (ptd_mode.PASS2_ENGINES, {"default": ptd_mode.PASS2_ENGINE_LORA, "tooltip": "LoRA refine: the normal pass-2 refine (pass2_lora, pass2_steps, pass2_denoise); with a PTD pass 1 it needs a pass2_lora such as DMAD. PTD last hop: pass 2 is ONLY the PTD adapter's final hop at pass-2 size on the re-noised, upscaled pass-1 latent (one model evaluation; pass2_lora, pass2_steps and pass2_denoise are not used). Needs accel_mode 'PTD (adapter)'."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -812,6 +815,7 @@ class MiniMaxH3MasterExtender:
             sparse_dense_blocks=sparse_dense_blocks,
             sparse_sink=sparse_sink,
             pass2_sla_sparsity=pass2_sla_sparsity,
+            ptd_adapter=kwargs.get("ptd_adapter", "none"),
             hyperflow_file=kwargs.get("hyperflow_file") or HYPERFLOW_DEFAULT_FILE,
             hyperflow_curve_refit=kwargs.get("hyperflow_curve_refit", True),
             hyperflow_strength=kwargs.get("hyperflow_strength", 1.0),
@@ -825,8 +829,9 @@ class MiniMaxH3MasterExtender:
             kwargs.get("pass2_lora_mode", "replace engine LoRA"),
             kwargs.get("pass2_steps", 4),
         )
+        engine.configure_pass2_engine(kwargs.get("pass2_engine", ptd_mode.PASS2_ENGINE_LORA))
         dual_requested = bool(kwargs.get("dual_sampling", False)) or dual_mode
-        dual_active = dual_requested and not str(accel_mode).lower().startswith("turbo")
+        dual_active = dual_requested and not str(accel_mode).lower().startswith("turbo") and not ptd_mode.is_ptd_mode(accel_mode)
         engine.configure_dual_sampling(
             dual_requested,
             kwargs.get("dual_split_step", 2),
@@ -870,6 +875,8 @@ class MiniMaxH3MasterExtender:
             "refs": _media_digest([refs, ref_videos, ref_video_audios, ref_audios]),
         }
 
+        if engine.ptd_mode:
+            p1_settings = ptd_mode.with_ptd_p1_settings(p1_settings, engine.ptd_adapter)
         p1_settings = with_dual_p1_settings(
             p1_settings, dual_active and pass2_enabled, kwargs.get("dual_split_step", 2),
             bool(kwargs.get("pass1_early_stop", False)))

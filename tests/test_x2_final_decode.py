@@ -46,7 +46,7 @@ class X2FinalDecodeTests(unittest.TestCase):
             "Path": Path, "os": os, "torch": torch, "time": time, "json": json, "hashlib": hashlib,
             "_LOG": logging.getLogger("test"),
             "_load_manifest_from_paths": lambda *a: copy.deepcopy(self.state),
-            "_write_json_atomic": self.write_manifest,
+            "_write_json_atomic": self.write_manifest, "_replace_with_retry": os.replace,
             "_normalize_color_adjustment": lambda v: v or {},
             "_color_adjustment_signature": lambda v: "c",
             "_color_is_neutral": lambda v: True,
