@@ -376,6 +376,83 @@ class PictureTests(unittest.TestCase):
         self.assertEqual(blocks[1], {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}})
 
 
+@unittest.skipUnless(torch, "needs torch (the box has it)")
+class PanelPictureTests(unittest.TestCase):
+    """The founder's pictures live in the Extender's panel (refs_json); the writer reads them through the Extender it feeds."""
+
+    REFS_JSON = json.dumps({"images": ["a.png", None, "c.png", None, None, None, None, None, None]})
+
+    def img(self, v):
+        return torch.full((1, 40, 40, 3), v / 10.0)
+
+    def prompt(self, **extender_inputs):
+        inputs = {"clips_in": ["5", 0], "refs_json": self.REFS_JSON, **extender_inputs}
+        return {"5": {"class_type": "H3ShotWriter", "inputs": {}}, "9": {"class_type": sh.EXTENDER_CLASS, "inputs": inputs}}
+
+    def loader(self, refs_json):
+        names = json.loads(refs_json)["images"]
+        return {f"ref_image_{i}": self.img(len(n)) for i, n in enumerate(names) if n}
+
+    def extender_refs(self, refs_json, sockets):
+        """master_node.extend's merge: panel pictures first, a socket fills only a slot the panel left empty."""
+        refs = self.loader(refs_json)
+        for idx in range(1, 10):
+            if f"ref_image_{idx - 1}" not in refs and sockets.get(f"ref_image_{idx}") is not None:
+                refs[f"ref_image_{idx - 1}"] = sockets[f"ref_image_{idx}"]
+        return dict(sorted(refs.items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))
+
+    def test_panel_pictures_of_the_linked_extender_are_numbered_as_the_extender_does(self):
+        with mock.patch.object(sh, "load_panel_refs", self.loader):
+            refs = sh.gather_refs(self.prompt(), "5", {})
+            labels = [p["label"] for p in sh.pictures_of({}, refs)]
+        self.assertEqual(labels, ["Picture 1", "Picture 3"])
+        theirs = sh.prompt_rewriter._ordered_refs(self.extender_refs(self.REFS_JSON, {}))
+        self.assertEqual([f"Picture {slot + 1}" for slot, _ in theirs], labels)
+
+    def test_own_sockets_fill_slots_the_panel_left_empty_but_never_override_it(self):
+        own = {"ref_image_2": self.img(9), "ref_image_3": self.img(8)}   # sockets 2 and 3: slot 2 is empty in the panel, slot 3 (c.png) is not
+        with mock.patch.object(sh, "load_panel_refs", self.loader):
+            refs = sh.gather_refs(self.prompt(ref_image_2=["20", 0]), "5", own)
+        self.assertEqual(list(refs), ["ref_image_0", "ref_image_1", "ref_image_2"])
+        self.assertTrue(torch.equal(refs["ref_image_1"], own["ref_image_2"]))
+        self.assertTrue(torch.equal(refs["ref_image_2"], self.img(5)))   # the panel's c.png wins, as in the Extender
+        theirs = self.extender_refs(self.REFS_JSON, own)
+        self.assertEqual(list(theirs), list(refs))
+        self.assertTrue(all(torch.equal(theirs[k], refs[k]) for k in refs))
+
+    def test_a_linked_extender_socket_with_no_picture_for_the_writer_is_a_warning(self):
+        with mock.patch.object(sh, "load_panel_refs", self.loader), self.assertLogs("minimax_h3_master_extender.shot_writer", "WARNING") as logs:
+            refs = sh.gather_refs(self.prompt(ref_image_4=["21", 0]), "5", {})
+        self.assertNotIn("ref_image_3", refs)
+        self.assertTrue(any("ref_image_4" in l and "Picture 4 is missing" in l for l in logs.output))
+
+    def test_standalone_falls_back_to_its_own_sockets(self):
+        own = {"ref_image_1": self.img(1), "ref_image_4": self.img(2)}
+        with mock.patch.object(sh, "load_panel_refs", lambda j: self.fail("no Extender is linked")):
+            refs = sh.gather_refs({"9": {"class_type": sh.EXTENDER_CLASS, "inputs": {"clips_in": ["6", 0], "refs_json": self.REFS_JSON}}}, "5", own)
+            self.assertEqual([p["label"] for p in sh.pictures_of({}, refs)], ["Picture 1", "Picture 4"])
+            self.assertEqual(sh.gather_refs(None, None, own).keys(), refs.keys())
+
+    def test_the_first_of_several_extenders_wins(self):
+        prompt = self.prompt()
+        prompt["10"] = {"class_type": sh.EXTENDER_CLASS, "inputs": {"clips_in": ["5", 0], "refs_json": json.dumps({"images": ["z.png"]})}}
+        self.assertEqual(sh.linked_extender(prompt, "5")[0], "9")
+        self.assertIsNone(sh.linked_extender(prompt, "7"))
+        self.assertIsNone(sh.linked_extender({"9": {"class_type": sh.EXTENDER_CLASS, "inputs": {"clips_in": ["5", 1]}}}, "5"))   # another output of the writer
+
+    def test_changed_panel_pictures_change_the_cache_key(self):
+        sigs = {self.REFS_JSON: [["a.png", 1, 100], None, ["c.png", 1, 100]]}
+        with mock.patch.object(sh, "panel_signature", lambda j: sigs[j]):
+            before = sh.H3ShotWriter.IS_CHANGED(self.prompt(), "5")
+            self.assertEqual(before, sh.H3ShotWriter.IS_CHANGED(self.prompt(), "5"))
+            sigs[self.REFS_JSON] = [["a.png", 1, 200], None, ["c.png", 1, 100]]   # a.png was replaced on disk
+            self.assertNotEqual(before, sh.H3ShotWriter.IS_CHANGED(self.prompt(), "5"))
+        self.assertEqual(sh.H3ShotWriter.IS_CHANGED(None, None), sh.H3ShotWriter.IS_CHANGED({}, "5"))
+
+    def test_node_declares_the_hidden_inputs(self):
+        self.assertEqual(sh.H3ShotWriter.INPUT_TYPES()["hidden"], {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"})
+
+
 class RangeAndCountTests(unittest.TestCase):
     def test_range_brief_gives_that_many_distinct_clips_and_prompt_says_so(self):
         brief = "Clip 1 - She sees the monster.\n3-6 - Battle.\nClip 2 - She hides."
