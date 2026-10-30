@@ -672,6 +672,11 @@
    "Open-H3 regenerate + face"
   ]
  },
+ "pass2_face_strength": {
+  "type": "FLOAT",
+  "min": 0.01,
+  "max": 1.0
+ },
  "clips_in": {
   "type": "STRING"
  }

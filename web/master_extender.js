@@ -1057,7 +1057,9 @@ app.registerExtension({
                     wrap.appendChild(uiHint("Refine lora, strength and mode are ignored in dual sampling."));
                 } else if (isOpenH3()) {
                     wrap.appendChild(uiRow("refiner", bindSelect("pass2_refiner")));
-                    wrap.appendChild(uiHint("Open-H3 refiner LoRA alone, 3 steps from sigma 0.909 to the refine resolution. Faces are found in the draft and start at 0.50, so they keep their identity; the pass-1 audio is kept. Refine lora, steps and denoise are not used."));
+                    if (W("pass2_face_strength")) wrap.appendChild(uiRow("face strength", bindNumber("pass2_face_strength"), { indent: true,
+                        hint: "Faces start the refine at this x 0.909 (0.25 -> 0.23). Lower keeps the draft's faces; 1.0 = no protection." }));
+                    wrap.appendChild(uiHint("Open-H3 refiner LoRA alone, 3 steps from sigma 0.909 to the refine resolution. Faces are found in the draft and start lower, so they keep their identity; the pass-1 audio is kept. Refine lora, steps and denoise are not used."));
                 } else {
                     const p2lora = String(getW("pass2_lora", "none"));
                     if (W("pass2_refiner")) wrap.appendChild(uiRow("refiner", bindSelect("pass2_refiner")));

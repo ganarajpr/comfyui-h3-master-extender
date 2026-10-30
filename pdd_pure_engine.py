@@ -43,7 +43,9 @@ PASS2_REFINER_OPEN_H3 = "Open-H3 regenerate + face"
 PASS2_REFINERS = [PASS2_REFINER_LORA, PASS2_REFINER_OPEN_H3]
 OPEN_H3_LORA = "h3\\minimax_h3_open_regenerate_2k_refiner_rank_384_bf16.safetensors"   # Kijai's refiner, used alone
 OPEN_H3_SIGMAS = (0.909375, 0.857143, 0.666667, 0.0)    # NVIDIA's 3-step release grid
-OPEN_H3_FACE = {"face_strength": 0.55, "pad": 0.35, "feather": 1.5, "threshold": 0.6}   # faces start at 0.50
+OPEN_H3_FACE = {"pad": 0.35, "feather": 1.5, "threshold": 0.6}
+# faces start at 0.25 x 0.909 = 0.23: the face-region author's 0.55 (0.50) still redrew CHOODI faces (founder, 2026-10-31)
+OPEN_H3_FACE_STRENGTH = 0.25
 
 
 def _is_open_h3(refiner):
@@ -484,11 +486,12 @@ class MasterEngine:
             return
         self.pass1_steps = steps
 
-    def configure_pass2_refiner(self, refiner=PASS2_REFINER_LORA):
+    def configure_pass2_refiner(self, refiner=PASS2_REFINER_LORA, face_strength=OPEN_H3_FACE_STRENGTH):
         """Open-H3 refine: pass 2 = Kijai's Open-H3 refiner LoRA alone (replace), NVIDIA's 3-step grid from sigma
-        0.909, a face map so faces start at 0.50, and the pass-1 audio held. Call after configure_dual_sampling.
+        0.909, a face map so faces start at face_strength x 0.909, and the pass-1 audio held. Call after configure_dual_sampling.
         The default changes nothing."""
         self.open_h3 = False
+        self.open_h3_face = dict(OPEN_H3_FACE, face_strength=float(face_strength))
         if not _is_open_h3(refiner):
             return
         if self.dual_active:
@@ -504,7 +507,7 @@ class MasterEngine:
         self.configure_pass2_lora(OPEN_H3_LORA, 1.0, "replace", 0)
         self.open_h3 = True
         _LOG.info("Pass 2: Open-H3 refine (%s alone, sigmas %s, face strength %.2f, audio held from pass 1)",
-                  OPEN_H3_LORA, list(OPEN_H3_SIGMAS), OPEN_H3_FACE["face_strength"])
+                  OPEN_H3_LORA, list(OPEN_H3_SIGMAS), self.open_h3_face["face_strength"])
 
     def _open_h3_face_map(self, video_p1, rejoined, clip_index):
         """Face strength map [T, H, W] on the pass-2 latent grid, from the decoded pass-1 frames (YuNet, CPU)."""
@@ -513,7 +516,7 @@ class MasterEngine:
             images = images.reshape((-1,) + tuple(images.shape[-3:]))
         builder = nodes.NODE_CLASS_MAPPINGS["OpenH3FaceRegionMap"]()
         path = builder.build(images, rejoined, filename_prefix=f"master_clip{clip_index + 1}", extra_boxes="",
-                             **OPEN_H3_FACE)[0]
+                             **self.open_h3_face)[0]
         del images
         import numpy as np
         mask = torch.from_numpy(np.load(path).astype("float32"))
