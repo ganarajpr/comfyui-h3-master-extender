@@ -1627,15 +1627,13 @@ app.registerExtension({
                     };
                     const actions = document.createElement("span");
                     actions.style.cssText = "display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap;";
-                    // Shown while any clip has a rewritten prompt: every clip back to its raw prompt, so the next run rewrites them all.
+                    // Every clip back to its raw prompt, so the next run rewrites them all (says so when no clip has a rewrite).
                     const clearRewritesBtn = document.createElement("button");
                     clearRewritesBtn.textContent = "Clear rewrites";
                     clearRewritesBtn.title = "Drop the rewritten prompt of every clip and put its raw prompt back, so the next run rewrites them all. Raw prompts are not touched.";
                     clearRewritesBtn.style.cssText = bulkStyle.replace("#2e6a45", "#6b5416").replace("#4ade80", "#fcd34d");
                     clearRewritesBtn.onclick = (e) => { e.stopPropagation(); clearAllRewrites(); };
-                    const anyRewritten = clipsState.some((c) => c.prompt_rewritten || typeof c.rewrite_text === "string" || c.rewrite_meta || liveRewrite.has(c.id));
-                    if (anyRewritten) actions.append(clearRewritesBtn);
-                    actions.append(validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
+                    actions.append(clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
                 container.appendChild(projectControls.references());
