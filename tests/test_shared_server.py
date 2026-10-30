@@ -306,6 +306,25 @@ class WriterMetadataTests(unittest.TestCase):
         self.assertEqual(nodes[4]["widgets_values"], ["STORY"])
         self.assertEqual(nodes[5]["widgets_values"], [""])
 
+    def test_a_workflow_converted_from_the_api_prompt_is_matched_by_node_type(self):
+        """A script's UI workflow converted from its API prompt renumbers the nodes (API 990 -> UI 9): the one node of that type is used."""
+        prompt, extra = self.graphs()
+        prompt["990"] = prompt.pop("3")
+        for n in extra["workflow"]["nodes"]:
+            n["type"] = {3: "H3ShotWriter", 4: "PreviewAny", 5: "PreviewAny", 7: "MiniMaxH3MasterExtender"}[n["id"]]
+        self.assertEqual(cm.embed_writer_output(990, prompt, extra, self.OUT, "STORY")[:2], (True, True))
+        self.assertEqual(json.loads(extra["workflow"]["nodes"][0]["widgets_values"][-1])["story"], "STORY")
+        prompt["980"] = prompt.pop("7")
+        self.assertEqual(cm.embed_clips(980, prompt, extra, [{"id": 0, "prompt": "p"}]), (True, True))
+        self.assertEqual(json.loads(extra["workflow"]["nodes"][3]["widgets_values"][1])[0]["prompt"], "p")
+
+    def test_an_empty_queue_time_value_still_finds_the_last_slot(self):
+        prompt, extra = self.graphs()
+        prompt["3"]["inputs"]["last_output"] = ""
+        extra["workflow"]["nodes"][0]["widgets_values"][-1] = ""
+        self.assertEqual(cm.embed_writer_output(3, prompt, extra, self.OUT, "STORY")[:2], (True, True))
+        self.assertEqual(json.loads(extra["workflow"]["nodes"][0]["widgets_values"][-1])["story"], "STORY")
+
     def test_a_graph_that_does_not_look_right_is_left_alone(self):
         self.assertEqual(cm.embed_writer_output(None, {}, {}, [], ""), (False, False, 0))
         prompt, extra = self.graphs()
