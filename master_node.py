@@ -25,6 +25,7 @@ import nodes
 from .master_projects import load_reference_images, clip_picture_keys, _clip_identity, _chain_key, _clip_fingerprint, _pass1_fingerprint, _audio_refine_signature
 from . import prompt_rewriter
 from . import clips_metadata
+from . import shared_server
 from . import shot_writer
 
 from . import motion_context_disk
@@ -716,16 +717,23 @@ class MiniMaxH3MasterExtender:
                 _send_progress(owner, 0, len(clips), stage, message, pct)
             def rewrite_stream(index, clip_id, phase, text, source=""):
                 _send_rewrite(owner, index, clip_id, phase, text, source)
-            rewrite_notes = prompt_rewriter.rewrite_clips(
-                clips, refs, kwargs, aspect_text=str(pass2_resolution if pass2_enabled else pass1_resolution),
-                progress_cb=rewrite_progress, stream_cb=rewrite_stream,
-                videos=ref_videos, video_audios=ref_video_audios, audios=ref_audios,
-                plan_cb=lambda planned_clips, positions: _send_plan(owner, planned_clips, positions),
-            )
+            try:
+                rewrite_notes = prompt_rewriter.rewrite_clips(
+                    clips, refs, kwargs, aspect_text=str(pass2_resolution if pass2_enabled else pass1_resolution),
+                    progress_cb=rewrite_progress, stream_cb=rewrite_stream,
+                    videos=ref_videos, video_audios=ref_video_audios, audios=ref_audios,
+                    plan_cb=lambda planned_clips, positions: _send_plan(owner, planned_clips, positions),
+                )
+            except BaseException:
+                shared_server.close()
+                raise
             for note in rewrite_notes:
                 _LOG.info("Rewriter: %s", note)
             _send_clips(owner, clips, fields=["prompt", "prompt_raw", "prompt_rewritten", "rewrite_text", "rewrite_meta", "validated"])
             clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)
+        # A model server the Shot Writer left running is the rewriter's to attach to and close; whatever is still held (rewrite off, nothing to write,
+        # another model) goes now, before H3 loads or a prompts_only run ends.
+        shared_server.close()
 
         if str(run_mode) == "prompts_only":
             return self._prompts_only(owner, clips, rewrite_notes, imported)

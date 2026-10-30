@@ -43,11 +43,13 @@ from pathlib import Path
 try:
     from . import e4_engine
     from . import prompt_rewriter
+    from . import shared_server
     from . import strata_backend
     from . import vram_release
 except ImportError:  # imported as a top-level module (tests)
     import e4_engine
     import prompt_rewriter
+    import shared_server
     import strata_backend
     import vram_release
 
@@ -1284,17 +1286,20 @@ def _pack():
             prompt_rewriter._mod("runner"))
 
 
-def server_slots(concurrency: int) -> int:
-    """Slots of the model server this node starts: as many as the writer sends requests at once, at most ``e4_engine.MAX_WORKERS`` (4 slots of ``slot_ctx`` fit the card with the model)."""
-    return max(1, min(e4_engine.MAX_WORKERS, int(concurrency)))
+def server_slots(concurrency: int, limit: int = e4_engine.MAX_WORKERS) -> int:
+    """Slots of the model server this node starts: as many as the writer sends requests at once, at most ``limit`` (default ``e4_engine.MAX_WORKERS``: 4 slots of ``slot_ctx`` fit the card with the model)."""
+    return max(1, min(int(limit), int(concurrency)))
 
 
 @contextlib.contextmanager
-def open_model(writer_label: str, budget: int, *, slot_ctx: int, concurrency: int = 1, say=None):
+def open_model(writer_label: str, budget: int, *, slot_ctx: int, concurrency: int = 1, say=None, share=None, max_slots: int = e4_engine.MAX_WORKERS):
     """The model server for the story writer: the rewriter pack's own session (a vision model from its list, on ninfer-serve or llama-server) or Strata, closed on exit.
 
-    The local server is started with ``server_slots(concurrency)`` slots and a pool of ``slot_ctx`` per slot (ninfer-serve: ``--max-concurrency`` = slots, ``--max-context`` = the pool
-    divided by the slots), so the writer's parallel requests run at the same time instead of queueing behind one slot. The endpoint says how many slots it has (``slots``)."""
+    The local server is started with ``server_slots(concurrency, max_slots)`` slots and a pool of ``slot_ctx`` per slot (ninfer-serve: ``--max-concurrency`` = slots, ``--max-context`` = the pool
+    divided by the slots), so the writer's parallel requests run at the same time instead of queueing behind one slot. The endpoint says how many slots it has (``slots``).
+
+    ``share`` is the linked Master Extender's inputs (``prompt_rewriter.shared_plan`` decides): when its rewriter runs the same model, the server is started with settings both nodes
+    can use (``prompt_rewriter.SHARED_SLOTS`` slots, the Extender's thinking budget and message) and is LEFT RUNNING on exit for the Extender's rewriter to attach to (``shared_server``)."""
     say = say or (lambda message: None)
     nodes, paths, mtmd, server_engine, runner = _pack()
     if not writer_label or writer_label.startswith("("):
@@ -1304,8 +1309,27 @@ def open_model(writer_label: str, budget: int, *, slot_ctx: int, concurrency: in
     if not strata and not model_path:
         raise StoryWriterError("the story writer needs a model that runs on a server (a vision model from the pack's list, or Strata); "
                                f"'{writer_label}' does not. Pick another writer_model.")
+    plan = None if strata else prompt_rewriter.shared_plan(share, model_path, nodes, paths)
     reasoning = {"enabled": True, "budget": budget, "message": BUDGET_MESSAGE}
-    slots = server_slots(concurrency)
+    slots = server_slots(concurrency, max_slots)
+    if plan:
+        reasoning = {"enabled": True, "budget": plan["budget"] if plan["thinking"] else budget, "message": plan["message"] or BUDGET_MESSAGE}
+        slots = max(slots, prompt_rewriter.SHARED_SLOTS)
+
+    def launch():
+        stack = contextlib.ExitStack()
+        try:
+            server = stack.enter_context(mtmd.session(model_path, mmproj_path, assets=0, attachments=1, gpu_layers=-1, n_ctx=0, device="auto", backend="auto",
+                                                     auto_download=True, progress=None, slots=slots, force=True, reasoning=reasoning, pool_ctx=slot_ctx * slots))
+        except BaseException:
+            stack.close()
+            raise
+        return server, stack.close, {"slots": slots, "slot_ctx": slot_ctx, "reasoning": reasoning}
+
+    def fits(meta):
+        return meta.get("slots", 0) >= slots and meta.get("slot_ctx", 0) >= slot_ctx and meta.get("reasoning") == reasoning
+
+    kept = False
     try:
         with contextlib.ExitStack() as stack:
             if strata:
@@ -1313,8 +1337,7 @@ def open_model(writer_label: str, budget: int, *, slot_ctx: int, concurrency: in
                 server = stack.enter_context(strata_backend.open_strata(budget, adopt=getattr(runner, "_adopt", None), on_wait=lambda s: say(f"waiting for Strata ({s:.0f} s)")))
             else:
                 say(f"loading {os.path.basename(model_path)}")
-                server = stack.enter_context(mtmd.session(model_path, mmproj_path, assets=0, attachments=1, gpu_layers=-1, n_ctx=0, device="auto", backend="auto",
-                                                         auto_download=True, progress=None, slots=slots, force=True, reasoning=reasoning, pool_ctx=slot_ctx * slots))
+                server = stack.enter_context(shared_server.use(shared_server.key_of(model_path, mmproj_path), launch, fits=fits, say=say, keep=lambda: bool(plan)))
             if server is None:
                 raise StoryWriterError(f"the model server for '{writer_label}' did not start (see the ComfyUI log: minimax_h3_rewriter.server_engine)")
             endpoint = e4_engine.endpoint_of(server, model_path=model_path, strata=strata, is_ninfer=server_engine.is_ninfer)
@@ -1322,8 +1345,10 @@ def open_model(writer_label: str, budget: int, *, slot_ctx: int, concurrency: in
             if not strata:
                 endpoint["slots"] = slots
             yield endpoint, runner
+        kept = bool(plan)
     finally:
-        vram_release.release("h3 story writer finished")
+        if not kept:
+            vram_release.release("h3 story writer finished")
 
 
 class H3StoryWriter:
