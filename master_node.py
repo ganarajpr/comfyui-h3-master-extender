@@ -25,6 +25,7 @@ import nodes
 from .master_projects import load_reference_images, clip_picture_keys, _clip_identity, _chain_key, _clip_fingerprint, _pass1_fingerprint, _audio_refine_signature
 from . import prompt_rewriter
 from . import clips_metadata
+from . import shot_writer
 
 from . import motion_context_disk
 from .motion_context_disk import (
@@ -379,7 +380,7 @@ class MiniMaxH3MasterExtender:
                 "audio_vae": ("VAE", {"tooltip": "MiniMax H3 Audio VAE"}),
                 "pdd_file": ("STRING", {"default": "", "tooltip": "Retired (PDD mode was removed). Kept only so saved workflows keep their widget order; any saved value is accepted and ignored."}),
                 "upscaler_model": (upscaler_files, {"default": upscaler_files[0], "tooltip": "Minimax H3 3D Latent Upscaler weights"}),
-                "run_mode": (["clip_by_clip", "full_batch"], {"default": "clip_by_clip", "tooltip": "clip_by_clip renders 1 clip then pauses for validation; full_batch renders all pending clips"}),
+                "run_mode": (["clip_by_clip", "full_batch", "prompts_only"], {"default": "clip_by_clip", "tooltip": "clip_by_clip renders 1 clip then pauses for validation; full_batch renders all pending clips; prompts_only imports clips_in, plans and rewrites the prompts, writes them to the panel and the saved metadata, and stops before H3 is loaded (nothing is rendered; cache and last_frame are blocked so a Final Decode after it simply does not run)."}),
                 "pass1_resolution": (
                     ["608x352 (16:9)", "352x608 (9:16)", "512x512 (1:1)", "704x384", "896x576",
                      "1056x608 (16:9)", "608x1056 (9:16)", "864x480 (16:9)", "480x864 (9:16)"],
@@ -505,6 +506,8 @@ class MiniMaxH3MasterExtender:
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
+                # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
+                "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -546,6 +549,13 @@ class MiniMaxH3MasterExtender:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
+    def check_lazy_status(self, clips_json=None, clips_in=None, unique_id=None, prompt=None, **kwargs):
+        """Ask for ``clips_in`` (so the Shot Writer upstream runs) only when it is wired and the clip list has no clip with a prompt."""
+        if clips_in is not None or shot_writer.has_prompt(clips_json):
+            return []
+        wired = ((prompt or {}).get(str(unique_id)) or {}).get("inputs", {}).get("clips_in")
+        return ["clips_in"] if isinstance(wired, list) else []
+
     def extend(
         self,
         model,
@@ -584,6 +594,7 @@ class MiniMaxH3MasterExtender:
         sparse_dense_blocks="auto",
         sparse_sink="auto",
         pass2_sla_sparsity=0.0,
+        clips_in=None,
         **kwargs,
     ):
         accel_mode, dual_mode, pass2_chunk_frames = resolve_accel_mode(accel_mode, pass2_chunk_frames)
@@ -603,6 +614,13 @@ class MiniMaxH3MasterExtender:
 
         # Parse clips configuration
         clips = json.loads(clips_json) if isinstance(clips_json, str) else clips_json
+        imported = False
+        if isinstance(clips_in, str) and clips_in.strip() and not shot_writer.has_prompt(clips):
+            written = shot_writer.import_clips(clips_in)
+            if not written:
+                raise ValueError("clips_in is not the H3 Shot Writer's clips output (a JSON list of clips with a 'raw' shot list).")
+            clips, imported = written, True
+            _LOG.info("clips_in: the clip list was empty, imported %d clip(s) from the Shot Writer", len(clips))
         if not isinstance(clips, list) or not clips:
             raise ValueError("Add a clip and enter its prompt before running this project.")
 
@@ -624,6 +642,12 @@ class MiniMaxH3MasterExtender:
                 clip_cfg.pop("prompt_raw", None)
                 clip_cfg.pop("rewrite_meta", None)
                 clip_cfg.pop("rewrite_text", None)
+
+        if imported:
+            _send_plan(owner, clips, range(len(clips)))
+            clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)
+            # The clips exist now: the story planner must not plan more of them.
+            kwargs["auto_clips"] = 0
 
         # Parse resolution settings
         w1, h1 = parse_resolution(pass1_resolution, 608, 352)
@@ -702,6 +726,9 @@ class MiniMaxH3MasterExtender:
                 _LOG.info("Rewriter: %s", note)
             _send_clips(owner, clips, fields=["prompt", "prompt_raw", "prompt_rewritten", "rewrite_text", "rewrite_meta", "validated"])
             clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)
+
+        if str(run_mode) == "prompts_only":
+            return self._prompts_only(owner, clips, rewrite_notes, imported)
 
         # Setup persistent disk caching
         chain_key = _chain_key(clips)
@@ -1139,6 +1166,30 @@ class MiniMaxH3MasterExtender:
             status_msg,
             last_frame_tensor,
         )
+
+    def _prompts_only(self, owner, clips, rewrite_notes, imported):
+        """run_mode prompts_only: the clips and their prompts are written (panel, saved metadata) and nothing is loaded or rendered.
+
+        ``cache`` and ``last_frame`` are blocked: Final Decode (which needs a cache to decode) and anything fed by the last frame are skipped by ComfyUI
+        instead of failing on an empty chain, and the run ends with no error. The counts and the status string are real values.
+        """
+        _send_clips(owner, clips, fields=["prompt", "prompt_raw", "prompt_rewritten", "rewrite_text", "rewrite_meta", "validated", "seed"])
+        status_msg = f"prompts only: {len(clips)} clips written, nothing rendered"
+        if not rewrite_notes:
+            status_msg += " (rewrite_mode is off: raw prompts only)"
+        else:
+            status_msg += " | " + "; ".join(rewrite_notes)
+        _LOG.info(status_msg)
+        return (_blocked(), len(clips), 0, status_msg, _blocked())
+
+
+def _blocked():
+    """An output that stops every node fed by it from running, without an error (comfy_execution's ExecutionBlocker; None = no message)."""
+    try:
+        from comfy_execution.graph_utils import ExecutionBlocker
+    except ImportError:  # a ComfyUI too old to have it: an empty value is the next best thing
+        return None
+    return ExecutionBlocker(None)
 
 
 NODE_CLASS_MAPPINGS = {
