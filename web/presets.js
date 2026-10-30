@@ -61,8 +61,8 @@ export const MASTER_PRESETS = [
     {
         // no resolutions here: pass 2 refines to whatever refine resolution is selected, like the other refiners
         id: "open-h3",
-        label: "Open-H3 refine + face",
-        hint: "HyperFlow 8-step pass 1, then NVIDIA's Open-H3-Regenerate-2K refiner as pass 2 (3 steps from sigma 0.909) with a face map, so faces start at 0.50 and keep their identity. Pass-1 audio is kept. Keeps the selected draft and refine resolutions.",
+        label: "Open-H3 refine + face (experimental)",
+        hint: "EXPERIMENTAL: faces failed review on CHOODI ep05 c40 at every face strength tried (0.55 / 0.25 / 0.10). HyperFlow 8-step pass 1, then NVIDIA's Open-H3-Regenerate-2K refiner as pass 2 (3 steps from sigma 0.909) with a face map, so faces start at 0.50 and keep their identity. Pass-1 audio is kept. Keeps the selected draft and refine resolutions.",
         values: {
             accel_mode: "HyperFlow 8-step",
             hyperflow_file: PRUNED,
