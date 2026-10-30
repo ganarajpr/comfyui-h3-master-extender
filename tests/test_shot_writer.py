@@ -458,7 +458,7 @@ class PanelPictureTests(unittest.TestCase):
         self.assertEqual(sh.H3ShotWriter.IS_CHANGED(None, None), sh.H3ShotWriter.IS_CHANGED({}, "5"))
 
     def test_node_declares_the_hidden_inputs(self):
-        self.assertEqual(sh.H3ShotWriter.INPUT_TYPES()["hidden"], {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"})
+        self.assertEqual(sh.H3ShotWriter.INPUT_TYPES()["hidden"], {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"})
 
 
 class RangeAndCountTests(unittest.TestCase):
@@ -642,7 +642,7 @@ class NodeTests(unittest.TestCase):
         self.assertIn("H3ShotWriter", sh.NODE_DISPLAY_NAME_MAPPINGS)
         spec = sh.H3ShotWriter.INPUT_TYPES()
         self.assertEqual(list(spec["required"]), ["brief", "clips", "seconds", "language", "seed", "writer_model", "thinking_budget"])
-        self.assertEqual(list(spec["optional"]), ["concurrency"] + [f"ref_image_{i}" for i in range(1, 10)])   # the Extender's names, appended after the rest
+        self.assertEqual(list(spec["optional"]), ["concurrency"] + [f"ref_image_{i}" for i in range(1, 10)] + ["last_output"])   # the Extender's names, appended after the rest
         self.assertTrue(all(spec["optional"][f"ref_image_{i}"][0] == "IMAGE" for i in range(1, 10)))
         clips, seconds = spec["required"]["clips"][1], spec["required"]["seconds"][1]
         self.assertEqual((clips["default"], clips["min"], clips["max"]), (0, 0, 60))
@@ -657,7 +657,7 @@ class NodeTests(unittest.TestCase):
         chat = Script(lambda kind, m, n: plan_json(2) if kind == "plan" else shots_json(1, GOOD))
 
         @contextlib.contextmanager
-        def fake_open(label, budget, slot_ctx, concurrency, say):
+        def fake_open(label, budget, slot_ctx, concurrency, say, **kw):
             yield {"url": "http://x", "model": "m", "style": "chat", "slots": 4}, mock.Mock(interrupted=lambda: False)
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sh, "open_model", fake_open), mock.patch.object(sh, "ServerChat", lambda *a, **k: chat), \

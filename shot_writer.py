@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
+    from . import clips_metadata
     from . import e4_engine
     from . import prompt_rewriter
     from . import story_planner
@@ -38,6 +39,7 @@ try:
     from .story_writer import (BUDGET_MESSAGE, DEFAULT_CONCURRENCY, DEFAULT_LANGUAGE, DEFAULT_SECONDS, MAX_CLIPS, MAX_CONCURRENCY, THINKING_BUDGET,
                                MinorContentError, Reply, ServerChat, StoryWriterError, is_wide, output_room, parse_json_object, quoted_lines, script_note)
 except ImportError:  # imported as a top-level module (tests)
+    import clips_metadata
     import e4_engine
     import prompt_rewriter
     import story_planner
@@ -601,6 +603,7 @@ def import_clips(text) -> list:
             clip["plan_end_state"] = end
         if duration > 15:
             clip["beyond"] = True
+        clip["writer"] = {key: item[key] for key in ("goal", "shots", "start_state", "end_state", "new_recurring_visuals") if key in item}
         clips.append(clip)
     return clips
 
@@ -930,6 +933,10 @@ def write_shots(chat, *, brief: str, clips: int, seconds: int = DEFAULT_SECONDS,
 # --------------------------------------------------------------------------- the ComfyUI node
 
 
+LAST_OUTPUT_DEFAULT = "{}"
+SHOT_CONCURRENCY = 8   # the writer's default requests in flight: ninfer at 65536 per slot gave ~1,110 tok/s with 8 clients against ~770 with 4
+
+
 def open_model(*args, **kwargs):
     return sw.open_model(*args, **kwargs)
 
@@ -948,9 +955,10 @@ class H3ShotWriter:
             "writer_model": (prompt_rewriter.writer_choices(), {"tooltip": "The rewriter pack's model list, the same as the Story Writer's writer_model. The server is started for this node and closed after it, so the render that follows has the GPU."}),
             "thinking_budget": (prompt_rewriter.REASONING_BUDGETS, {"default": "4096", "tooltip": "Thinking tokens at most per call, on top of the answer."}),
         }, "optional": {
-            "concurrency": ("INT", {"default": DEFAULT_CONCURRENCY, "min": 1, "max": MAX_CONCURRENCY, "tooltip": "Requests sent to the model server at the same time: the clips' shot lists are written in parallel. The model server this node starts gets that many slots, at most 4; a higher value is lowered to the slots the server has."}),
+            "concurrency": ("INT", {"default": SHOT_CONCURRENCY, "min": 1, "max": MAX_CONCURRENCY, "tooltip": "Requests sent to the model server at the same time: the clips' shot lists are written in parallel. The model server this node starts gets that many slots, at most 8. When the Master Extender this node feeds rewrites with the same model, the server always gets 8 slots and is left running for that Extender's rewriter (no second start)."}),
             **{f"ref_image_{i}": ("IMAGE", {"tooltip": f"Reference picture {i}, wired from the same Load Image as the Master Extender's ref_image_{i}. The writer looks at it and the brief may call it 'picture {i}'; it stays <Picture {i}> in the raw prompts."}) for i in range(1, REF_SLOTS + 1)},
-        }, "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"}}
+            "last_output": ("STRING", {"default": LAST_OUTPUT_DEFAULT, "multiline": True, "tooltip": "Filled by the node: what it last wrote (clips, story, time, model), saved in the video's metadata. Hidden in the graph; leave it alone."}),
+        }, "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
     @classmethod
     def IS_CHANGED(cls, prompt=None, unique_id=None, **kwargs):
@@ -969,7 +977,7 @@ class H3ShotWriter:
     def VALIDATE_INPUTS(cls, thinking_budget=None):
         return True
 
-    def write(self, brief, clips, seconds, language, seed, writer_model, thinking_budget="4096", concurrency=DEFAULT_CONCURRENCY, unique_id=None, prompt=None, **refs):
+    def write(self, brief, clips, seconds, language, seed, writer_model, thinking_budget="4096", concurrency=SHOT_CONCURRENCY, unique_id=None, prompt=None, extra_pnginfo=None, last_output=None, **refs):
         say_early = lambda message: _LOG.info("H3 Shot Writer: %s", message)
         pictures = pictures_of(refs, gather_refs(prompt, unique_id, refs, say_early))
         strata = str(writer_model) == strata_backend.LABEL
@@ -993,7 +1001,8 @@ class H3ShotWriter:
         def say(message):
             _LOG.info("H3 Shot Writer: %s", message)
 
-        with open_model(str(writer_model), budget, slot_ctx=slot_ctx, concurrency=concurrency, say=say) as (endpoint, runner):
+        found = linked_extender(prompt, unique_id)
+        with open_model(str(writer_model), budget, slot_ctx=slot_ctx, concurrency=concurrency, say=say, share=found[1] if found else None, max_slots=MAX_CONCURRENCY) as (endpoint, runner):
             concurrency = min(int(concurrency), int(endpoint.get("slots") or concurrency))
             chat = ServerChat(endpoint, interrupted=getattr(runner, "interrupted", None))
             result = write_shots(chat, brief=brief, clips=clips, seconds=seconds, language=language, seed=seed, model=endpoint["model"], style=endpoint["style"],
@@ -1004,6 +1013,8 @@ class H3ShotWriter:
             print(f"[H3 Shot Writer] warning: {warning}", flush=True)
         for clip, visuals in side["new_recurring_visuals"].items():
             print(f"[H3 Shot Writer] warning: clip {clip} introduces recurring visuals that need a reference image: {', '.join(visuals)}", flush=True)
+        clips_metadata.embed_writer_output(unique_id, prompt, extra_pnginfo, json.loads(result["clips"]) if isinstance(result["clips"], str) else result["clips"], result["story"],
+                                           model=endpoint.get("label") or endpoint.get("model") or "")
         return (result["clips"], result["story"])
 
 

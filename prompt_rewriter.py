@@ -37,10 +37,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 try:
     from . import e4_engine
+    from . import shared_server
     from . import story_planner
     from . import strata_backend
 except ImportError:  # imported as a top-level module (tests)
     import e4_engine
+    import shared_server
     import story_planner
     import strata_backend
 
@@ -99,6 +101,7 @@ E4_SCORES = e4_engine.SCORES
 E4_DECISION_BUDGETS = e4_engine.DECISION_BUDGETS
 
 REASONING_BUDGETS = ["1024", "2048", "4096"]
+SHARED_SLOTS = 8   # slots of a server the Shot Writer leaves for this rewriter (ninfer, 65536 per slot: 8 clients gave ~1,110 tok/s against ~770 at 4)
 
 
 def reasoning_budget(value) -> str:
@@ -236,6 +239,31 @@ def writer_choices() -> list[str]:
 
 def _same_file(a: str, b: str) -> bool:
     return bool(a and b) and os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def shared_plan(inputs, model_path: str, nodes, paths):
+    """What a server the Shot Writer starts must carry for the Master Extender (its ``inputs`` in the API prompt) that reads the writer's clips, or None.
+
+    None unless that Extender will rewrite (``rewrite_mode`` not off) with the SAME model file as the writer, from plain widget values (a wired widget cannot be read here).
+    Otherwise ``{"thinking", "budget", "message"}``: the rewriter's thinking switch, its budget and its budget message, which ninfer fixes at launch."""
+    if not isinstance(inputs, dict) or not model_path:
+        return None
+
+    def plain(name, default):
+        value = inputs.get(name, default)
+        return None if isinstance(value, list) else value
+
+    mode, label = plain("rewrite_mode", "off"), plain("rewrite_writer_model", "")
+    if not isinstance(mode, str) or mode == "off" or not isinstance(label, str) or not label or label.startswith("(") or label == strata_backend.LABEL:
+        return None
+    try:
+        files = _vision_files(nodes, paths, label)
+    except Exception:
+        return None
+    if not _same_file(files[0], model_path):
+        return None
+    thinking = plain("rewrite_thinking", False)
+    return {"thinking": bool(thinking), "budget": int(reasoning_budget(plain("rewrite_reasoning_budget", "4096"))), "message": str(plain("rewrite_reasoning_budget_message", "") or "").strip()}
 
 
 def _writer_file(nodes, paths, label: str) -> str:
@@ -864,18 +892,42 @@ def rewrite_clips(clips: list, refs: dict, settings: dict, *, aspect_text: str, 
     notes: list[str] = []
     open_session = caption_jobs > 0 or writer_on_server
     if open_session:
-        session = mtmd.session(
-            model_path, mmproj_path,
-            assets=caption_jobs, attachments=max(VIDEO_FRAMES if videos_to_describe else 1, len(pictures)),
-            gpu_layers=-1, n_ctx=0, device="auto", backend="auto", auto_download=True,
-            progress=None, slots=server_slots, force=writer_on_server,
-            reasoning=reasoning if writer_on_server else None, pool_ctx=pool_ctx,
-        )
+        need_slot_ctx = max(writer_ctx, plan_ctx_tokens, e4_engine.slot_ctx() if e4_plan else 0)
+
+        def launch():
+            stack = contextlib.ExitStack()
+            try:
+                opened = stack.enter_context(mtmd.session(
+                    model_path, mmproj_path,
+                    assets=caption_jobs, attachments=max(VIDEO_FRAMES if videos_to_describe else 1, len(pictures)),
+                    gpu_layers=-1, n_ctx=0, device="auto", backend="auto", auto_download=True,
+                    progress=None, slots=server_slots, force=writer_on_server,
+                    reasoning=reasoning if writer_on_server else None, pool_ctx=pool_ctx,
+                ))
+            except BaseException:
+                stack.close()
+                raise
+            return opened, stack.close, {}
+
+        def fits(meta):
+            """A server the Shot Writer left running is used as launched: ninfer fixes the context per slot, the thinking budget and its message at start."""
+            if meta.get("slot_ctx", 0) < need_slot_ctx:
+                return False
+            if writer_on_server and reasoning["enabled"] and not e4_plan:
+                had = meta.get("reasoning") or {}
+                if not had.get("enabled") or int(had.get("budget", -1)) != budget or (budget_message and str(had.get("message") or "") != budget_message.strip()):
+                    return False
+            return True
+
+        session = shared_server.use(shared_server.key_of(model_path, mmproj_path), launch, fits=fits, say=lambda message: say("rewrite", message, 0.1))
     else:
         session = contextlib.nullcontext(None)
 
     with contextlib.ExitStack() as stack:
         server = stack.enter_context(session)
+        have = getattr(server, "slots", None)
+        if isinstance(have, int) and have > 0:   # an attached server may have fewer slots than this run would use
+            writers_at_once, caption_slots, e4_workers = (max(1, min(n, have)) for n in (writers_at_once, caption_slots, e4_workers))
         if videos_to_describe:
             video_question = nodes.caption_question("Video", length)
             say("rewrite", f"describing {len(videos_to_describe)} reference video(s) from {VIDEO_FRAMES} sampled frames each", 0.15)

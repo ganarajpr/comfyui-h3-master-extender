@@ -35,9 +35,11 @@ from .shot_writer import (
     NODE_DISPLAY_NAME_MAPPINGS as SHOT_WRITER_NODE_DISPLAY_NAME_MAPPINGS,
 )
 
+from . import shared_server
 from . import vram_release
 
 vram_release.install()
+shared_server.install()
 
 NODE_CLASS_MAPPINGS = {
     **MASTER_NODE_CLASS_MAPPINGS,
