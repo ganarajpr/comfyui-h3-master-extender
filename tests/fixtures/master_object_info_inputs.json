@@ -25,7 +25,8 @@
  "run_mode": {
   "options": [
    "clip_by_clip",
-   "full_batch"
+   "full_batch",
+   "prompts_only"
   ]
  },
  "pass1_resolution": {
@@ -664,5 +665,8 @@
   "type": "FLOAT",
   "min": 0.0,
   "max": 0.99
+ },
+ "clips_in": {
+  "type": "STRING"
  }
 }
