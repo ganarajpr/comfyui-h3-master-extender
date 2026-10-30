@@ -949,6 +949,14 @@ app.registerExtension({
                 clearRewrites.style.cssText = "background: #3a2e14; color: #fcd34d; border: 1px solid #6b5416; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;";
                 clearRewrites.onclick = () => clearAllRewrites();
                 wrap.appendChild(uiRow("", clearRewrites));
+                if (writerLinked()) {
+                    const reimport = document.createElement("button");
+                    reimport.textContent = "Re-import from writer";
+                    reimport.title = "Empty the clip list so the next run imports the clips again from the H3 Shot Writer wired into clips_in. Your clips, edits and rewrites in the list are dropped.";
+                    reimport.style.cssText = "background: #1f3a2e; color: #86efac; border: 1px solid #2f6b4c; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;";
+                    reimport.onclick = () => reimportFromWriter();
+                    wrap.appendChild(uiRow("", reimport));
+                }
             }
 
             function section(key, title, summaryFn, buildBody, { collapsible = true } = {}) {
@@ -1188,6 +1196,18 @@ app.registerExtension({
                     delete clip.planned;
                     if (clip.prompt === "") delete clip.plan_end_state;
                 }
+                saveState();
+                renderUI();
+            }
+            function writerLinked() {
+                return Boolean(node.inputs?.find((i) => i.name === "clips_in" && i.link != null));
+            }
+            // The next run imports the clips again when the list holds no prompt (the backend asks the Shot Writer only then).
+            function reimportFromWriter() {
+                if (!confirm("Empty the clip list so the next run imports the clips again from the writer? Every clip in the list, with its edits, rewrites and renders, is dropped.")) return;
+                const fresh = { id: 0, title: "Clip 1", prompt: "", duration: DUR_DEFAULT, seed: Math.floor(Math.random() * 1000000000), seed_mode: "randomize", validated: false, loras: [] };
+                liveRewrite.clear();
+                clipsState.splice(0, clipsState.length, fresh);
                 saveState();
                 renderUI();
             }
@@ -1834,11 +1854,12 @@ app.registerExtension({
                 // 5. Footer: run mode + Run
                 const footer = document.createElement("div");
                 footer.style.cssText = "display: flex; gap: 10px; align-items: center;";
-                const runRow = uiRow("run", bindSelect("run_mode", { render: (v) => String(v).replace("_", " ") }), { hint: "clip by clip renders one clip and pauses for validation; full batch renders everything." });
+                const runRow = uiRow("run", bindSelect("run_mode", { render: (v) => String(v).replace("_", " ") }), { hint: "clip by clip renders one clip and pauses for validation; full batch renders everything; prompts only: write raw + H3 prompts, render nothing; edit them, then switch to full batch or clip by clip." });
                 runRow.style.flex = "1";
                 footer.appendChild(runRow);
                 const continueButton = document.createElement("button");
-                continueButton.textContent = getW("run_mode", "clip_by_clip") === "full_batch" ? "Run" : "Run / Continue after validation";
+                const runModeNow = getW("run_mode", "clip_by_clip");
+                continueButton.textContent = runModeNow === "full_batch" ? "Run" : (runModeNow === "prompts_only" ? "Write prompts" : "Run / Continue after validation");
                 continueButton.style.cssText = "flex: 1; background: #6355d8; color: #fff; border: none; border-radius: 6px; padding: 7px 12px; font-weight: 600; font-size: 12px; cursor: pointer;";
                 continueButton.disabled = !clipsState.length || projectControls.isBusy();
                 if (continueButton.disabled) continueButton.style.opacity = "0.5";
@@ -1963,6 +1984,12 @@ app.registerExtension({
                         continue;
                     }
                     if (rawTextOf(local).trim() || "planned" in local) continue;
+                    // Clips imported from the Shot Writer arrive whole (seed, mode, title) and take the empty slot as they are.
+                    if (incoming.from_writer === true) {
+                        clipsState[item.index] = incoming;
+                        changed = true;
+                        continue;
+                    }
                     Object.assign(local, { prompt: incoming.prompt, planned: true, duration: incoming.duration, prompt_rewritten: false, validated: false, plan_end_state: incoming.plan_end_state });
                     delete local.prompt_raw; delete local.rewrite_text; delete local.rewrite_meta;
                     changed = true;

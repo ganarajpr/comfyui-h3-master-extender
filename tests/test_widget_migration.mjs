@@ -113,3 +113,17 @@ console.log("widget migration ok");
         assert.equal(JSON.stringify(node.widgets_values), before, `${file}: pass2 row binding leaves values unchanged`);
     }
 }
+
+// run_mode gained prompts_only (last option, default unchanged) and clips_in was appended as the last input: a socket, so no widget value moves
+{
+    const inputs = JSON.parse(fs.readFileSync(new URL("./fixtures/master_object_info_inputs.json", import.meta.url), "utf8"));
+    assert.deepEqual(inputs.run_mode.options, ["clip_by_clip", "full_batch", "prompts_only"]);
+    assert.equal(Object.keys(inputs).at(-1), "clips_in");
+    for (const file of workflows) {
+        const node = JSON.parse(fs.readFileSync(new URL(`../example_workflows/${file}`, import.meta.url), "utf8")).nodes.find(n => n.type === "MiniMaxH3MasterExtender");
+        const names = node.inputs.filter(i => i.widget).map(i => i.name);
+        assert(!names.includes("clips_in"), `${file}: clips_in is a socket, not a widget`);
+        assert.equal(names.length + 1, node.widgets_values.length, `${file}: widget values still line up (names + master_ui)`);
+        assert(["clip_by_clip", "full_batch"].includes(node.widgets_values[names.indexOf("run_mode")]), `${file}: saved run_mode still valid`);
+    }
+}

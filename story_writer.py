@@ -556,6 +556,21 @@ def quoted_lines(text: str) -> list:
 # --------------------------------------------------------------------------- the model server
 
 
+def _anthropic_parts(content):
+    """A message's content for /v1/messages: text stays, OpenAI ``image_url`` data-URI parts become ``image`` blocks."""
+    if not isinstance(content, list):
+        return content
+    out = []
+    for part in content:
+        url = (part.get("image_url") or {}).get("url", "") if part.get("type") == "image_url" else ""
+        if url.startswith("data:") and ";base64," in url:
+            head, data = url.split(";base64,", 1)
+            out.append({"type": "image", "source": {"type": "base64", "media_type": head[5:], "data": data}})
+        else:
+            out.append(part)
+    return out
+
+
 class ServerChat:
     """A chat call on the model server the rewriter opened (``e4_engine.endpoint_of`` describes it): ninfer-serve's /v1/messages, or chat completions.
 
@@ -573,16 +588,18 @@ class ServerChat:
         self.timeout = timeout
         self.sleep = sleep
 
-    def request(self, messages, max_tokens: int, budget: int, temperature: float):
+    def request(self, messages, max_tokens: int, budget: int, temperature: float, response_format=None):
         if self.style == "ninfer-messages":
             system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
             body = {"model": self.model, "max_tokens": max_tokens, "temperature": temperature, "thinking": {"type": "enabled", "budget_tokens": max(1024, budget)},
-                    "messages": [m for m in messages if m["role"] != "system"]}
+                    "messages": [dict(m, content=_anthropic_parts(m["content"])) for m in messages if m["role"] != "system"]}
             if system:
                 body["system"] = system
             return f"{self.url}/v1/messages", {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}, body
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
                 "reasoning_budget_tokens": max(1024, budget), "reasoning_budget_message": self.budget_message}
+        if response_format:   # ninfer and Strata enforce it on chat completions; /v1/messages gets no schema (the prompt describes the JSON)
+            body["response_format"] = response_format
         return f"{self.url}/v1/chat/completions", {"Content-Type": "application/json"}, body
 
     def parse(self, payload: dict, secs: float) -> Reply:
@@ -599,8 +616,8 @@ class ServerChat:
         return Reply(strip_think((choice.get("message") or {}).get("content") or ""), "length" if choice.get("finish_reason") == "length" else "stop",
                      int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), int(think), secs)
 
-    def __call__(self, messages, *, max_tokens: int, budget: int, kind: str = "", temperature: float = 0.6) -> Reply:
-        url, headers, body = self.request(messages, max_tokens, budget, temperature)
+    def __call__(self, messages, *, max_tokens: int, budget: int, kind: str = "", temperature: float = 0.6, response_format=None) -> Reply:
+        url, headers, body = self.request(messages, max_tokens, budget, temperature, response_format)
         last = ""
         for attempt in range(1, self.retries + 1):
             if self.interrupted is not None and self.interrupted():
@@ -616,6 +633,10 @@ class ServerChat:
             except urllib.error.HTTPError as error:
                 detail = error.read().decode("utf-8", errors="replace")[:300]
                 last = f"HTTP {error.code} {detail}"
+                if error.code in (400, 422) and "response_format" in body:   # a server that rejects the schema still answers without it
+                    _LOG.warning("story writer: the server rejected response_format (%s); asking without it", last)
+                    body.pop("response_format")
+                    continue
                 if error.code in (400, 401, 403, 404, 422):
                     raise StoryWriterError(f"the model server refused the {kind or 'request'}: {last}") from error
             except (urllib.error.URLError, OSError, ValueError) as error:
