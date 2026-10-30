@@ -5,7 +5,7 @@ import { MASTER_PRESETS, matchPreset } from "../web/presets.js";
 const inputs = JSON.parse(fs.readFileSync(new URL("./fixtures/master_object_info_inputs.json", import.meta.url), "utf8"));
 
 assert.equal(new Set(MASTER_PRESETS.map(p => p.id)).size, MASTER_PRESETS.length, "unique ids");
-assert.equal(MASTER_PRESETS.length, 11);
+assert.equal(MASTER_PRESETS.length, 12);
 
 // every preset value is valid for the live node
 for (const p of MASTER_PRESETS) {

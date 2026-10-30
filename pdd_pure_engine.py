@@ -36,6 +36,44 @@ from . import x0_debug
 
 _LOG = logging.getLogger("minimax_h3_master_extender.engine")
 
+# Open-H3 refine (pass2_refiner): NVIDIA's Open-H3-Regenerate-2K refiner as pass 2, with BennyDaBall's face region
+# (ComfyUI-Open-H3-FaceRegion) so faces start from lower noise than the rest of the frame.
+PASS2_REFINER_LORA = "refine lora"
+PASS2_REFINER_OPEN_H3 = "Open-H3 regenerate + face"
+PASS2_REFINERS = [PASS2_REFINER_LORA, PASS2_REFINER_OPEN_H3]
+OPEN_H3_LORA = "h3\\minimax_h3_open_regenerate_2k_refiner_rank_384_bf16.safetensors"   # Kijai's refiner, used alone
+OPEN_H3_SIGMAS = (0.909375, 0.857143, 0.666667, 0.0)    # NVIDIA's 3-step release grid
+OPEN_H3_FACE = {"face_strength": 0.55, "pad": 0.35, "feather": 1.5, "threshold": 0.6}   # faces start at 0.50
+
+
+def _is_open_h3(refiner):
+    return str(refiner or "").lower().startswith("open-h3")
+
+
+class _RegionNoise:
+    """Start noise for the Open-H3 refine: the video gets m * noise + (1 - m) * upscaled, so with ComfyUI's flow
+    scaling s * noise' + (1 - s) * up a token with strength m starts at m * s. Audio noise passes through.
+
+    MMH3SplitUpscale draws its noise once per stream from zeros of the whole clip's shape and slices it per window, so
+    a plain (not nested) request of the video's shape gets the region noise too."""
+
+    def __init__(self, seed, mask, up):
+        self.seed, self.mask, self.up = seed, mask, up
+
+    def _mix(self, noise):
+        m = self.mask.to(noise.device, noise.dtype)[None, None]
+        return m * noise + (1 - m) * self.up.to(noise.device, noise.dtype)
+
+    def generate_noise(self, input_latent):
+        latent = input_latent["samples"]
+        noise = comfy.sample.prepare_noise(latent, self.seed, input_latent.get("batch_index"))
+        if getattr(latent, "is_nested", False):
+            video_n, audio_n = noise.unbind()
+            return comfy.nested_tensor.NestedTensor((self._mix(video_n), audio_n))
+        if tuple(noise.shape) == tuple(self.up.shape):
+            return self._mix(noise)
+        return noise
+
 
 def parse_resolution(res_str: str, default_w: int, default_h: int):
     """Parse '1344x768 (16:9)' or '1344x768' into (w, h)."""
@@ -446,6 +484,74 @@ class MasterEngine:
             return
         self.pass1_steps = steps
 
+    def configure_pass2_refiner(self, refiner=PASS2_REFINER_LORA):
+        """Open-H3 refine: pass 2 = Kijai's Open-H3 refiner LoRA alone (replace), NVIDIA's 3-step grid from sigma
+        0.909, a face map so faces start at 0.50, and the pass-1 audio held. Call after configure_dual_sampling.
+        The default changes nothing."""
+        self.open_h3 = False
+        if not _is_open_h3(refiner):
+            return
+        if self.dual_active:
+            _LOG.warning("Open-H3 refine ignored: dual sampling runs HyperFlow's own grid as pass 2")
+            return
+        if nodes.NODE_CLASS_MAPPINGS.get("OpenH3FaceRegionMap") is None:
+            raise RuntimeError("Open-H3 refine needs ComfyUI-Open-H3-FaceRegion in custom_nodes: "
+                               "git clone https://github.com/BennyDaBall930/ComfyUI-Open-H3-FaceRegion")
+        import folder_paths
+        if OPEN_H3_LORA not in folder_paths.get_filename_list("loras"):
+            raise RuntimeError(f"Open-H3 refine needs the refiner LoRA at models/loras/{OPEN_H3_LORA} "
+                               "(Kijai's minimax_h3_open_regenerate_2k_refiner_rank_384_bf16)")
+        self.configure_pass2_lora(OPEN_H3_LORA, 1.0, "replace", 0)
+        self.open_h3 = True
+        _LOG.info("Pass 2: Open-H3 refine (%s alone, sigmas %s, face strength %.2f, audio held from pass 1)",
+                  OPEN_H3_LORA, list(OPEN_H3_SIGMAS), OPEN_H3_FACE["face_strength"])
+
+    def _open_h3_face_map(self, video_p1, rejoined, clip_index):
+        """Face strength map [T, H, W] on the pass-2 latent grid, from the decoded pass-1 frames (YuNet, CPU)."""
+        images = self.vae.decode(video_p1)
+        if images.ndim == 5:
+            images = images.reshape((-1,) + tuple(images.shape[-3:]))
+        builder = nodes.NODE_CLASS_MAPPINGS["OpenH3FaceRegionMap"]()
+        path = builder.build(images, rejoined, filename_prefix=f"master_clip{clip_index + 1}", extra_boxes="",
+                             **OPEN_H3_FACE)[0]
+        del images
+        import numpy as np
+        mask = torch.from_numpy(np.load(path).astype("float32"))
+        _LOG.info("Clip %d: Open-H3 face map %s, %d of %d latent frames with a face", clip_index + 1,
+                  tuple(mask.shape), int((mask < 0.999).flatten(1).any(1).sum()), mask.shape[0])
+        return mask
+
+    @staticmethod
+    def _with_region_strength(model, mask, sigmas, bounds):
+        """Pass the face map to H3 as its per-token video denoise_mask, so a token with strength m runs at m * sigma.
+        `bounds` are the latent-frame windows [(k0, k1), ...] sampled in order; a window starts when the sigma is back
+        at the schedule's first value."""
+        first = float(sigmas[0])
+        state = {"window": -1, "last": None}
+        prev = model.model_options.get("model_function_wrapper")
+
+        def wrapper(apply_model, args):
+            sigma = float(args["timestep"].flatten()[0])
+            if abs(sigma - first) < 1e-5 and (state["last"] is None or abs(state["last"] - first) >= 1e-5):
+                state["window"] += 1
+            state["last"] = sigma
+            k0, k1 = bounds[min(state["window"], len(bounds) - 1)]
+            c = dict(args["c"])
+            shapes = c.get("latent_shapes")
+            if shapes and int(shapes[0][2]) != k1 - k0:
+                raise RuntimeError(f"Open-H3 face map: window {state['window']} has {int(shapes[0][2])} latent frames, "
+                                   f"expected {k1 - k0}")
+            x = args["input"]
+            m = mask[k0:k1].to(x.device, torch.float32)[None, None]
+            c["denoise_mask"] = c["denoise_mask"] * m if "denoise_mask" in c else m
+            if prev is not None:
+                return prev(apply_model, {**args, "c": c})
+            return apply_model(x, args["timestep"], **c)
+
+        m = model.clone()
+        m.set_model_unet_function_wrapper(wrapper)
+        return m
+
     def configure_audio_refine(self, steps=0, denoise=0.5, cache=True):
         """Audio-only refine after pass 2 (ComfyUI-H3-AudioRefine). steps 0 = off."""
         self.audio_refine_steps = int(steps or 0)
@@ -735,6 +841,8 @@ class MasterEngine:
                       dual_split_index(self.pass1_sigmas, self.dual_split_step), len(tail) - 1,
                       [round(float(x), 4) for x in tail])
             return tail
+        if getattr(self, "open_h3", False):
+            return torch.FloatTensor(list(OPEN_H3_SIGMAS))
         if self.hyperflow_mode and not self._pass2_lora_active():
             tail = hyperflow_tail_sigmas(self.pass1_sigmas, pass2_denoise)
             _LOG.info("HyperFlow: pass 2 uses the tail of HyperFlow's own grid (%d steps): %s",
@@ -899,7 +1007,7 @@ class MasterEngine:
             return False
         return int(frame_count) > int(self.pass2_chunk_frames)
 
-    def _sample_pass2_chunked(self, model, positive, latent, sigmas, seed):
+    def _sample_pass2_chunked(self, model, positive, latent, sigmas, seed, region=None):
         """Refine pass 2 in overlapping temporal windows instead of one shot.
 
         A 15 s clip at 1344x768 is ~108k packed tokens, at 1920x1088 ~218k;
@@ -941,6 +1049,13 @@ class MasterEngine:
                   t_lat, window_lat, window_tokens)
 
         model = self._with_ff_chunking(model, window_tokens)
+        noise = Noise_RandomNoise(seed)
+        if region is not None:
+            # the split node samples its windows in order; recompute its bounds so each gets its slice of the map
+            segments = sys.modules[split_cls.__module__].compute_h3_segments_adaptive
+            bounds, _ = segments(t_lat, *tparam["p"][:2])
+            model = self._with_region_strength(model, region, sigmas, [(k0, k1) for k0, _, k1, _ in bounds])
+            noise = _RegionNoise(seed, region, video)
         self._reclaim_vram(model, tokens=window_tokens)
 
         sampler_name = pass_sampler_name(getattr(self, "turbo_mode", False), self.sampler_name)
@@ -948,7 +1063,7 @@ class MasterEngine:
             latent=latent,
             conditioning=positive,
             model=model,
-            noise=Noise_RandomNoise(seed),
+            noise=noise,
             sampler=comfy.samplers.sampler_object(sampler_name),
             sigmas=sigmas,
             negative=None,
@@ -981,7 +1096,7 @@ class MasterEngine:
             _LOG.exception("x0 debug dump: setup failed, rendering without it")
             return None
 
-    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False):
+    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False, region=None):
         """Standard Euler sampling using ComfyUI core sampler internals directly.
 
         NOTE: Do NOT place any bare 'import comfy' statements inside this function.
@@ -1001,6 +1116,15 @@ class MasterEngine:
 
         # Noise_RandomNoise is a plain class: Noise_RandomNoise(seed)
         noise_obj = Noise_RandomNoise(seed)
+        if region is not None:
+            # Open-H3 refine: face map as start noise + per-token strength, audio held clean like the windowed pass
+            video, audio = latent_image["samples"].unbind()
+            noise_obj = _RegionNoise(seed, region, video)
+            model = self._with_region_strength(model, region, sigmas, [(0, int(video.shape[2]))])
+            latent_image = dict(latent_image)
+            latent_image["noise_mask"] = comfy.nested_tensor.NestedTensor((
+                torch.ones((1, 1, 1) + tuple(video.shape[-2:]), dtype=torch.float32),
+                torch.zeros((1,) + tuple(audio.shape[1:]), dtype=torch.float32)))
 
         # Size the feed-forward chunking to this pass's packed token count.
         model = self._with_ff_chunking(model, self._packed_tokens(latent_image["samples"]))
@@ -1371,6 +1495,7 @@ class MasterEngine:
 
         # Quality-tail sigmas (HyperFlow tail, or the turbo schedule's tail)
         sigmas_p2 = self._pass2_sigmas(model_p2, pass2_denoise)
+        region = self._open_h3_face_map(video_p1, rejoined_latent, clip_index) if getattr(self, "open_h3", False) else None
 
         # Sample Pass 2 (High-Res Refine): whole clip, or overlapping temporal
         # windows when the clip is longer than pass2_chunk_frames.
@@ -1381,6 +1506,7 @@ class MasterEngine:
                 latent=rejoined_latent,
                 sigmas=sigmas_p2,
                 seed=seed,
+                region=region,
             )
         else:
             final_sampled = self._sample_euler(
@@ -1389,7 +1515,9 @@ class MasterEngine:
                 latent_image=rejoined_latent,
                 sigmas=sigmas_p2,
                 seed=seed,
+                region=region,
             )
+            final_sampled.pop("noise_mask", None)
 
         if getattr(self, "audio_refine_steps", 0) > 0:
             if progress_cb:

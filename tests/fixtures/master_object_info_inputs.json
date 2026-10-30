@@ -666,6 +666,12 @@
   "min": 0.0,
   "max": 0.99
  },
+ "pass2_refiner": {
+  "options": [
+   "refine lora",
+   "Open-H3 regenerate + face"
+  ]
+ },
  "clips_in": {
   "type": "STRING"
  }

@@ -133,7 +133,7 @@ class DefaultsAreUnchanged(unittest.TestCase):
         text = NODE.read_text(encoding="utf-8")
         names = re.findall(r'^\s{16}"(\w+)": \(', text[text.index("def INPUT_TYPES"):], re.M)
         self.assertEqual(names[:len(OLD_INPUT_NAMES)], OLD_INPUT_NAMES)
-        self.assertEqual(names[len(OLD_INPUT_NAMES):], ["dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps", "pass2_chunk_when", "pass2_sla_sparsity", "clips_in"])
+        self.assertEqual(names[len(OLD_INPUT_NAMES):], ["dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps", "pass2_chunk_when", "pass2_sla_sparsity", "pass2_refiner", "clips_in"])
 
     def test_new_inputs_default_off(self):
         text = NODE.read_text(encoding="utf-8")
