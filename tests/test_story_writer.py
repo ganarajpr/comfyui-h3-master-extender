@@ -700,6 +700,14 @@ class WriteStoryTests(unittest.TestCase):
         self.assertEqual(a, sw.job_hash(" b ", 6, 15, "English", 1, "m", 4096))
 
 
+# A cancel raises ComfyUI's InterruptProcessingException where ComfyUI is importable (the box), KeyboardInterrupt elsewhere.
+try:
+    from comfy.model_management import InterruptProcessingException as _ComfyInterrupt
+    INTERRUPTS = (KeyboardInterrupt, _ComfyInterrupt)
+except Exception:
+    INTERRUPTS = (KeyboardInterrupt,)
+
+
 class Stub(BaseHTTPRequestHandler):
     seen = []
     mode = "ok"
@@ -795,7 +803,7 @@ class WireTests(unittest.TestCase):
     def test_interrupt_is_honoured(self):
         with stub_server() as url:
             chat = sw.ServerChat({"url": url, "model": "m", "style": "ninfer-messages"}, interrupted=lambda: True)
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertRaises(INTERRUPTS):
                 chat([{"role": "user", "content": "x"}], max_tokens=5000, budget=1024)
         self.assertEqual(Stub.seen, [])
 
@@ -805,7 +813,7 @@ class WireTests(unittest.TestCase):
             cancel_at = time.time() + 0.3
             chat = sw.ServerChat({"url": url, "model": "m", "style": "ninfer-messages"}, interrupted=lambda: time.time() > cancel_at)
             started = time.time()
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertRaises(INTERRUPTS):
                 chat([{"role": "user", "content": "x"}], max_tokens=5000, budget=1024)
             waited = time.time() - started
         self.assertLess(waited, 1.5)
