@@ -707,6 +707,8 @@ class Stub(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         Stub.seen.append((self.path, body))
+        if Stub.mode == "slow":   # a long generation: the answer comes after the client has been cancelled
+            time.sleep(3)
         if Stub.mode == "400":
             self.send_response(400)
             self.end_headers()
@@ -796,6 +798,18 @@ class WireTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 chat([{"role": "user", "content": "x"}], max_tokens=5000, budget=1024)
         self.assertEqual(Stub.seen, [])
+
+    def test_a_cancel_stops_a_request_in_flight(self):
+        """ComfyUI's cancel lands within about half a second, not when the model's answer (a minute or more) arrives."""
+        with stub_server("slow") as url:
+            cancel_at = time.time() + 0.3
+            chat = sw.ServerChat({"url": url, "model": "m", "style": "ninfer-messages"}, interrupted=lambda: time.time() > cancel_at)
+            started = time.time()
+            with self.assertRaises(KeyboardInterrupt):
+                chat([{"role": "user", "content": "x"}], max_tokens=5000, budget=1024)
+            waited = time.time() - started
+        self.assertLess(waited, 1.5)
+        self.assertEqual(len(Stub.seen), 1)
 
     def test_engine_over_http(self):
         with stub_server() as url, tempfile.TemporaryDirectory() as tmp:

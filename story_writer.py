@@ -616,6 +616,32 @@ class ServerChat:
         return Reply(strip_think((choice.get("message") or {}).get("content") or ""), "length" if choice.get("finish_reason") == "length" else "stop",
                      int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), int(think), secs)
 
+    def _post(self, request) -> dict:
+        """The request's JSON answer. A plan or a long clip is one blocking call of a minute or more, so the wait runs on a
+        helper thread and ComfyUI's cancel is checked every half second meanwhile: a cancel raises at once, and the abandoned
+        connection ends when the node closes the server."""
+        if self.interrupted is None:
+            with urllib.request.urlopen(request, timeout=self.timeout) as answer:
+                return json.loads(answer.read().decode("utf-8"))
+        box = {}
+
+        def fetch():
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as answer:
+                    box["payload"] = json.loads(answer.read().decode("utf-8"))
+            except BaseException as error:  # handed to the waiting thread
+                box["error"] = error
+
+        worker = threading.Thread(target=fetch, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(0.5)
+            if worker.is_alive() and self.interrupted():
+                raise_interrupt()
+        if "error" in box:
+            raise box["error"]
+        return box["payload"]
+
     def __call__(self, messages, *, max_tokens: int, budget: int, kind: str = "", temperature: float = 0.6, response_format=None) -> Reply:
         url, headers, body = self.request(messages, max_tokens, budget, temperature, response_format)
         last = ""
@@ -625,8 +651,7 @@ class ServerChat:
             started = time.time()
             try:
                 request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers)
-                with urllib.request.urlopen(request, timeout=self.timeout) as answer:
-                    payload = json.loads(answer.read().decode("utf-8"))
+                payload = self._post(request)
                 if isinstance(payload, dict) and not payload.get("error"):
                     return self.parse(payload, time.time() - started)
                 last = str(payload.get("error"))[:300]
