@@ -150,9 +150,82 @@ def refs_from_inputs(inputs: dict) -> dict:
     return {f"ref_image_{i - 1}": inputs[f"ref_image_{i}"] for i in range(1, REF_SLOTS + 1) if inputs.get(f"ref_image_{i}") is not None}
 
 
-def pictures_of(inputs: dict) -> list:
-    """The connected pictures as the planner and the clip writers send them (``prompt_rewriter._reference_pictures``: 896 px long side, PNG data URIs)."""
-    return prompt_rewriter._reference_pictures(prompt_rewriter._ordered_refs(refs_from_inputs(inputs)))
+def pictures_of(inputs: dict, refs: dict | None = None) -> list:
+    """The pictures as the planner and the clip writers send them (``prompt_rewriter._reference_pictures``: 896 px long side, PNG data URIs).
+    ``refs`` is a ready reference dict (``gather_refs``); without it the node's own sockets are used."""
+    return prompt_rewriter._reference_pictures(prompt_rewriter._ordered_refs(refs if refs is not None else refs_from_inputs(inputs)))
+
+
+EXTENDER_CLASS = "MiniMaxH3MasterExtender"
+
+
+def load_panel_refs(refs_json) -> dict:
+    """The Extender's panel pictures (``refs_json``) by the Extender's own loader, ``ref_image_<slot>`` keys, slot 0 = Picture 1."""
+    try:
+        from . import master_projects
+    except ImportError:
+        import master_projects
+    return master_projects.load_reference_images(refs_json)
+
+
+def linked_extender(prompt, unique_id):
+    """``(node_id, inputs)`` of the first Master Extender in the API prompt whose ``clips_in`` is this node's output 0, or None. Several: the first, logged."""
+    found = []
+    for node_id, node in (prompt or {}).items():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        link = inputs.get("clips_in") if isinstance(inputs, dict) else None
+        if node.get("class_type") == EXTENDER_CLASS and isinstance(link, list) and len(link) == 2 and str(link[0]) == str(unique_id) and int(link[1]) == 0:
+            found.append((str(node_id), inputs))
+    if len(found) > 1:
+        _LOG.info("shot writer: %d Master Extenders read this node's clips; using %s's pictures", len(found), found[0][0])
+    return found[0] if found else None
+
+
+def panel_signature(refs_json) -> list:
+    """Name, size and mtime of every panel picture file, so a changed picture changes the node's cache key."""
+    try:
+        config = json.loads(refs_json) if isinstance(refs_json, str) else refs_json
+        names = config.get("images", []) if isinstance(config, dict) else []
+    except ValueError:
+        return []
+    out = []
+    for name in names:
+        if not isinstance(name, str) or not name:
+            out.append(None)
+            continue
+        try:
+            import folder_paths
+
+            stat = Path(folder_paths.get_annotated_filepath(name)).stat()
+            out.append([name, stat.st_size, int(stat.st_mtime_ns)])
+        except Exception:
+            out.append([name])
+    return out
+
+
+def gather_refs(prompt, unique_id, own: dict, say=None) -> dict:
+    """The reference dict the linked Master Extender will have at run time, as far as this node can build it.
+
+    The Extender merges its panel pictures (``refs_json``) first and lets a ``ref_image_N`` socket fill only a slot the panel left empty
+    (``master_node.extend``); the same order is used here, with this node's own ``ref_image_N`` sockets standing in for the Extender's (their tensors
+    belong to other nodes). An Extender socket that is linked while neither the panel nor this node has that picture is named in a warning.
+    With no linked Extender the node's own sockets are all there is."""
+    refs = refs_from_inputs(own)
+    found = linked_extender(prompt, unique_id)
+    if not found:
+        return refs
+    node_id, inputs = found
+    refs_json = inputs.get("refs_json")
+    merged = load_panel_refs(refs_json) if isinstance(refs_json, str) and refs_json.strip() else {}
+    for key, value in refs.items():
+        merged.setdefault(key, value)
+    for idx in range(1, REF_SLOTS + 1):
+        if isinstance(inputs.get(f"ref_image_{idx}"), list) and f"ref_image_{idx - 1}" not in merged:
+            _LOG.warning("shot writer: Master Extender %s has ref_image_%d wired from another node, but neither its panel nor this node's ref_image_%d has that picture; "
+                         "Picture %d is missing for the writer", node_id, idx, idx, idx)
+            if say:
+                say(f"Picture {idx} (Extender socket) is not available to the writer")
+    return dict(sorted(merged.items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))
 
 
 def message(text: str, pictures: list) -> dict:
@@ -871,7 +944,14 @@ class H3ShotWriter:
         }, "optional": {
             "concurrency": ("INT", {"default": DEFAULT_CONCURRENCY, "min": 1, "max": MAX_CONCURRENCY, "tooltip": "Requests sent to the model server at the same time: the clips' shot lists are written in parallel. The model server this node starts gets that many slots, at most 4; a higher value is lowered to the slots the server has."}),
             **{f"ref_image_{i}": ("IMAGE", {"tooltip": f"Reference picture {i}, wired from the same Load Image as the Master Extender's ref_image_{i}. The writer looks at it and the brief may call it 'picture {i}'; it stays <Picture {i}> in the raw prompts."}) for i in range(1, REF_SLOTS + 1)},
-        }}
+        }, "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"}}
+
+    @classmethod
+    def IS_CHANGED(cls, prompt=None, unique_id=None, **kwargs):
+        """A different panel picture on the Extender this node feeds is a different job: its files' names, sizes and mtimes join the cache key."""
+        found = linked_extender(prompt, unique_id)
+        refs_json = found[1].get("refs_json") if found else None
+        return hashlib.sha1(json.dumps(panel_signature(refs_json) if isinstance(refs_json, str) else [], ensure_ascii=False).encode("utf-8")).hexdigest()
 
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("clips", "story")
@@ -883,8 +963,9 @@ class H3ShotWriter:
     def VALIDATE_INPUTS(cls, thinking_budget=None):
         return True
 
-    def write(self, brief, clips, seconds, language, seed, writer_model, thinking_budget="4096", concurrency=DEFAULT_CONCURRENCY, **refs):
-        pictures = pictures_of(refs)
+    def write(self, brief, clips, seconds, language, seed, writer_model, thinking_budget="4096", concurrency=DEFAULT_CONCURRENCY, unique_id=None, prompt=None, **refs):
+        say_early = lambda message: _LOG.info("H3 Shot Writer: %s", message)
+        pictures = pictures_of(refs, gather_refs(prompt, unique_id, refs, say_early))
         strata = str(writer_model) == strata_backend.LABEL
         sees = strata_backend.vision_available() if strata else True
         budget = int(prompt_rewriter.reasoning_budget(thinking_budget))
