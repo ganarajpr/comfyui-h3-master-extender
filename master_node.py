@@ -390,6 +390,7 @@ class MiniMaxH3MasterExtender:
                      "1280x720", "720x1280 (9:16)",
                      "1344x768 (16:9)", "768x1344 (9:16)",
                      "1920x1088 (16:9)", "1088x1920 (9:16)",
+                     "2560x1440 (16:9)", "1440x2560 (9:16)",
                      "1024x1024 (1:1)",
                      PASS2_OFF],
                     {"default": "1344x768 (16:9)", "tooltip": "Stage 2 (Pass 2) target resolution. 1920x1088 is 1080p on H3's 32-px grid; it needs ~2x the VRAM of 1344x768, so keep clips shorter (~5-8 s) at 1080p on a 32 GB card. 'off (pass 1 only)' skips pass 2 and decodes the pass-1 result at the pass-1 size (2x with the X2 final decode). Pass-1 results stay cached, so switching pass 2 back on later only runs pass 2."},
