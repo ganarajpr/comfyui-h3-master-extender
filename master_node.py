@@ -58,6 +58,9 @@ from .pdd_pure_engine import (
     duration_to_h3_frames,
     with_dual_p1_settings,
     with_pass1_steps_p1_settings,
+    PASS2_REFINERS,
+    PASS2_REFINER_LORA,
+    OPEN_H3_FACE_STRENGTH,
 )
 
 PASS2_OFF = "off (pass 1 only)"
@@ -392,6 +395,7 @@ class MiniMaxH3MasterExtender:
                      "1280x720", "720x1280 (9:16)",
                      "1344x768 (16:9)", "768x1344 (9:16)",
                      "1920x1088 (16:9)", "1088x1920 (9:16)",
+                     "2560x1440 (16:9)", "1440x2560 (9:16)",
                      "1024x1024 (1:1)",
                      PASS2_OFF],
                     {"default": "1344x768 (16:9)", "tooltip": "Stage 2 (Pass 2) target resolution. 1920x1088 is 1080p on H3's 32-px grid; it needs ~2x the VRAM of 1344x768, so keep clips shorter (~5-8 s) at 1080p on a 32 GB card. 'off (pass 1 only)' skips pass 2 and decodes the pass-1 result at the pass-1 size (2x with the X2 final decode). Pass-1 results stay cached, so switching pass 2 back on later only runs pass 2."},
@@ -507,6 +511,9 @@ class MiniMaxH3MasterExtender:
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
+                # --- Pass-2 refiner (appended before clips_in, a socket, so it is the last widget value; the default is the long-standing refine-LoRA pass) ---
+                "pass2_refiner": (PASS2_REFINERS, {"default": PASS2_REFINER_LORA, "tooltip": "refine lora = the normal pass 2 (pass2_lora, pass2_steps, pass2_denoise). EXPERIMENTAL, faces failed review (CHOODI ep05 c40, 2026-10-31: at face strength 0.55, 0.25 and 0.10 none was acceptable; DMAD repaints faces the Open-H3 refiner cannot match). Open-H3 regenerate + face = NVIDIA's Open-H3-Regenerate-2K refiner (Kijai's r384 LoRA alone) to the pass-2 resolution: 3 Euler steps from sigma 0.909, with a face map (ComfyUI-Open-H3-FaceRegion, YuNet) so faces start lower (pass2_face_strength) and keep their identity, and the pass-1 audio held. pass2_lora / pass2_steps / pass2_denoise are ignored. Not with dual sampling."}),
+                "pass2_face_strength": ("FLOAT", {"default": OPEN_H3_FACE_STRENGTH, "min": 0.01, "max": 1.0, "step": 0.01, "tooltip": "Open-H3 refine only: faces start the refine at this x sigma 0.909 (0.25 -> 0.23) while the rest of the frame starts at 0.909. Lower keeps the draft's faces; 1.0 = no face protection. The face-region author's 0.55 (faces at 0.50) still redrew CHOODI faces (2026-10-31)."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -868,9 +875,15 @@ class MiniMaxH3MasterExtender:
             kwargs.get("pass1_early_stop", False),
         )
         engine.configure_pass1_steps(kwargs.get("pass1_steps", 0) if pass2_enabled else 0)
+        engine.configure_pass2_refiner(kwargs.get("pass2_refiner", PASS2_REFINER_LORA) if pass2_enabled else PASS2_REFINER_LORA,
+                                       kwargs.get("pass2_face_strength", OPEN_H3_FACE_STRENGTH))
         audio_refine = _audio_refine_signature(
             kwargs.get("audio_refine_steps", 0), kwargs.get("audio_refine_denoise", 0.5),
             kwargs.get("audio_refine_cache", True))
+        if engine.open_h3:
+            # a finished clip refined with the normal pass 2 must not be reused for an Open-H3 render (and back);
+            # added only when on, so other fingerprints are unchanged
+            audio_refine = [audio_refine, "open_h3_face_refine", engine.open_h3_face["face_strength"]]
         engine.configure_audio_refine(
             kwargs.get("audio_refine_steps", 0),
             kwargs.get("audio_refine_denoise", 0.5),

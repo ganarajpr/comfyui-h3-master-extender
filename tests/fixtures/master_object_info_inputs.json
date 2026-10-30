@@ -52,6 +52,8 @@
    "768x1344 (9:16)",
    "1920x1088 (16:9)",
    "1088x1920 (9:16)",
+   "2560x1440 (16:9)",
+   "1440x2560 (9:16)",
    "1024x1024 (1:1)",
    "off (pass 1 only)"
   ]
@@ -663,6 +665,17 @@
   "type": "FLOAT",
   "min": 0.0,
   "max": 0.99
+ },
+ "pass2_refiner": {
+  "options": [
+   "refine lora",
+   "Open-H3 regenerate + face"
+  ]
+ },
+ "pass2_face_strength": {
+  "type": "FLOAT",
+  "min": 0.01,
+  "max": 1.0
  },
  "clips_in": {
   "type": "STRING"

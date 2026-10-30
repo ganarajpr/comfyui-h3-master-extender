@@ -797,6 +797,7 @@ app.registerExtension({
             };
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
             const isHyperflow = () => !isTurbo();
+            const isOpenH3 = () => String(getW("pass2_refiner", "")).toLowerCase().startsWith("open-h3");
 
             function bindSelect(name, opts = {}) {
                 const w = W(name);
@@ -841,7 +842,8 @@ app.registerExtension({
             function engineSummary() {
                 const steps = getW("pdd_nfe", "8");
                 const p2 = String(getW("pass2_lora", "none"));
-                const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
+                const p2note = isOpenH3() ? " · refine Open-H3 + face"
+                    : p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
                 const dualMode = isDualMode(getW("accel_mode", ""));
@@ -1053,8 +1055,14 @@ app.registerExtension({
                 if (dualActive) {
                     wrap.appendChild(uiRow("pass 2 steps", bindNumber(p2b.widget), { hint: p2b.hint }));
                     wrap.appendChild(uiHint("Refine lora, strength and mode are ignored in dual sampling."));
+                } else if (isOpenH3()) {
+                    wrap.appendChild(uiRow("refiner", bindSelect("pass2_refiner")));
+                    if (W("pass2_face_strength")) wrap.appendChild(uiRow("face strength", bindNumber("pass2_face_strength"), { indent: true,
+                        hint: "Faces start the refine at this x 0.909 (0.25 -> 0.23). Lower keeps the draft's faces; 1.0 = no protection." }));
+                    wrap.appendChild(uiHint("Open-H3 refiner LoRA alone, 3 steps from sigma 0.909 to the refine resolution. Faces are found in the draft and start lower, so they keep their identity; the pass-1 audio is kept. Refine lora, steps and denoise are not used."));
                 } else {
                     const p2lora = String(getW("pass2_lora", "none"));
+                    if (W("pass2_refiner")) wrap.appendChild(uiRow("refiner", bindSelect("pass2_refiner")));
                     wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
                         { hint: "LoRA applied only on the pass-2 refine tail. none = same model as pass 1." }));
                     if (p2lora !== "none") {
