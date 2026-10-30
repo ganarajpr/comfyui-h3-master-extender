@@ -960,12 +960,6 @@ app.registerExtension({
                 if (sysWired) sys.style.opacity = "0.5";
                 wrap.appendChild(sys);
                 wrap.appendChild(uiHint("Rewritten clips show a ✎ badge. They are rewritten again automatically when their raw text, duration, aspect, reference pictures, models or system prompt change; otherwise they are left alone. 'Rewrite again' in a clip's prompt panel forces it."));
-                const clearRewrites = document.createElement("button");
-                clearRewrites.textContent = "Clear rewrites (keep raw)";
-                clearRewrites.title = "Drop the rewritten prompt of every clip and put its raw prompt back, so the next run rewrites them all. Raw prompts are not touched.";
-                clearRewrites.style.cssText = "background: #3a2e14; color: #fcd34d; border: 1px solid #6b5416; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;";
-                clearRewrites.onclick = () => clearAllRewrites();
-                wrap.appendChild(uiRow("", clearRewrites));
                 if (writerLinked()) {
                     const reimport = document.createElement("button");
                     reimport.textContent = "Re-import from writer";
@@ -1633,6 +1627,14 @@ app.registerExtension({
                     };
                     const actions = document.createElement("span");
                     actions.style.cssText = "display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap;";
+                    // Shown while any clip has a rewritten prompt: every clip back to its raw prompt, so the next run rewrites them all.
+                    const clearRewritesBtn = document.createElement("button");
+                    clearRewritesBtn.textContent = "Clear rewrites";
+                    clearRewritesBtn.title = "Drop the rewritten prompt of every clip and put its raw prompt back, so the next run rewrites them all. Raw prompts are not touched.";
+                    clearRewritesBtn.style.cssText = bulkStyle.replace("#2e6a45", "#6b5416").replace("#4ade80", "#fcd34d");
+                    clearRewritesBtn.onclick = (e) => { e.stopPropagation(); clearAllRewrites(); };
+                    const anyRewritten = clipsState.some((c) => c.prompt_rewritten || typeof c.rewrite_text === "string" || c.rewrite_meta || liveRewrite.has(c.id));
+                    if (anyRewritten) actions.append(clearRewritesBtn);
                     actions.append(validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
