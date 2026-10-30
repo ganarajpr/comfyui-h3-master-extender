@@ -14,6 +14,8 @@ _LOG = logging.getLogger("MiniMaxH3Master")
 
 WIDGET = "clips_json"
 WRITER_WIDGET = "last_output"
+EXTENDER_CLASS = "MiniMaxH3MasterExtender"
+WRITER_CLASS = "H3ShotWriter"
 PREVIEW_CLASS = "PreviewAny"
 PREVIEW_INPUT = "source"
 
@@ -49,12 +51,17 @@ def _update_api_graph(prompt, uid, text, widget=WIDGET):
     return old
 
 
-def _update_ui_graph(extra_pnginfo, uid, text, old, widget=WIDGET, valid=_is_list_json):
+def _update_ui_graph(extra_pnginfo, uid, text, old, widget=WIDGET, valid=_is_list_json, class_type=None, last=False):
+    """``class_type``: when no UI node has this id (a graph converted from an API prompt renumbers its nodes), the one node of that type.
+    ``last``: the widget is the node's last one (a hidden widget appended last), so its slot is the last value even when the queue-time
+    value is empty and cannot pick a slot by itself."""
     workflow = extra_pnginfo.get("workflow")
     nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
     if not isinstance(nodes, list):
         return False
     matches = [n for n in nodes if isinstance(n, dict) and str(n.get("id")) == uid]
+    if not matches and class_type:
+        matches = [n for n in nodes if isinstance(n, dict) and n.get("type") == class_type]
     if len(matches) != 1:
         return False
     values = matches[0].get("widgets_values")
@@ -64,6 +71,9 @@ def _update_ui_graph(extra_pnginfo, uid, text, old, widget=WIDGET, valid=_is_lis
             return True
         return False
     if isinstance(values, list):
+        if last and values and isinstance(values[-1], str) and (values[-1] == old or (not values[-1].strip() and not (old or "").strip())):
+            values[-1] = text
+            return True
         # The slot is found by the queue-time value (the API graph and the UI graph are saved from the same widget),
         # never by position: frontends list widgets differently.
         slots = [i for i, v in enumerate(values) if isinstance(v, str) and v == old] if old is not None else []
@@ -82,7 +92,7 @@ def embed_clips(unique_id, prompt, extra_pnginfo, clips):
         text = serialize(clips)
         old = _update_api_graph(prompt, uid, text) if isinstance(prompt, dict) else None
         api = old is not None
-        ui = _update_ui_graph(extra_pnginfo, uid, text, old) if isinstance(extra_pnginfo, dict) else False
+        ui = _update_ui_graph(extra_pnginfo, uid, text, old, class_type=EXTENDER_CLASS) if isinstance(extra_pnginfo, dict) else False
         if not (api and ui):
             _LOG.info("Clip metadata: node %s clips_json updated in the API graph: %s, in the workflow: %s", uid, api, ui)
         return (api, ui)
@@ -104,7 +114,7 @@ def embed_writer_output(unique_id, prompt, extra_pnginfo, clips, story, model=""
         text = json.dumps(payload, indent=2, ensure_ascii=False)
         old = _update_api_graph(prompt, uid, text, WRITER_WIDGET) if isinstance(prompt, dict) else None
         api = old is not None
-        ui = _update_ui_graph(extra_pnginfo, uid, text, old, WRITER_WIDGET, _is_object_json) if isinstance(extra_pnginfo, dict) else False
+        ui = _update_ui_graph(extra_pnginfo, uid, text, old, WRITER_WIDGET, _is_object_json, class_type=WRITER_CLASS, last=True) if isinstance(extra_pnginfo, dict) else False
         previews = _update_previews(prompt, extra_pnginfo, uid, story) if isinstance(prompt, dict) and isinstance(extra_pnginfo, dict) else 0
         if not (api and ui):
             _LOG.info("Writer metadata: node %s last_output updated in the API graph: %s, in the workflow: %s", uid, api, ui)
