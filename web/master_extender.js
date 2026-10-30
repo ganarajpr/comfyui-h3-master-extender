@@ -943,6 +943,12 @@ app.registerExtension({
                 if (sysWired) sys.style.opacity = "0.5";
                 wrap.appendChild(sys);
                 wrap.appendChild(uiHint("Rewritten clips show a ✎ badge. They are rewritten again automatically when their raw text, duration, aspect, reference pictures, models or system prompt change; otherwise they are left alone. 'Rewrite again' in a clip's prompt panel forces it."));
+                const clearRewrites = document.createElement("button");
+                clearRewrites.textContent = "Clear rewrites (keep raw)";
+                clearRewrites.title = "Drop the rewritten prompt of every clip and put its raw prompt back, so the next run rewrites them all. Raw prompts are not touched.";
+                clearRewrites.style.cssText = "background: #3a2e14; color: #fcd34d; border: 1px solid #6b5416; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;";
+                clearRewrites.onclick = () => clearAllRewrites();
+                wrap.appendChild(uiRow("", clearRewrites));
             }
 
             function section(key, title, summaryFn, buildBody, { collapsible = true } = {}) {
@@ -1182,6 +1188,15 @@ app.registerExtension({
                     delete clip.planned;
                     if (clip.prompt === "") delete clip.plan_end_state;
                 }
+                saveState();
+                renderUI();
+            }
+            // Every clip back to its raw prompt; the raw prompts themselves are left as they are.
+            function clearAllRewrites() {
+                const rewritten = clipsState.filter((c) => c.prompt_rewritten || typeof c.rewrite_text === "string" || c.rewrite_meta || liveRewrite.has(c.id));
+                if (!rewritten.length) { alert("No clip has a rewritten prompt."); return; }
+                if (!confirm(`Clear the rewritten prompts of ${rewritten.length} clip(s)? Their raw prompts stay; the next run rewrites them again.`)) return;
+                for (const clip of clipsState) wipeRewrite(clip);
                 saveState();
                 renderUI();
             }
