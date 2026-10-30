@@ -230,6 +230,14 @@ class StateTests(unittest.TestCase):
         self.assertIn("Kael first appears in the shot at 0s without saying what they wear", user(retry))
         self.assertIn("full silver plate armour", user(retry).split("PREVIOUS ANSWER", 1)[1])
 
+    def test_an_unchanged_outfit_is_not_demanded(self):
+        state = {"characters": [{"name": "Monster", "wardrobe": "a dark spiked metal collar"}, {"name": "Kael", "wardrobe": "full silver plate armour"}]}
+        shots = [shot(0, "The Monster roars; Kael steps forward"), shot(5), shot(10)]
+        opening = {"Monster": "a dark spiked metal collar", "Kael": "a grey cloak over a blue dress"}
+        problems = sh.check_costume(shots, state, opening)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Kael", problems[0])
+
     def test_skin_marks_in_the_plan_are_a_complaint(self):
         bad = {2: [{"character": "Kael", "field": "state", "to": "a bleeding gash on her arm"}]}
         replies = iter([plan_json(2, changes=bad), plan_json(2)])

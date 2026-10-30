@@ -514,12 +514,18 @@ def check_shots(shots: list, seconds: int, language: str, required_lines=()) -> 
     return problems
 
 
-def check_costume(shots: list, start_state: dict | None) -> list:
-    """The first shot that names a character must say what they wear, in a word of their outfit from the clip's start state (the raw prompt then carries it)."""
+def check_costume(shots: list, start_state: dict | None, opening: dict | None = None) -> list:
+    """The first shot that names a character must say what they wear, in a word of their outfit from the clip's start state (the raw prompt then carries it).
+
+    Only for a character whose outfit has changed from the one they open the film in (``opening``: name -> wardrobe): that is the case the
+    reference picture gets wrong (armour put on later). An unchanged outfit is what the picture shows, so it is not demanded in every clip.
+    """
     problems = []
     for c in (start_state or {}).get("characters", []):
         words = {w.casefold() for w in re.findall(r"[^\W\d_]{4,}", c.get("wardrobe", ""))}
         if not words or c["wardrobe"].casefold().startswith("as on the reference"):
+            continue
+        if opening is not None and normalize(opening.get(c["name"], "")) == normalize(c["wardrobe"]):
             continue
         first = next((s for s in shots if c["name"].casefold() in (s["action"] + " " + s.get("framing", "")).casefold()), None)
         if first and not any(w in first["action"].casefold() for w in words):
@@ -824,7 +830,7 @@ class ShotEngine:
         answer = 250 + MAX_SHOTS * (260 if is_wide(self.language) else 150)
 
         def check(parsed):
-            return check_shots(parsed["shots"], seconds, self.language, required) + check_costume(parsed["shots"], clip["start_state"])
+            return check_shots(parsed["shots"], seconds, self.language, required) + check_costume(parsed["shots"], clip["start_state"], {c["name"]: c["wardrobe"] for c in plan["cast"]})
 
         parsed, problems = self._checked(f"shots_{number:03d}", messages, answer=answer, schema_name="clip_shots", schema=SHOTS_SCHEMA,
                                          parse=lambda t: coerce_shots(parse_json_object(t)), check=check)
