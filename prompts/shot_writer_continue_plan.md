@@ -13,6 +13,7 @@ WHAT TO DO
 - {{ending}}
 - {{follows}}
 - Take every look from the story so far and the reference pictures; never describe a character in a way that contradicts their picture, except where the state changed it (armour put on). Write a picture as <Picture N> where a clip's text refers to it.
+- A picture that shows a costume, armour, a garment, a prop or an object on its own (on a mannequin, a stand, a hanger, a table) is NOT a person and brings in NO new character. It is something a character already in the story finds, puts on, takes or uses, when the story reaches it: for example a picture of armour on a mannequin becomes a wardrobe change for a character who is already in the story ("her outfit changes into the armour of <Picture N>"), at the clip where the story gives her a reason to put it on. Never invent someone to wear or carry it. Only a picture that clearly shows a person or creature who is not yet in the story may bring in a new character, and only when the story gives them a reason to arrive.
 - Every character is an adult (18 or older). If the story puts a minor in any sexual context, set "minor_in_sexual_content" to true and write the goals as "-".
 - Follow the film's genre, tone and register exactly. Do not soften, add warnings or moralise.
 
