@@ -270,12 +270,13 @@ def _store_fingerprints(data_path, manifest_path, fingerprints):
         _write_json_atomic(manifest_path, state)
 
 
-def _send_plan(owner, clips, positions):
-    """Hand the clips a story plan wrote (position + the whole clip) to the panel."""
+def _send_plan(owner, clips, positions, fill=False):
+    """Hand the clips a story plan wrote (position + the whole clip) to the panel. ``fill`` marks clips written into empty slots of the founder's own list
+    ("Fill from story so far"): the panel takes them even though it has already seen text there."""
     try:
         _send_to_queuer(
             EVENT_PLAN,
-            {"owner": str(owner), "planned": [{"index": int(i), "clip": clips[i]} for i in positions if 0 <= i < len(clips)]},
+            {"owner": str(owner), "planned": [dict({"index": int(i), "clip": clips[i]}, **({"fill": True} if fill else {})) for i in positions if 0 <= i < len(clips)]},
         )
     except Exception:
         pass
@@ -668,6 +669,23 @@ class MiniMaxH3MasterExtender:
                 refs[f"ref_image_{idx - 1}"] = kwargs[ref_k]
         # Slot order is <Picture i> order for the text encoder and the rewriter alike.
         refs = dict(sorted(refs.items(), key=lambda item: int(item[0].rsplit("_", 1)[1])))
+
+        # "Fill from story so far" (panel button): the empty clips the panel flagged for this one run are written as raw shot lists from the clips around them, then the
+        # run ends like prompts_only (nothing is rewritten, nothing rendered), so the founder reads them before the rewrite. Every other clip is left exactly as it is.
+        if any(isinstance(c, dict) and c.get(shot_writer.FILL_FLAG) is True for c in clips):
+            filled = shot_writer.fill_empty_clips(
+                clips, refs, writer_model=str(kwargs.get("rewrite_writer_model") or ""), thinking_budget=kwargs.get("rewrite_reasoning_budget", "4096"),
+                language=str(kwargs.get("e4_language") or "English").strip() or "English", seed=int(kwargs.get("rewrite_seed", 42) or 42),
+                say=lambda message: _LOG.info("Fill empty clips: %s", message))
+            for clip_cfg in clips:
+                if isinstance(clip_cfg, dict):
+                    clip_cfg.pop(shot_writer.FILL_FLAG, None)
+            if filled:
+                _send_plan(owner, clips, filled, fill=True)
+            clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)
+            note = (f"filled empty clip(s) {', '.join(str(i + 1) for i in filled)} from the story so far" if filled
+                    else "fill from story: no empty clip had a clip with text to continue from; nothing written")
+            return self._prompts_only(owner, clips, [note], False)
 
         # Video / audio references (sockets only): ref_video_N -> <Video k>, soundtracks and
         # standalone audio -> <Audio j>. Keys are 0-based like the pictures, so the core

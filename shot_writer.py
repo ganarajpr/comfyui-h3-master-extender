@@ -17,6 +17,12 @@ prompts carry the interpretation. Calls go to the same local model server the St
    inside itself, and flags what does not hold: wardrobe, props held or worn, posture and position, visible condition. Only the flagged clips are written
    again, once, with the complaint appended, and pass the same code checks. There is no second seam check; a seam answer that cannot be read is a warning.
 
+FILL MODE (``fill_empty_clips``, used by the Master Extender's "Fill from story so far" button, no Shot Writer node needed): the Extender's empty clips are written
+from the clips around them. The story so far is the RAW prompts of the clips before (and the next clip with text after the gap), never a rewritten prompt. The plan
+call (``prompts/shot_writer_continue_plan.md``) plans only the empty clips, reading cast, wardrobe, props, place and state off the earlier raw prompts; the shots
+calls and their checks are the same as for a brief; the seam check covers only the cuts that touch a filled clip and may only rewrite filled clips. The result is the
+same ``clips`` list, each item carrying ``"index"`` (the 0-based Extender clip) and ``"fill": true``; ``apply_fill`` puts them into the clip list.
+
 Every reply is requested with a JSON schema (``response_format``) and also described in the prompt; it is parsed tolerantly all the same.
 The pure engine (``ShotEngine``) takes any ``chat(messages, max_tokens=, budget=, kind=, temperature=, response_format=) -> Reply``. ComfyUI is imported
 lazily, so the engine runs and is tested without it.
@@ -273,6 +279,10 @@ def load_prompt(name: str) -> str:
 
 def fill(template: str, **values) -> str:
     return sw.fill(template, **values)
+
+
+def fill_prompt(**values) -> str:
+    return fill(load_prompt("continue_plan"), **values)
 
 
 # --------------------------------------------------------------------------- JSON schemas (response_format) and parsing
@@ -589,6 +599,22 @@ def story_text(plan: dict) -> str:
     return "\n\n".join(p for p in parts if p.strip()) + "\n"
 
 
+def wrapped_raw(item: dict, n: int) -> tuple:
+    """``(raw, end_state)`` of a writer item for the Extender clip at 0-based position ``n``: the shot list inside the same state blocks a planned story clip's ask
+    carries (the state it opens in, from the clip before, and the state it ends in). Their marks switch on the rewriter's STATE_RULE, so wardrobe and props come
+    from the state and not from the reference picture."""
+    raw = str(item["raw"]).strip()
+    start, end = story_planner._coerce_end_state(item.get("start_state")), story_planner._coerce_end_state(item.get("end_state"))
+    if start and n > 0:
+        raw = f"{story_planner.OPENS_MARK.format(n=n)}\n{story_planner.format_end_state(start)}\n\n{raw}"
+    if end:
+        raw = f"{raw}\n\n{story_planner.ENDS_MARK}\n{story_planner.format_end_state(end)}"
+    return raw, end
+
+
+WRITER_KEYS = ("goal", "shots", "start_state", "end_state", "new_recurring_visuals")
+
+
 def import_clips(text) -> list:
     """The Master Extender's clip entries for the JSON the Shot Writer's ``clips`` output holds: the shot list is the raw prompt, not yet rewritten.
 
@@ -606,14 +632,7 @@ def import_clips(text) -> list:
         if not isinstance(item, dict) or not str(item.get("raw") or "").strip():
             continue
         n = len(clips)
-        raw = str(item["raw"]).strip()
-        start, end = story_planner._coerce_end_state(item.get("start_state")), story_planner._coerce_end_state(item.get("end_state"))
-        # The same blocks a planned story clip's ask carries: the state it opens in (from the clip before) and the state it ends in. Their marks switch
-        # on the rewriter's STATE_RULE, so wardrobe and props come from the state and not from the reference picture.
-        if start and n > 0:
-            raw = f"{story_planner.OPENS_MARK.format(n=n)}\n{story_planner.format_end_state(start)}\n\n{raw}"
-        if end:
-            raw = f"{raw}\n\n{story_planner.ENDS_MARK}\n{story_planner.format_end_state(end)}"
+        raw, end = wrapped_raw(item, n)
         duration = int(round(_num(item.get("seconds"), DEFAULT_SECONDS)))
         clip = {"id": n, "title": f"Clip {n + 1}", "prompt": raw, "prompt_raw": raw, "prompt_rewritten": False, "duration": duration,
                 "seed": int(digest[:8], 16) % 10**8 + n, "seed_mode": "fixed", "validated": False, "loras": [], "from_writer": True}
@@ -621,9 +640,111 @@ def import_clips(text) -> list:
             clip["plan_end_state"] = end
         if duration > 15:
             clip["beyond"] = True
-        clip["writer"] = {key: item[key] for key in ("goal", "shots", "start_state", "end_state", "new_recurring_visuals") if key in item}
+        clip["writer"] = {key: item[key] for key in WRITER_KEYS if key in item}
         clips.append(clip)
     return clips
+
+
+# --------------------------------------------------------------------------- fill mode: write the Extender's empty clips from the clips around them
+
+FILL_FLAG = "fill_empty"    # set by the panel on the empty clips for the one queued run that fills them; never saved
+FILL_CONTEXT_CHARS = 1200   # a context clip is shown by its first 1,200 characters (its raw ask: a rewritten Ref2VA prompt is long and is never sent)
+FILL_SHOTS_CHARS = 700      # ... and by 700 in every shots call's "story so far" block
+FILL_SEAM_CHARS = 700       # how much of a fixed neighbour's text a seam is judged against (the end of the clip before, the start of the clip after)
+
+
+def _clip_items(clips) -> list:
+    try:
+        items = json.loads(clips) if isinstance(clips, str) else clips
+    except ValueError:
+        return []
+    return items if isinstance(items, list) else []
+
+
+def clip_text(clip) -> str:
+    """What a clip says in the panel: the raw ask when it has one (a rewritten clip keeps it in ``prompt_raw``), else its prompt."""
+    return str((clip.get("prompt_raw") or clip.get("prompt") or "") if isinstance(clip, dict) else "").strip()
+
+
+def is_marked(clip) -> bool:
+    """An empty clip (no prompt, no raw prompt) the panel flagged for this run."""
+    return isinstance(clip, dict) and clip.get(FILL_FLAG) is True and not clip_text(clip)
+
+
+def _capped(text: str, limit: int, tail: bool = False) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return ("[...] " + text[-limit:]) if tail else (text[:limit] + " [...]")
+
+
+def _writer_state(clip: dict) -> tuple:
+    """``(goal, end-state text)`` of a clip that came from the writer (its ``writer`` block), else ``("", "")``."""
+    block = clip.get("writer") if isinstance(clip.get("writer"), dict) else {}
+    end = story_planner._coerce_end_state(block.get("end_state"))
+    return _text(block.get("goal")), (state_lines(end) if end and end.get("characters") else "")
+
+
+def fill_request(clips) -> dict | None:
+    """The fill job of an Extender clip list, or None (no empty clip flagged, or no clip with text to continue from).
+
+    ``targets``: the flagged empty clips (``index`` 0-based, ``clip`` the number, ``seconds`` the panel duration).
+    ``context``: the clips with text up to the first one after the last target (so a gap is bridged by the clip after it), ``text`` their RAW text capped at
+    ``FILL_CONTEXT_CHARS``, and the writer's goal / end state when the clip came from the writer. ``total``: the number of clips in the list."""
+    items = _clip_items(clips)
+    marked = [i for i, c in enumerate(items) if is_marked(c)]
+    if not marked:
+        return None
+    texted = [i for i, c in enumerate(items) if i not in marked and clip_text(c)]
+    after = [i for i in texted if i > marked[-1]]
+    last = after[0] if after else marked[-1]
+    context = []
+    for i in texted:
+        if i > last:
+            break
+        goal, end = _writer_state(items[i])
+        context.append({"index": i, "clip": i + 1, "seconds": int(_num(items[i].get("duration"), DEFAULT_SECONDS)), "text": _capped(clip_text(items[i]), FILL_CONTEXT_CHARS),
+                        "goal": goal, "end_state": end})
+    if not context:
+        return None
+    targets = [{"index": i, "clip": i + 1, "seconds": int(max(MIN_SECONDS, min(MAX_SECONDS, _num(items[i].get("duration"), DEFAULT_SECONDS))))} for i in marked]
+    return {"targets": targets, "context": context, "total": len(items)}
+
+
+def fill_key(fill: dict | None) -> str:
+    """What identifies a fill job: the targets and every context clip's text, so a changed text or another empty clip is a new job."""
+    return json.dumps([[t["index"], t["seconds"]] for t in fill["targets"]] + [[c["index"], c["text"], c["goal"], c["end_state"]] for c in fill["context"]],
+                      ensure_ascii=False) if fill else ""
+
+
+def apply_fill(clips: list, text) -> list:
+    """Put a fill result into the Extender's clip list in place and return the 0-based indices it changed.
+
+    Only a clip that is flagged and still empty, and whose ``index`` the result names, is touched; every other clip stays exactly as it is (so its render cache
+    stays valid). The clip keeps its id, title, duration, loras and refs. Its prompt and raw prompt become the shot list inside the state blocks ``import_clips``
+    writes, it is not rewritten or validated, it is flagged ``from_writer`` with the ``writer`` block and ``plan_end_state``, its seed mode is ``fixed`` at the
+    seed it already has (the clip must not move on its own), and the flag is cleared."""
+    changed = []
+    for item in _clip_items(text):
+        if not isinstance(item, dict) or item.get("fill") is not True or not str(item.get("raw") or "").strip():
+            continue
+        index = item.get("index")
+        if not isinstance(index, int) or not 0 <= index < len(clips) or not is_marked(clips[index]) or index in changed:
+            continue
+        clip = clips[index]
+        raw, end = wrapped_raw(item, index)
+        clip.update({"prompt": raw, "prompt_raw": raw, "prompt_rewritten": False, "validated": False, "from_writer": True, "seed_mode": "fixed",
+                     "writer": {key: item[key] for key in WRITER_KEYS if key in item}})
+        for key in (FILL_FLAG, "rewrite_text", "rewrite_meta", "planned", "prompt_source"):
+            clip.pop(key, None)
+        if end:
+            clip["plan_end_state"] = end
+        else:
+            clip.pop("plan_end_state", None)
+        if not isinstance(clip.get("seed"), int):
+            clip["seed"] = int(hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8], 16) % 10**8 + index
+        changed.append(index)
+    return changed
 
 
 def has_prompt(clips) -> bool:
@@ -678,6 +799,40 @@ def seam_input(clips: list) -> tuple:
     return "\n\n".join(parts), "\n\n".join(inside) or "(no clip changes wardrobe or props inside itself)", len(inside)
 
 
+def fill_seam_input(out: list, fill: dict) -> tuple:
+    """Like ``seam_input`` for a fill job: only the cuts that touch a target (N-1 -> N and N -> N+1 for a target N). A neighbour that is not a target is a fixed
+    clip of the founder's: it is shown by the end (as the clip before) or the start (as the clip after) of its text. Returns
+    ``(seams text, inside text, inside count, seams checked)``; ``inside`` covers the targets only."""
+    done = {c["clip"]: c for c in out}
+    context = {c["clip"]: c for c in fill["context"]}
+
+    def planned_end(n):
+        return state_lines(done[n]["end_state"]) if n in done else (context[n]["end_state"] or "(a clip the founder wrote: its text is the authority)")
+
+    def last(n):
+        return _last_shots(done[n]) if n in done else [_capped(context[n]["text"], FILL_SEAM_CHARS, tail=True)] if n in context else ["(this clip has no text)"]
+
+    def first(n):
+        return _first_shots(done[n]) if n in done else [_capped(context[n]["text"], FILL_SEAM_CHARS)] if n in context else ["(this clip has no text)"]
+
+    fixed = lambda n: "" if n in done else " (the founder's clip, fixed: it cannot be changed)"
+    parts = []
+    for n in range(2, fill["total"] + 1):
+        if n - 1 not in done and n not in done:
+            continue
+        parts.append("\n".join([f"SEAM {n - 1} -> {n}", f"Clip {n - 1} planned end{fixed(n - 1)}:", planned_end(n - 1), f"Clip {n - 1} last shots as written:", *last(n - 1),
+                                f"Clip {n} planned start{fixed(n)}:", state_lines(done[n]["start_state"]) if n in done else "(a clip the founder wrote: its text is the authority)",
+                                f"Clip {n} first shots as written:", *first(n)]))
+    note = ("NOTE: only the clips that are not marked \"fixed\" were just written and can be changed. A clip marked fixed is the founder's own and is never the "
+            "clip to fix: when a seam does not join, \"fix_clip\" is the newly written clip of the seam.\n\n")
+    inside = []
+    for clip in out:
+        changes = inside_changes(clip)
+        if changes:
+            inside.append("\n".join([f"CLIP {clip['clip']} CHANGES INSIDE ITSELF: " + "; ".join(changes), f"Clip {clip['clip']} all shots as written:", clip["raw"]]))
+    return note + "\n\n".join(parts), "\n\n".join(inside) or "(no clip changes wardrobe or props inside itself)", len(inside), len(parts)
+
+
 def coerce_seams(obj, total: int) -> dict | None:
     """The flagged seams and inside-clip problems of a parsed reply, each with the clip to fix. None when the reply holds neither list.
 
@@ -725,10 +880,14 @@ class ShotEngine:
 
     def __init__(self, chat, work_dir, *, brief: str, clips: int, seconds: int = DEFAULT_SECONDS, language: str = DEFAULT_LANGUAGE, slot_ctx: int = 65536,
                  budget: int = THINKING_BUDGET, concurrency: int = DEFAULT_CONCURRENCY, plan_part: int = PLAN_PART, pictures=None, sees: bool = True,
-                 progress=None, say=None, seams: bool = True):
+                 progress=None, say=None, seams: bool = True, fill: dict | None = None):
         self.chat = chat
         self.work = Path(work_dir)
+        self.fill = fill
         self.brief = brief.strip()
+        if fill:
+            clips = len(fill["targets"])
+        self.film_total = fill["total"] if fill else int(clips)
         self.clips = int(clips)
         self.seconds = int(seconds)
         self.language = (language or DEFAULT_LANGUAGE).strip() or DEFAULT_LANGUAGE
@@ -835,10 +994,15 @@ class ShotEngine:
         stored = self.work / "plan.json"
         if stored.is_file():
             return json.loads(stored.read_text(encoding="utf-8"))
-        self.say("plan: cast, locations, a goal and a state for every clip")
+        self.say("plan: cast, locations, a goal and a state for " + (f"the {self.clips} clip(s) to write" if self.fill else "every clip"))
         total = self.clips
         parts = [(1, total)] if total <= self.plan_part else [(a, min(a + self.plan_part - 1, total)) for a in range(1, total + 1, self.plan_part)]
         merged = None
+        if self.fill:
+            merged = self._plan_fill()
+            if merged["minor"]:
+                raise MinorContentError("the brief puts a minor in a sexual context; nothing was written", work_dir=str(self.work))
+            parts = []
         for index, (first, last) in enumerate(parts):
             out = self._plan_part(first, last, total, merged, index + 1, len(parts))
             if out["minor"]:
@@ -853,9 +1017,13 @@ class ShotEngine:
         plan = merged
         seen = set()
         for number, clip in enumerate(plan["clips"], start=1):
-            clip["clip"] = number
             seconds = clip.get("seconds")
-            clip["seconds"] = int(round(seconds)) if seconds and MIN_SECONDS <= seconds <= MAX_SECONDS else self.seconds
+            if self.fill:   # the clip keeps its number in the Extender's list and its length from the panel
+                target = self.fill["targets"][number - 1]
+                clip["clip"], clip["seconds"] = target["clip"], target["seconds"]
+            else:
+                clip["clip"] = number
+                clip["seconds"] = int(round(seconds)) if seconds and MIN_SECONDS <= seconds <= MAX_SECONDS else self.seconds
             fresh = [v for v in clip["new_recurring_visuals"] if v.casefold() not in seen]
             seen.update(v.casefold() for v in fresh)
             clip["new_recurring_visuals"] = fresh
@@ -907,30 +1075,107 @@ class ShotEngine:
             plan["clips"] = plan["clips"][:n]
         return plan
 
+    def _plan_fill(self) -> dict:
+        """The plan of a fill job: one call (``prompts/shot_writer_continue_plan.md``) that reads the story so far (the raw prompts of the context clips) and plans only the
+        empty clips. The ending belongs to the last empty clip only when it is the last clip of the list."""
+        fill = self.fill
+        targets = {t["clip"]: t for t in fill["targets"]}
+        context = {c["clip"]: c for c in fill["context"]}
+        top = max(max(targets), max(context))
+        lines = []
+        for n in range(1, top + 1):
+            if n in targets:
+                lines.append(f"Clip {n} ({targets[n]['seconds']} s): EMPTY, you plan it.")
+            elif n in context:
+                lines.append(f"Clip {n} ({context[n]['seconds']} s):\n{context[n]['text']}")
+            else:
+                lines.append(f"Clip {n}: (empty, but not yours to plan)")
+        first = fill["targets"][0]
+        values = dict(self._lang(), story="\n\n".join(lines), empty=", ".join(str(t["clip"]) for t in fill["targets"]), count=len(fill["targets"]),
+                      max_cast=sw.max_cast(fill["total"]), first_number=first["clip"], first_seconds=first["seconds"],
+                      ending=("The last empty clip is the last clip of the film: bring the story to a real ending in it." if top == max(targets) and top == fill["total"] else
+                              "Do not end the story: more of it follows, so leave it open."),
+                      follows=(f"Clip {max(context)} follows the empty clips: the last empty clip must lead straight into it (it opens from where your clip ends)." if max(context) > max(targets) else ""))
+        values["pictures_note"] = pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees)
+        messages = [message(fill_prompt(**values), self.pictures)]
+        n = len(fill["targets"])
+        answer = 900 + n * (420 if is_wide(self.language) else 330) + 500
+
+        def check(plan):
+            problems = []
+            if len(plan["clips"]) != n:
+                problems.append(f"the plan has {len(plan['clips'])} clips; it must have exactly {n}, one for each empty clip {', '.join(str(t['clip']) for t in fill['targets'])}")
+            return problems + check_plan(plan)
+
+        plan, problems = self._checked("plan", messages, answer=answer, schema_name="shot_plan", schema=PLAN_SCHEMA, parse=lambda t: coerce_plan(parse_json_object(t)), check=check)
+        if plan is None:
+            raise StoryWriterError("the plan could not be read from the model's answer; nothing was written", work_dir=str(self.work))
+        for problem in problems:
+            self._warn(f"plan: {problem}")
+        plan["clips"] = plan["clips"][:n]
+        for clip in plan["clips"]:
+            clip["founder_lines"] = []
+        return plan
+
     # ---- stage 2: the shots of every clip
 
     def _clip_file(self, number: int) -> Path:
         return self.work / "clips" / f"{number:03d}.json"
 
     def shots_for(self, plan: dict, index: int) -> dict:
-        stored = self._clip_file(index + 1)
+        stored = self._clip_file(plan["clips"][index]["clip"])
         if stored.is_file():
             return json.loads(stored.read_text(encoding="utf-8"))
         return self._write_clip(plan, index)
 
+    def _brief_block(self) -> str:
+        """The shots prompt's source block: the founder's brief, or in a fill job the raw prompts of the clips around the empty ones (the story so far)."""
+        if not self.fill:
+            return f"THE FOUNDER'S BRIEF (the source; only the lines he wrote are kept, you may improve everything else):\n{self.brief}"
+        story = "\n\n".join(f"Clip {c['clip']} ({c['seconds']} s): {_capped(c['text'], FILL_SHOTS_CHARS)}" for c in self.fill["context"])
+        return ("THE STORY SO FAR (the raw prompts of the clips around the clips you write; the dialogue, names, places and props in them are canon, and the shots "
+                f"you write continue them):\n{story}")
+
+    def _around(self, plan: dict, index: int) -> tuple:
+        """The ``previous`` and ``next`` lines of the shots prompt for the plan clip at ``index``. In a fill job the neighbour in the film may be a fixed clip of the
+        founder's (shown by its capped text) or another target (by its plan goal), whichever it is."""
+        clips = plan["clips"]
+        if not self.fill:
+            previous = (f"The clip before it ({index}) is: {clips[index - 1]['goal']} It ended: {clips[index - 1]['end_state']['end_action'] or 'where it left off'}" if index else "Nothing comes before it: this clip opens the film.")
+            following = f"The clip after it ({index + 2}) is: {clips[index + 1]['goal']}" if index + 1 < len(clips) else "Nothing comes after it: this clip ends the film."
+            return previous, following
+        number = clips[index]["clip"]
+        planned = {c["clip"]: c for c in clips}
+        context = {c["clip"]: c for c in self.fill["context"]}
+
+        def describe(n, after):
+            if n in planned:
+                c = planned[n]
+                return f"is: {c['goal']}" + ("" if after else f" It ended: {c['end_state']['end_action'] or 'where it left off'}")
+            if n in context:
+                c = context[n]
+                text = _capped(c["text"], FILL_SEAM_CHARS if after else FILL_CONTEXT_CHARS)
+                return "is already written by the founder and is fixed. " + (f"Its text: {text}" if after else f"Its text (the start may be cut): {text}" + (f" The state it ends in:\n{c['end_state']}" if c["end_state"] else ""))
+            return "has no text yet."
+        previous = f"The clip before it ({number - 1}) {describe(number - 1, False)}" if number > 1 else "Nothing comes before it: this clip opens the film."
+        following = f"The clip after it ({number + 1}) {describe(number + 1, True)}" if number < self.film_total else "Nothing comes after it: this clip ends the film."
+        return previous, following
+
     def _write_clip(self, plan: dict, index: int, complaints=(), before: str = "", kind: str = "shots") -> dict:
         """One clip's shot list: ask, check, one retry, save. ``complaints`` (the seam check's) are appended to the first ask."""
-        number = index + 1
-        stored = self._clip_file(number)
         clips = plan["clips"]
         clip = clips[index]
+        number = clip["clip"]
+        stored = self._clip_file(number)
         seconds = clip["seconds"]
-        previous = (f"The clip before it ({index}) is: {clips[index - 1]['goal']} It ended: {clips[index - 1]['end_state']['end_action'] or 'where it left off'}" if index else "Nothing comes before it: this clip opens the film.")
-        following = f"The clip after it ({number + 1}) is: {clips[index + 1]['goal']}" if index + 1 < len(clips) else "Nothing comes after it: this clip ends the film."
+        previous, following = self._around(plan, index)
+        lang = self._lang()
+        if self.fill:   # the language is the one the story so far already speaks; self.language is only the fallback and the script check
+            lang = dict(lang, language=f"the language of the dialogue already in the story so far ({self.language} when it has none)", script_note="")
         required = [line for line in clip.get("founder_lines", []) if line in self.founder]
         lines_rule = ("- The founder wrote these lines for this clip, already in the film's language. Use each in one shot's dialogue, copied character for character: "
                       + "; ".join(f"\"{line}\"" for line in required)) if required else ""
-        values = dict(self._lang(), cast=sw.format_cast(plan["cast"]), locations=sw.format_locations(plan["locations"]), brief=self.brief, clip=number, total=len(clips),
+        values = dict(lang, cast=sw.format_cast(plan["cast"]), locations=sw.format_locations(plan["locations"]), brief_block=self._brief_block(), clip=number, total=self.film_total,
                       goal=clip["goal"], previous=previous, next=following, shot_range=f"{MIN_SHOTS} to {min(MAX_SHOTS, max(MIN_SHOTS, seconds // MIN_SHOT_SECONDS))}",
                       min_shots=MIN_SHOTS, lines_rule=lines_rule, extra="", seconds=seconds,
                       start_state=state_lines(clip["start_state"]), end_state=state_lines(clip["end_state"]))
@@ -958,11 +1203,13 @@ class ShotEngine:
             shots = repair_timing(shots, seconds) or shots
         result = {"clip": number, "seconds": seconds, "goal": clip["goal"], "raw": raw_text(shots), "shots": shots,
                   "start_state": clip["start_state"], "end_state": clip["end_state"], "new_recurring_visuals": clip["new_recurring_visuals"]}
+        if self.fill:
+            result.update(index=number - 1, fill=True)
         if complaints:
             result["seam_fixed"] = True
         stored.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
         if not complaints:
-            self.progress(number + 1, len(clips) + 1)
+            self.progress(index + 2, len(clips) + 1)
         return result
 
     def check_film(self, out: list) -> None:
@@ -975,43 +1222,48 @@ class ShotEngine:
 
     def seam_check(self, plan: dict, out: list) -> list:
         """One model call over every cut and every change inside a clip; the flagged clips are written again once. Never fails the node."""
-        if not self.seams or len(out) < 2:
+        if not self.seams or self.film_total < 2:
             return out
+        pos = {c["clip"]: i for i, c in enumerate(out)}
         stored = self.work / "seams.json"
         record = json.loads(stored.read_text(encoding="utf-8")) if stored.is_file() else None
         started = time.time()
         if record is None:
-            seams_text, inside_text, inside_n = seam_input(out)
+            seams_text, inside_text, inside_n, checked = (fill_seam_input(out, self.fill) if self.fill else (*seam_input(out), len(out) - 1))
+            if not checked:
+                return out
             pictures_note_ = pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees) if self.labels else ""
-            values = dict(self._lang(), cast=sw.format_cast(plan["cast"]), seams=seams_text, inside=inside_text, total=len(out), pictures_note=pictures_note_)
+            values = dict(self._lang(), cast=sw.format_cast(plan["cast"]), seams=seams_text, inside=inside_text, total=self.film_total, pictures_note=pictures_note_)
             messages = [message(fill(load_prompt("seams"), **values), self.pictures)]
-            answer = 400 + 70 * (len(out) - 1) + 150 * inside_n + 600
-            self.say(f"seam check: {len(out) - 1} seams")
+            answer = 400 + 70 * checked + 150 * inside_n + 600
+            self.say(f"seam check: {checked} seams")
             try:
                 reply = self._ask("seams", messages, answer=answer, schema_name="seam_check", schema=SEAMS_SCHEMA)
-                found = coerce_seams(parse_json_object(reply.text), len(out))
+                found = coerce_seams(parse_json_object(reply.text), self.film_total)
+                if found is not None and self.fill:
+                    found = self._only_targets(found, pos)
             except StoryWriterError as exc:
                 self._warn(f"seam check: the call failed ({exc}); the shot lists are kept as written")
                 return out
             if found is None:
                 self._warn("seam check: the answer was not one JSON object in the shape described; the shot lists are kept as written")
                 return out
-            record = dict(found, checked=len(out) - 1, complaints={str(k): v for k, v in seam_complaints(found).items()})
+            record = dict(found, checked=checked, complaints={str(k): v for k, v in seam_complaints(found).items()})
             stored.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
-        todo = {int(k): v for k, v in record["complaints"].items()}
-        redo = [n for n in todo if not out[n - 1].get("seam_fixed")]
+        todo = {int(k): v for k, v in record["complaints"].items() if int(k) in pos}
+        redo = [n for n in todo if not out[pos[n]].get("seam_fixed")]
         if redo:
             self.say(f"seam check: writing clips {redo} again")
 
             def rewrite(n):
-                return self._write_clip(plan, n - 1, todo[n], out[n - 1]["raw"], kind="seamfix")
+                return self._write_clip(plan, pos[n], todo[n], out[pos[n]]["raw"], kind="seamfix")
 
             for n, fixed in zip(redo, self._map(rewrite, redo)):
                 if fixed is not None:
-                    out[n - 1] = fixed
+                    out[pos[n]] = fixed
         secs = time.time() - started
         flagged = [f"{s['from']}->{s['to']} {s['aspect'] or 'seam'}" for s in record["seams"]] + [f"inside {s['clip']}" for s in record["inside"]]
-        rewritten = sorted(n for n in todo if out[n - 1].get("seam_fixed"))
+        rewritten = sorted(n for n in todo if out[pos[n]].get("seam_fixed"))
         self.seam_report = {"seams": record["checked"], "flagged": record["seams"], "inside": record["inside"], "rewritten": rewritten, "seconds": round(secs, 1)}
         _LOG.info("shot writer: seam check: %d seams, %d flagged (%s), rewrote clips %s in %.0f s", record["checked"], len(flagged), ", ".join(flagged) or "none", rewritten, secs)
         for s in record["seams"]:
@@ -1020,8 +1272,22 @@ class ShotEngine:
             self._warn(f"seam check: inside clip {s['clip']}: {s['problem']} Fixed by writing the clip again.")
         return out
 
+    @staticmethod
+    def _only_targets(found: dict, pos: dict) -> dict:
+        """A fill job may only rewrite the clips it wrote: a flag that points at a fixed clip of the founder's moves to the other clip of the seam (a target by
+        construction), and an inside problem of a clip that is not a target is dropped."""
+        seams = []
+        for s in found["seams"]:
+            if s["fix_clip"] not in pos:
+                s = dict(s, fix_clip=s["to"] if s["fix_clip"] == s["from"] else s["from"])
+            if s["fix_clip"] in pos:
+                seams.append(s)
+        return {"seams": seams, "inside": [s for s in found["inside"] if s["clip"] in pos]}
+
     def run(self) -> dict:
         plan = self.plan()
+        if not self.fill:
+            self.film_total = len(plan["clips"])
         self.progress(1, len(plan["clips"]) + 1)
         self.say(f"shots: {len(plan['clips'])} clips")
         out = self._map(lambda i: self.shots_for(plan, i), range(len(plan["clips"])))
@@ -1033,9 +1299,10 @@ class ShotEngine:
 # --------------------------------------------------------------------------- files
 
 
-def job_hash(brief: str, clips: int, seconds: int, language: str, seed: int, model: str, budget: int, pictures=()) -> str:
+def job_hash(brief: str, clips: int, seconds: int, language: str, seed: int, model: str, budget: int, pictures=(), fill=None) -> str:
+    """The key of a job's work folder. A fill job adds ``fill_key`` (targets and their texts, every context clip's text); without ``fill`` the key is what it always was."""
     shown = [[p["label"], hashlib.sha1(str(p.get("image", "")).encode("utf-8")).hexdigest()] for p in pictures or []]
-    payload = json.dumps([brief.strip(), int(clips), int(seconds), language, int(seed), model, int(budget), shown, VERSION], ensure_ascii=False)
+    payload = json.dumps([brief.strip(), int(clips), int(seconds), language, int(seed), model, int(budget), shown, VERSION] + ([fill_key(fill)] if fill else []), ensure_ascii=False)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
 
 
@@ -1076,24 +1343,52 @@ def write_outputs(root: Path, engine: ShotEngine, result: dict, *, model: str, s
 
 def write_shots(chat, *, brief: str, clips: int, seconds: int = DEFAULT_SECONDS, language: str = DEFAULT_LANGUAGE, seed: int = 0, model: str = "model", style: str = "",
                 budget: int = THINKING_BUDGET, slot_ctx: int = 65536, out_dir=None, progress=None, say=None, concurrency: int = DEFAULT_CONCURRENCY,
-                plan_part: int = PLAN_PART, pictures=None, sees: bool = True, seams: bool = True) -> dict:
-    """The whole job with an injected ``chat``: validate, resume or start, write, save. Returns ``{clips, story, clips_path, story_path, json_path, sidecar}``."""
+                plan_part: int = PLAN_PART, pictures=None, sees: bool = True, seams: bool = True, fill: dict | None = None) -> dict:
+    """The whole job with an injected ``chat``: validate, resume or start, write, save. Returns ``{clips, story, clips_path, story_path, json_path, sidecar}``.
+
+    ``fill`` (``fill_request`` of the linked Extender's clip list) turns it into a fill job: only the marked clips are written and the brief may be empty."""
     brief = str(brief or "").strip()
-    if not brief:
+    if not brief and not fill:
         raise StoryWriterError("brief is empty")
     clips = int(clips)
     if not MIN_CLIPS <= clips <= MAX_CLIPS:
         raise StoryWriterError(f"clips must be {MIN_CLIPS} (the writer decides) to {MAX_CLIPS}, got {clips}")
     root = output_root(out_dir)
-    work = root / "_work" / job_hash(brief, clips, seconds, language, seed, model, budget, pictures)
+    work = root / "_work" / job_hash(brief, clips, seconds, language, seed, model, budget, pictures, fill)
     started = time.time()
     engine = ShotEngine(chat, work, brief=brief, clips=clips, seconds=seconds, language=language, slot_ctx=slot_ctx, budget=budget, concurrency=concurrency,
-                        plan_part=plan_part, pictures=pictures, sees=sees, progress=progress, say=say, seams=seams)
+                        plan_part=plan_part, pictures=pictures, sees=sees, progress=progress, say=say, seams=seams, fill=fill)
     result = engine.run()
     clips_path, story_path, json_path, side = write_outputs(root, engine, result, model=model, seed=seed, wall=time.time() - started, style=style)
     (work / ".done").write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
     return {"clips": json.dumps(result["clips"], ensure_ascii=False, indent=2), "story": result["story"], "clips_path": str(clips_path), "story_path": str(story_path),
             "json_path": str(json_path), "sidecar": side}
+
+
+def fill_empty_clips(clips: list, refs: dict, *, writer_model: str, thinking_budget="4096", language: str = DEFAULT_LANGUAGE, seed: int = 42,
+                     concurrency: int = 8, say=None, progress=None) -> list:
+    """Write the clips of ``clips`` flagged ``fill_empty`` (and empty) from the clips around them, in place, and return the 0-based indices written ([] when there is
+    nothing to fill). Called by the Master Extender's run for the panel's "Fill from story so far" button.
+
+    ``refs`` is the Extender's reference dict (``ref_image_<slot>``, 0-based): the writer looks at the pictures as the Shot Writer node does. The local model server is opened
+    with ``open_model`` (the rewriter's writer model choice) and closed again, so the run that follows has the GPU."""
+    fill = fill_request(clips)
+    if not fill:
+        return []
+    say = say or (lambda message: _LOG.info("Fill empty clips: %s", message))
+    say(f"writing clip(s) {', '.join(str(t['clip']) for t in fill['targets'])} of {fill['total']} from the {len(fill['context'])} clip(s) around them")
+    budget = int(prompt_rewriter.reasoning_budget(thinking_budget))
+    slot_ctx = e4_engine.slot_ctx()
+    pictures = pictures_of({}, refs)
+    strata = str(writer_model) == strata_backend.LABEL
+    sees = strata_backend.vision_available() if strata else True
+    with open_model(str(writer_model), budget, slot_ctx=slot_ctx, concurrency=concurrency, say=say, max_slots=MAX_CONCURRENCY) as (endpoint, runner):
+        chat = ServerChat(endpoint, interrupted=getattr(runner, "interrupted", None))
+        result = write_shots(chat, brief="", clips=0, language=language, seed=seed, model=endpoint["model"], style=endpoint["style"], budget=budget, slot_ctx=slot_ctx,
+                             progress=progress, say=say, concurrency=min(int(concurrency), int(endpoint.get("slots") or concurrency)), pictures=pictures, sees=sees, fill=fill)
+    for warning in result["sidecar"]["warnings"]:
+        _LOG.warning("Fill empty clips: %s", warning)
+    return apply_fill(clips, result["clips"])
 
 
 # --------------------------------------------------------------------------- the ComfyUI node

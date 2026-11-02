@@ -1210,6 +1210,22 @@ app.registerExtension({
                 saveState();
                 renderUI();
             }
+            // "Fill from story so far": every EMPTY clip (no prompt, no raw prompt) is written as a raw shot list from the clips around it, in one run.
+            const clipIsEmpty = (c) => !String(c.prompt_raw || "").trim() && !String(c.prompt || "").trim();
+            // The empty clips are flagged only for the queued graph (it is serialised while queuePrompt runs) and unflagged as soon as the call returns. The backend writes
+            // them and ends the run like prompts_only: nothing is rewritten or rendered, so the raw shot lists can be read first.
+            async function fillEmptyClips() {
+                const empties = clipsState.filter(clipIsEmpty);
+                if (!empties.length || empties.length === clipsState.length) return;
+                for (const c of empties) c.fill_empty = true;
+                saveState();
+                try { await app.queuePrompt(0, 1); }
+                finally {
+                    for (const c of empties) delete c.fill_empty;
+                    saveState();
+                    renderUI();
+                }
+            }
             function writerLinked() {
                 return Boolean(node.inputs?.find((i) => i.name === "clips_in" && i.link != null));
             }
@@ -1702,6 +1718,7 @@ app.registerExtension({
                     const durMax = clip.beyond ? DUR_HARD_MAX : DUR_SOFT_MAX;
                     const frames = alignH3Frames(durValue);
                     const seedMode = clip.seed_mode || "randomize";
+                    const fillable = clipIsEmpty(clip) && !externalPromptWired(index) && clipsState.some((c) => !clipIsEmpty(c));
 
                     card.innerHTML = `
                         <!-- Card Header -->
@@ -1732,6 +1749,7 @@ app.registerExtension({
                                 <span style="display: flex; align-items: center; gap: 6px;"><span class="prompt-meta" style="font-size: 10px; color: #6f6f8a; font-variant-numeric: tabular-nums;"></span><span class="copy-slot"></span></span>
                             </div>
                             <div class="prompt-preview minimax-prompt-preview" title="Click to edit in the prompt panel" style="box-sizing: border-box; width: 100%; min-height: ${PROMPT_PREVIEW_LINES * 15 + 12}px; max-height: ${PROMPT_PREVIEW_LINES * 15 + 12}px; overflow: hidden; background: #101016; border: 1px solid #2e2e42; border-radius: 4px; color: #d4d4e4; padding: 6px 8px; font-size: 11px; line-height: 15px; white-space: pre-wrap; word-break: break-word; cursor: text; position: relative;"></div>
+                            ${fillable ? `<button class="fill-btn" title="Write ${clipsState.filter(clipIsEmpty).length > 1 ? "every empty clip" : "this clip"} as a raw timed shot list that continues the story so far (the raw prompts of the clips before it, and the next written clip after a gap), with the reference pictures. Nothing is rewritten or rendered; read the shot lists, then rewrite and render as usual." style="margin-top: 5px; width: 100%; background: #1f3a2e; color: #86efac; border: 1px solid #2f6b4c; border-radius: 4px; padding: 4px 8px; font-size: 11px; cursor: pointer;">✍ Fill from story so far${clipsState.filter(clipIsEmpty).length > 1 ? ` (${clipsState.filter(clipIsEmpty).length} empty clips)` : ""}</button>` : ""}
                         </div>
 
                         <!-- Duration Setting: 5-15 s slider, "go beyond" unlocks up to 30 s -->
@@ -1768,6 +1786,12 @@ app.registerExtension({
                     // Event Listeners for Card
                     const preview = card.querySelector(".prompt-preview");
                     const promptMeta = card.querySelector(".prompt-meta");
+                    const fillBtn = card.querySelector(".fill-btn");
+                    if (fillBtn) {
+                        fillBtn.disabled = projectControls.isBusy();
+                        if (fillBtn.disabled) fillBtn.style.opacity = "0.5";
+                        fillBtn.onclick = (e) => { e.stopPropagation(); fillEmptyClips(); };
+                    }
                     const cardVideo = clipVideo(index, "width: 100%; aspect-ratio: 16 / 9;");
                     if (cardVideo) preview.parentElement.appendChild(cardVideo);
                     const paintPreview = () => {
@@ -2000,6 +2024,11 @@ app.registerExtension({
                         if (item.index === clipsState.length) { clipsState.push(incoming); changed = true; }
                         continue;
                     }
+                    // Clips written into empty slots by "Fill from story so far" take the slot whole, unless text was typed there meanwhile.
+                    if (item.fill === true) {
+                        if (!rawTextOf(local).trim() && !String(local.prompt || "").trim()) { clipsState[item.index] = incoming; changed = true; }
+                        continue;
+                    }
                     if (rawTextOf(local).trim() || "planned" in local) continue;
                     // Clips imported from the Shot Writer arrive whole (seed, mode, title) and take the empty slot as they are.
                     if (incoming.from_writer === true) {
@@ -2015,6 +2044,10 @@ app.registerExtension({
                 ensureClipIds(clipsState);
                 saveState();
                 renderUI();
+                if (promptPanel.el) {
+                    const { clip } = findClip(promptPanel.clipId);
+                    if (clip) openPromptPanel(clip.id, { focus: false });
+                }
             };
             api.addEventListener(EVENT_PLAN, planHandler);
 

@@ -943,5 +943,179 @@ class SeamCheckTests(unittest.TestCase):
         self.assertEqual(sorted(chat.kinds()), ["plan", "shots_001"])
 
 
+# --------------------------------------------------------------------------- fill empty clips ("Fill from story so far")
+
+REWRITTEN = "## summary\nREWRITTEN-REF2VA-TEXT that must never reach the writer"
+
+
+def typed(i, text=None, rewritten=False):
+    clip = {"id": i, "title": f"Clip {i + 1}", "prompt": text or f"Kael does thing {i + 1} by the well.", "duration": 15, "seed": 100 + i, "seed_mode": "randomize", "validated": False, "loras": []}
+    if rewritten:
+        clip.update(prompt_raw=clip["prompt"], prompt=REWRITTEN, prompt_rewritten=True, rewrite_text=REWRITTEN, rewrite_meta={"model": "m"})
+    return clip
+
+
+def empty(i, flagged=True, duration=12):
+    clip = {"id": i, "title": f"Clip {i + 1}", "prompt": "", "duration": duration, "seed": 500 + i, "seed_mode": "randomize", "validated": False, "loras": []}
+    if flagged:
+        clip[sh.FILL_FLAG] = True
+    return clip
+
+
+def fill_handler(total_targets, seam_answer=None):
+    def handler(kind, messages, n):
+        if kind == "plan":
+            return plan_json(total_targets)
+        if kind == "seams":
+            return seam_answer
+        number = int(kind.split("_")[1])
+        return shots_json(number, GOOD, seconds=12 if number > 8 else 15)
+    return handler
+
+
+class FillEmptyClipsTests(unittest.TestCase):
+    def ten(self):
+        return [typed(i, rewritten=i % 2 == 0) for i in range(8)] + [empty(8), empty(9)]
+
+    def run_fill(self, clips, handler, **kw):
+        chat = Script(handler)
+        fill = sh.fill_request(clips)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = engine(chat, tmp, brief="", clips=0, fill=fill, **kw).run()
+        return chat, out
+
+    def test_only_the_empty_clips_are_written_from_the_raw_prompts_of_the_clips_before(self):
+        clips = self.ten()
+        chat, out = self.run_fill(clips, fill_handler(2))
+        self.assertEqual(chat.kinds(), ["plan", "shots_009", "shots_010"])
+        self.assertEqual([(c["index"], c["clip"], c["seconds"], c["fill"]) for c in out["clips"]], [(8, 9, 12, True), (9, 10, 12, True)])
+        plan_text = user(chat.calls[0])
+        for i in range(8):
+            self.assertIn(f"Clip {i + 1} (15 s):\nKael does thing {i + 1} by the well.", plan_text)
+        self.assertIn("Clip 9 (12 s): EMPTY", plan_text)
+        self.assertNotIn("REWRITTEN-REF2VA-TEXT", "\n".join(user(c) for c in chat.calls))
+        self.assertNotIn("{{", plan_text)
+        self.assertIn("THE STORY SO FAR", user(chat.calls[1]))
+        self.assertNotIn("THE FOUNDER'S BRIEF", user(chat.calls[1]))
+        self.assertIn("The clip before it (8) is already written by the founder", user(chat.calls[1]))
+        self.assertIn("The clip after it (10) is: ", user(chat.calls[1]))   # the other empty clip: its planned goal
+        self.assertIn("Nothing comes after it: this clip ends the film.", user(chat.calls[2]))
+        self.assertIn("bring the story to a real ending", plan_text)
+
+    def test_the_seam_check_covers_only_the_cuts_that_touch_a_filled_clip_and_rewrites_only_filled_clips(self):
+        bad = {"from": 8, "to": 9, "aspect": "posture", "fix_clip": 8, "problem": "Clip 8 ends seated, clip 9 opens standing.", "fix": "Open clip 9 seated."}
+        chat, out = self.run_fill(self.ten(), fill_handler(2, seams_json(10, [bad])), seams=True)
+        seams = user(next(c for c in chat.calls if c["kind"] == "seams"))
+        self.assertIn("SEAM 8 -> 9", seams)
+        self.assertIn("SEAM 9 -> 10", seams)
+        self.assertNotIn("SEAM 7 -> 8", seams)
+        self.assertIn("the founder's clip, fixed", seams)
+        self.assertEqual(chat.kinds()[-1], "seamfix_009")   # fix_clip 8 is the founder's: the fix moves to the filled clip of the seam
+        self.assertEqual(sum(1 for k in chat.kinds() if k.startswith("seamfix")), 1)
+        self.assertTrue(out["clips"][0]["seam_fixed"])
+
+    def test_an_empty_clip_in_the_middle_sees_the_clip_after_it_but_not_the_ones_beyond(self):
+        clips = [typed(i) for i in range(8)]
+        clips[4] = empty(4)
+        clips[5]["prompt"] = "Kael finds the sword in the grass."
+        chat, out = self.run_fill(clips, fill_handler(1))
+        self.assertEqual(chat.kinds(), ["plan", "shots_005"])
+        plan_text = user(chat.calls[0])
+        self.assertIn("Clip 6 (15 s):\nKael finds the sword in the grass.", plan_text)
+        self.assertNotIn("Kael does thing 7", plan_text)
+        self.assertIn("Clip 6 follows the empty clips", plan_text)
+        self.assertIn("Do not end the story", plan_text)
+        shots = user(chat.calls[1])
+        self.assertIn("The clip before it (4) is already written", shots)
+        self.assertIn("The clip after it (6) is already written by the founder and is fixed. Its text: Kael finds the sword in the grass.", shots)
+        self.assertEqual([c["index"] for c in out["clips"]], [4])
+
+    def test_a_gap_is_bridged_and_each_empty_clip_keeps_its_own_duration(self):
+        clips = [typed(0), empty(1, duration=6), empty(2, duration=9), typed(3), typed(4)]
+        fill = sh.fill_request(clips)
+        self.assertEqual([(t["clip"], t["seconds"]) for t in fill["targets"]], [(2, 6), (3, 9)])
+        self.assertEqual([c["clip"] for c in fill["context"]], [1, 4])
+
+    def test_import_replaces_only_the_empty_clips_and_leaves_every_other_clip_byte_identical(self):
+        clips = self.ten()
+        clips[3]["seed_mode"] = "fixed"
+        before = [json.dumps(c, sort_keys=True) for c in clips[:8]]
+        _, out = self.run_fill(clips, fill_handler(2))
+        changed = sh.apply_fill(clips, out["clips"])
+        self.assertEqual(changed, [8, 9])
+        self.assertEqual([json.dumps(c, sort_keys=True) for c in clips[:8]], before)
+        for i in (8, 9):
+            c = clips[i]
+            self.assertEqual((c["id"], c["duration"], c["seed"], c["seed_mode"], c["validated"], c["prompt_rewritten"], c["from_writer"]), (i, 12, 500 + i, "fixed", False, False, True))
+            self.assertEqual(c["prompt"], c["prompt_raw"])
+            self.assertIn("Shot 1 \u2013 0s", c["prompt"])
+            self.assertIn("CONTINUITY", c["prompt"])   # the state block of the clip before
+            self.assertNotIn(sh.FILL_FLAG, c)
+            self.assertIn("shots", c["writer"])
+            self.assertIn("plan_end_state", c)
+
+    def test_apply_fill_never_touches_a_clip_that_has_text_or_is_not_flagged(self):
+        clips = [typed(0), empty(1, flagged=False), typed(2)]
+        clips[2][sh.FILL_FLAG] = True   # flagged but not empty
+        item = {"index": 1, "fill": True, "raw": "Shot 1 \u2013 0s: x.", "seconds": 15}
+        self.assertEqual(sh.apply_fill(clips, [item, dict(item, index=2), dict(item, index=0)]), [])
+        self.assertEqual(clips[1]["prompt"], "")
+
+    def test_no_empty_clip_or_nothing_to_continue_from_is_a_no_op(self):
+        self.assertIsNone(sh.fill_request([typed(0), typed(1)]))
+        self.assertIsNone(sh.fill_request([typed(0), empty(1, flagged=False)]))   # empty but not flagged for this run
+        self.assertIsNone(sh.fill_request([empty(0), empty(1)]))                  # no clip with text to continue from
+        with mock.patch.object(sh, "open_model", side_effect=AssertionError("the model must not start")):
+            clips = [typed(0), typed(1)]
+            self.assertEqual(sh.fill_empty_clips(clips, {}, writer_model="w"), [])
+
+    def test_job_key_changes_with_a_context_text_or_another_empty_clip(self):
+        a = sh.fill_key(sh.fill_request(self.ten()))
+        clips = self.ten()
+        clips[7]["prompt"] = "Something else happens."
+        self.assertNotEqual(a, sh.fill_key(sh.fill_request(clips)))
+        self.assertNotEqual(a, sh.fill_key(sh.fill_request(self.ten()[:9])))
+        self.assertEqual(a, sh.fill_key(sh.fill_request(self.ten())))
+
+    def test_fill_empty_clips_opens_the_server_writes_and_fills_in_place(self):
+        chat = Script(fill_handler(2))
+
+        @contextlib.contextmanager
+        def fake_open(label, budget, slot_ctx, concurrency, say, **kw):
+            yield {"url": "http://x", "model": "m", "style": "chat", "slots": 4}, mock.Mock(interrupted=lambda: False)
+
+        clips = self.ten()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sh, "open_model", fake_open), mock.patch.object(sh, "ServerChat", lambda *a, **k: chat), \
+                mock.patch.object(sh, "output_root", lambda base=None: Path(tmp) / "out"):
+            changed = sh.fill_empty_clips(clips, {}, writer_model="w", language="English")
+        self.assertEqual(changed, [8, 9])
+        self.assertIn("Shot 1", clips[9]["prompt"])
+        self.assertIn("CONTINUITY", clips[8]["prompt"])
+
+
+class FillWiringTests(unittest.TestCase):
+    def test_extend_fills_flagged_empty_clips_before_the_rewriter_and_returns_like_prompts_only(self):
+        text = master_source()
+        body = text[text.index("def extend("):]
+        start = body.index("shot_writer.FILL_FLAG")
+        block = body[start - 200:body.index("# Video / audio references")]
+        self.assertIn("shot_writer.fill_empty_clips(", block)
+        self.assertIn("_send_plan(owner, clips, filled, fill=True)", block)
+        self.assertIn("clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)", block)
+        self.assertIn("return self._prompts_only(", block)
+        self.assertLess(start, body.index("prompt_rewriter.rewrite_clips("))
+        self.assertLess(start, body.index("_manifest_for_first(cache_owner"))
+
+    def test_panel_button_flags_only_for_the_queued_graph(self):
+        js = (ROOT / "web" / "master_extender.js").read_text(encoding="utf-8")
+        self.assertIn("Fill from story so far", js)
+        body = js[js.index("async function fillEmptyClips"):js.index("function writerLinked")]
+        self.assertIn("c.fill_empty = true", body)
+        self.assertIn("await app.queuePrompt(0, 1)", body)
+        self.assertIn("delete c.fill_empty", body)
+        self.assertLess(body.index("queuePrompt"), body.index("delete c.fill_empty"))
+        self.assertIn("clipIsEmpty(clip) && !externalPromptWired(index)", js)
+
+
 if __name__ == "__main__":
     unittest.main()

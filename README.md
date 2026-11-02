@@ -169,6 +169,24 @@ A separate node, `H3 Story Writer (brief to story)` (category *MiniMax H3 Master
 - **Workflow:** `example_workflows/MiniMax_H3_Master_Extender_Story_Writer.json` is the Story Auto example with the writer wired into `rewrite_story`, `story_engine` set to `e4.10` and a core *Preview as Text* node on the story. `python tools/add_story_writer.py in.json out.json [--clips 8] [--seconds 15] [--no-preview]` does the same to any saved UI-format workflow with a Master Extender node (the writer goes to the left of the graph, takes the Extender's story text as its brief and its writer model and language; running it again changes nothing). Tests: `tests/test_add_story_writer.py`.
 - **To deploy:** copy `story_writer.py`, `prompts/story_writer_*.md` and the changed `__init__.py` into the extender folder (or pull the branch), then restart ComfyUI so the node appears. Nothing else changes.
 
+## Fill from story so far (write the empty clips)
+
+You write clips 1 to 8 yourself in the panel (some may already be rendered), add clips 9 and 10 and leave them empty. Every empty clip card has a button, **✍ Fill from story so far** (it needs no Shot Writer node and works on every workflow). One click fills ALL the empty clips in one run:
+
+```
+Clip 8 (15 s): Kael, in her silver armour, grips the sword at the well. The monster's shadow crosses the wall.
+Clip 9 (12 s): (empty)        ->  Shot 1 – 0s – wide low angle: The monster climbs over the broken wall into the square.
+Clip 10 (12 s): (empty)           Shot 2 – 4s – close up on Kael's face: Kael steadies her grip. Kael says "Come then."
+                                  Shot 3 – 8s – ...
+```
+
+1. The writer reads the RAW prompts of the clips before (`prompt_raw` if the clip was rewritten, else `prompt`; never the rewritten Ref2VA text), with their durations, plus the panel's reference pictures, and works out cast, wardrobe, props, place and state. An empty clip in the middle also sees the next clip with text after it, so the gap is bridged.
+2. Each empty clip becomes a timed shot list at its own panel duration (`Shot 1 – 0s – wide: ...`), through the Shot Writer's plan, shot calls, code checks (timing, shots of at least 2 s, dialogue script, words per shot) and seam check (only the cuts that touch a filled clip; only filled clips are rewritten). The dialogue language is the one the earlier clips already use.
+3. Only the empty clips change: raw prompt = prompt = the shot list inside the OPENS/ENDS state blocks, not rewritten, not validated, seed mode fixed at the seed it had. Every other clip stays exactly as it was, so renders already cached stay valid.
+4. The run ends there (like `run_mode` prompts_only, whatever the widgets say): nothing is rewritten and nothing rendered. Read the shot lists, then rewrite with `rewrite_mode` pending clips (run mode prompts only), then render with clip by clip or full batch as usual.
+
+The button queues the workflow once; the empty clips carry a one-run `fill_empty` flag only in the queued graph (never saved). It uses the rewriter's writer model (`rewrite_writer_model`, `rewrite_reasoning_budget`) on the local server, closed afterwards so a render that follows has the GPU. Code: `shot_writer.fill_empty_clips`, prompt `prompts/shot_writer_continue_plan.md`. Tests: `python -m unittest discover -s tests -p "test_shot_writer.py"` (`FillEmptyClipsTests`).
+
 ## Presets
 
 The panel's Engine section starts with a **preset** dropdown that fills the engine widgets in one click. It only writes ordinary widgets (so saved workflows and API graphs are unaffected) and shows **Custom** whenever the current values match no preset.

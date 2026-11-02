@@ -8,8 +8,7 @@ CAST:
 LOCATIONS:
 {{locations}}
 
-THE FOUNDER'S BRIEF (the source; only the lines he wrote are kept, you may improve everything else):
-{{brief}}
+{{brief_block}}
 
 {{pictures_note}}
 
