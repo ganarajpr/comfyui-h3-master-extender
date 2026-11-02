@@ -185,6 +185,8 @@ Clip 10 (12 s): (empty)           Shot 2 – 4s – close up on Kael's face: Kae
 3. Only the empty clips change: raw prompt = prompt = the shot list inside the OPENS/ENDS state blocks, not rewritten, not validated, seed mode fixed at the seed it had. Every other clip stays exactly as it was, so renders already cached stay valid.
 4. The run ends there (like `run_mode` prompts_only, whatever the widgets say): nothing is rewritten and nothing rendered. Read the shot lists, then rewrite with `rewrite_mode` pending clips (run mode prompts only), then render with clip by clip or full batch as usual.
 
+The plan and shot prompts carry the founder's drama rules (cause for every clip, no replays or resets, scenes that enter and exit on a visible action, shots with frame sides, locked cameras and stillness as acting). The shot count is ceil(seconds/3) to one more, a line has at most 2 x (shot seconds - 1) words, and a shot that uses a banned word (stock gestures, mouth squeeze, marks on skin, music words) is asked again once. These shot rules apply to the Shot Writer node too.
+
 The button queues the workflow once; the empty clips carry a one-run `fill_empty` flag only in the queued graph (never saved). It uses the rewriter's writer model (`rewrite_writer_model`, `rewrite_reasoning_budget`) on the local server, closed afterwards so a render that follows has the GPU. Code: `shot_writer.fill_empty_clips`, prompt `prompts/shot_writer_continue_plan.md`. Tests: `python -m unittest discover -s tests -p "test_shot_writer.py"` (`FillEmptyClipsTests`).
 
 ## Presets

@@ -30,6 +30,7 @@ lazily, so the engine runs and is tested without it.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -138,7 +139,14 @@ def foreign_letters(line: str, language: str) -> list:
 
 
 def max_line_words(shot_seconds: float, language: str) -> int:
-    return max(2, int(shot_seconds * sw.SPEECH_WORDS_PER_SECOND * (WIDE_WORDS_FACTOR if is_wide(language) else 1.0)))
+    """At most 2 x (shot seconds - 1) words, at least 2: about a second of quiet around the line; a non-Latin script gets about three quarters of that."""
+    return max(2, int(max(shot_seconds - 1, 0) * sw.SPEECH_WORDS_PER_SECOND * (WIDE_WORDS_FACTOR if is_wide(language) else 1.0)))
+
+
+def shot_range(seconds: int) -> tuple:
+    """``(fewest, most)`` shots of a clip: ceil(seconds / 3) to one more, within MIN_SHOTS..MAX_SHOTS and what ``MIN_SHOT_SECONDS`` allows (12 s -> 4 to 5, 15 s -> 5 to 6)."""
+    most = max(1, min(MAX_SHOTS, -(-int(seconds) // 3) + 1, int(seconds) // MIN_SHOT_SECONDS))
+    return min(max(MIN_SHOTS, -(-int(seconds) // 3)), most), most
 
 
 def founder_lines(brief: str, language: str) -> list:
@@ -319,6 +327,16 @@ PLAN_SCHEMA = {
                 "new_recurring_visuals": _strings()}}},
     },
 }
+def _continue_schema() -> dict:
+    """The plan schema of a fill job: every clip also carries ``because`` (the cause in an earlier clip) and ``scene`` (place + time label), required but may be empty."""
+    schema = copy.deepcopy(PLAN_SCHEMA)
+    clip = schema["properties"]["clips"]["items"]
+    clip["required"] = clip["required"] + ["because", "scene"]
+    clip["properties"].update(because={"type": "string"}, scene={"type": "string"})
+    return schema
+
+
+CONTINUE_PLAN_SCHEMA = _continue_schema()
 SHOTS_SCHEMA = {
     "type": "object", "additionalProperties": False, "required": ["clip", "seconds", "shots"],
     "properties": {
@@ -394,6 +412,7 @@ def coerce_plan(obj) -> dict | None:
                       "place": _text(item.get("place")), "present": [_text(x) for x in item.get("present") or [] if isinstance(x, str) and _text(x)],
                       "end_action": _text(item.get("end_action")), "changes": changes, "place_changes": places,
                       "new_recurring_visuals": [_text(x) for x in item.get("new_recurring_visuals") or [] if isinstance(x, str) and _text(x)]})
+        clips[-1].update({k: _text(item[k]) for k in ("because", "scene") if _text(item.get(k))})
     if not clips:
         return None
     return {"title": _text(obj.get("title")), "summary": _text(obj.get("summary")), "minor": bool(obj.get("minor_in_sexual_content")),
@@ -509,8 +528,9 @@ def check_shots(shots: list, seconds: int, language: str, required_lines=()) -> 
     problems = []
     if not shots:
         return ["there are no shots"]
-    if not MIN_SHOTS <= len(shots) <= MAX_SHOTS:
-        problems.append(f"the clip has {len(shots)} shots; write {MIN_SHOTS} to {MAX_SHOTS}")
+    fewest, most = shot_range(seconds)
+    if not fewest <= len(shots) <= most:
+        problems.append(f"the clip has {len(shots)} shots; write {fewest} to {most}")
     starts = [s["start"] for s in shots]
     if starts[0] != 0:
         problems.append(f"shot 1 starts at {starts[0]}s; it must start at 0")
@@ -540,6 +560,30 @@ def check_shots(shots: list, seconds: int, language: str, required_lines=()) -> 
     for line in required_lines:
         if not any(line in said for said in spoken):
             problems.append(f"the founder's line \"{line}\" belongs in this clip and must appear word for word in one shot's dialogue")
+    return problems
+
+
+# Words a shot's framing or action must not hold (not its dialogue): the founder's acting rules for H3 (no stock gestures, no mouth squeeze, no marks or colour on skin, no
+# words borrowed from music for timing). Whole words only, so a false friend is possible ("wave" of the sea, "palm" tree, "dirt" on a coat); the retry says what to reword.
+BANNED_WORDS = re.compile(r"\b(nod(?:s|ded|ding)?|gestur(?:e|es|ed|ing)|blink(?:s|ed|ing)?|eyelids?|glanc(?:e|es|ed|ing)|palms?|points? at|pointing at|shrug(?:s|ged|ging)?|"
+                          r"wav(?:e|es|ed|ing)|beckon(?:s|ed|ing)?|hand to (?:her |his |their |the )?chest|"
+                          r"lips? pressed|pressed lips|bit(?:e|es|ing)? (?:her |his |their )?lips?|trembling lips|jaw clench\w*|clenched jaw|"
+                          r"sweat|dirt|pale|flushed|blush(?:es|ed|ing)?|reddens|glowing)\b", re.I)
+MUSIC_WORDS = re.compile(r"\b(beats?|rhythm\w*|tempo|pulse[sd]?|pulsing|swell(?:s|ed|ing)?)\b", re.I)
+
+
+def check_words(shots: list) -> list:
+    """Complaints for banned words in each shot's framing and action (never the dialogue): the hard rules of the shot prompt and the skin marks of ``SKIN_MARKS``.
+    A music word is complained about without being named, so the retry does not hand it back."""
+    problems = []
+    for i, shot in enumerate(shots, start=1):
+        text = f"{shot.get('framing', '')} {shot['action']}"
+        found = sorted({m.group(0).lower() for m in BANNED_WORDS.finditer(text)} | {m.group(0).lower() for m in SKIN_MARKS.finditer(text)})
+        if found:
+            problems.append(f"shot {i} uses words that are not allowed ({', '.join(found)}); say it another way (strain in the brow, jaw hinge, throat or breath; hands still or working an object; "
+                            f"nothing on the skin; no stock gestures)")
+        if MUSIC_WORDS.search(text):
+            problems.append(f"shot {i} uses a word borrowed from music to talk about timing; timing lives only in the start numbers, so remove it")
     return problems
 
 
@@ -647,6 +691,9 @@ def import_clips(text) -> list:
 
 # --------------------------------------------------------------------------- fill mode: write the Extender's empty clips from the clips around them
 
+CONTINUE_ENDING = ("The last empty clip is the last clip of the film, so it ends the story: end on the high point and let that same moment start the next danger. "
+                   "No wind-down. The open question is about the main characters, and it is a concrete fact (someone has seen, decided or started something), shown through an "
+                   "object planted earlier. It presses on a secret without answering it. This is the only clip that may end open.")
 FILL_FLAG = "fill_empty"    # set by the panel on the empty clips for the one queued run that fills them; never saved
 FILL_CONTEXT_CHARS = 1200   # a context clip is shown by its first 1,200 characters (its raw ask: a rewritten Ref2VA prompt is long and is never sent)
 FILL_SHOTS_CHARS = 700      # ... and by 700 in every shots call's "story so far" block
@@ -1093,8 +1140,8 @@ class ShotEngine:
         first = fill["targets"][0]
         values = dict(self._lang(), story="\n\n".join(lines), empty=", ".join(str(t["clip"]) for t in fill["targets"]), count=len(fill["targets"]),
                       max_cast=sw.max_cast(fill["total"]), first_number=first["clip"], first_seconds=first["seconds"],
-                      ending=("The last empty clip is the last clip of the film: bring the story to a real ending in it." if top == max(targets) and top == fill["total"] else
-                              "Do not end the story: more of it follows, so leave it open."),
+                      ending=(CONTINUE_ENDING if top == max(targets) and top == fill["total"] else
+                              "More of the story follows these clips: do not end it, and do not wind it down. Each scene you write still ends on a conclusion, the last clip included."),
                       follows=(f"Clip {max(context)} follows the empty clips: the last empty clip must lead straight into it (it opens from where your clip ends)." if max(context) > max(targets) else ""))
         values["pictures_note"] = pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees)
         messages = [message(fill_prompt(**values), self.pictures)]
@@ -1107,7 +1154,7 @@ class ShotEngine:
                 problems.append(f"the plan has {len(plan['clips'])} clips; it must have exactly {n}, one for each empty clip {', '.join(str(t['clip']) for t in fill['targets'])}")
             return problems + check_plan(plan)
 
-        plan, problems = self._checked("plan", messages, answer=answer, schema_name="shot_plan", schema=PLAN_SCHEMA, parse=lambda t: coerce_plan(parse_json_object(t)), check=check)
+        plan, problems = self._checked("plan", messages, answer=answer, schema_name="shot_plan", schema=CONTINUE_PLAN_SCHEMA, parse=lambda t: coerce_plan(parse_json_object(t)), check=check)
         if plan is None:
             raise StoryWriterError("the plan could not be read from the model's answer; nothing was written", work_dir=str(self.work))
         for problem in problems:
@@ -1176,8 +1223,8 @@ class ShotEngine:
         lines_rule = ("- The founder wrote these lines for this clip, already in the film's language. Use each in one shot's dialogue, copied character for character: "
                       + "; ".join(f"\"{line}\"" for line in required)) if required else ""
         values = dict(lang, cast=sw.format_cast(plan["cast"]), locations=sw.format_locations(plan["locations"]), brief_block=self._brief_block(), clip=number, total=self.film_total,
-                      goal=clip["goal"], previous=previous, next=following, shot_range=f"{MIN_SHOTS} to {min(MAX_SHOTS, max(MIN_SHOTS, seconds // MIN_SHOT_SECONDS))}",
-                      min_shots=MIN_SHOTS, lines_rule=lines_rule, extra="", seconds=seconds,
+                      goal=clip["goal"], previous=previous, next=following, shot_range="{} to {}".format(*shot_range(seconds)),
+                      min_shots=shot_range(seconds)[0], lines_rule=lines_rule, extra="", seconds=seconds,
                       start_state=state_lines(clip["start_state"]), end_state=state_lines(clip["end_state"]))
         shown = "; ".join(f"{p['label']}: {p['shows']}" for p in plan.get("pictures", []))
         values["pictures_note"] = (pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees) + (f" What they show (from the plan): {shown}." if shown else "")) if self.labels else ""
@@ -1188,7 +1235,7 @@ class ShotEngine:
         answer = 250 + MAX_SHOTS * (260 if is_wide(self.language) else 150)
 
         def check(parsed):
-            return check_shots(parsed["shots"], seconds, self.language, required) + check_costume(parsed["shots"], clip["start_state"], {c["name"]: c["wardrobe"] for c in plan["cast"]})
+            return check_shots(parsed["shots"], seconds, self.language, required) + check_words(parsed["shots"]) + check_costume(parsed["shots"], clip["start_state"], {c["name"]: c["wardrobe"] for c in plan["cast"]})
 
         parsed, problems = self._checked(f"{kind}_{number:03d}", messages, answer=answer, schema_name="clip_shots", schema=SHOTS_SCHEMA,
                                          parse=lambda t: coerce_shots(parse_json_object(t)), check=check)
