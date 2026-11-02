@@ -25,11 +25,11 @@ def end_state(i=0):
     return {"place": "Hall", "present": ["Ana"], "state": f"Ana wears her grey coat, door {i} open"}
 
 
-def outline_reply(n, *, cast=None, minor=False, extra_beats=0, plain=False):
+def outline_reply(n, *, cast=None, extra_beats=0, plain=False):
     lines = [f"Beat line {i}: Ana crosses the hall and says goodbye to the door number {i}." for i in range(1, n + 1 + extra_beats)]
     beats = lines if plain else [{"beat": line, "end_state": end_state(i)} for i, line in enumerate(lines, start=1)]
-    return json.dumps({"title": "T", "minor_in_sexual_content": minor, "cast": cast or [{"name": "Ana", "look": "a tall woman in a grey coat"}],
-                       "locations": [{"name": "Hall", "look": "a long dim hall"}], "beats": [] if minor else beats})
+    return json.dumps({"title": "T", "cast": cast or [{"name": "Ana", "look": "a tall woman in a grey coat"}],
+                       "locations": [{"name": "Hall", "look": "a long dim hall"}], "beats": beats})
 
 
 def beat_text(i, words=30):
@@ -82,7 +82,7 @@ def span(messages):
 
 def acts_reply(prompt):
     count = int(re.search(r"Exactly (\d+) acts", prompt).group(1))
-    return json.dumps({"title": "T", "minor_in_sexual_content": False, "cast": [{"name": "Ana", "look": "tall"}], "locations": [{"name": "Hall", "look": "dim"}],
+    return json.dumps({"title": "T", "cast": [{"name": "Ana", "look": "tall"}], "locations": [{"name": "Hall", "look": "dim"}],
                        "acts": [{"summary": f"Act {k} happens.", "start_state": end_state(), "end_state": end_state()} for k in range(1, count + 1)]})
 
 
@@ -120,7 +120,6 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual([c["name"] for c in out["cast"]], ["Ana", "Bo"])
         self.assertIsNone(sw.coerce_outline({"beats": []}))
         self.assertIsNone(sw.coerce_outline({"cast": []}))
-        self.assertTrue(sw.coerce_outline({"minor_in_sexual_content": True, "beats": []})["minor"])
 
     def test_outline_under_alternate_keys_and_shapes(self):
         long = "Ana crosses the hall and leaves the house behind her"
@@ -349,12 +348,6 @@ class OutlineTests(unittest.TestCase):
         self.assertEqual(len(eng.outline()["beats"]), 40)
         self.assertEqual(eng.outline_mode, "whole")
 
-    def test_minor_in_an_act_plan_raises(self):
-        def handler(kind, messages, n):
-            return json.dumps({"minor_in_sexual_content": True, "acts": [{"summary": "x"}] * 4}) if kind == "outline_acts" else "x"
-        with self.assertRaises(sw.MinorContentError):
-            make_engine(Script(handler), self.tmp.name, clips=40, two_level_min=31).outline()
-
     def test_unparseable_twice_then_two_parts(self):
         def handler(kind, messages, n):
             text = messages[0]["content"]
@@ -382,11 +375,6 @@ class OutlineTests(unittest.TestCase):
             eng.outline()
         self.assertTrue(list((Path(self.tmp.name) / "work" / "calls").glob("*.json")))
 
-    def test_minor_flag_raises(self):
-        chat, eng = self.engine(lambda k, m, n: outline_reply(6, minor=True))
-        with self.assertRaises(sw.MinorContentError):
-            eng.outline()
-
     def test_outline_is_stored_and_reused(self):
         chat, eng = self.engine(lambda k, m, n: outline_reply(6))
         eng.outline()
@@ -397,7 +385,7 @@ class OutlineTests(unittest.TestCase):
         chat, eng = self.engine(lambda k, m, n: outline_reply(6))
         eng.outline()
         text = chat.calls[0]["messages"][0]["content"]
-        for needle in ("EXACTLY 6 beats", "about 15 seconds", "A lighthouse" if False else "A woman leaves a house.", "at most 3 named", "minor_in_sexual_content"):
+        for needle in ("EXACTLY 6 beats", "about 15 seconds", "A lighthouse" if False else "A woman leaves a house.", "at most 3 named"):
             self.assertIn(needle, text)
         self.assertNotIn("{{", text)
 
@@ -477,11 +465,11 @@ class WriteTests(unittest.TestCase):
                 return outline_reply(20)
             first, last = span(messages)
             if first == 1:
-                return sw.SENTINEL_MINOR
+                return "garbage"
             time.sleep(0.05)
             return writer_reply(first, last)
         chat = Script(handler)
-        with self.assertRaises(sw.MinorContentError):
+        with self.assertRaises(sw.StoryWriterError):
             make_engine(chat, self.tmp.name, clips=20, chunk_beats=2, concurrency=2).run()
         self.assertLess(len(chat.calls), 11)
 
@@ -638,12 +626,6 @@ class WriteTests(unittest.TestCase):
         result = make_engine(resumed, self.tmp.name, clips=4, chunk_beats=4).run()
         self.assertEqual(len(result["beats"]), 4)
         self.assertEqual([span(c["messages"]) for c in resumed.calls], [(3, 4)])
-
-    def test_minor_sentinel_in_a_chunk_raises(self):
-        def handler(kind, messages, n):
-            return outline_reply(3) if kind == "outline" else sw.SENTINEL_MINOR
-        with self.assertRaises(sw.MinorContentError):
-            make_engine(Script(handler), self.tmp.name, clips=3).run()
 
     def test_speech_over_the_limit_is_reported(self):
         def handler(kind, messages, n):

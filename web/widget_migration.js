@@ -62,6 +62,20 @@ export function pass2ChunkWhenValue(value) {
 export function pass2SlaSparsityValue(value) {
     return typeof value === "number" && Number.isFinite(value) && value >= 0.5 && value <= 0.99 ? value : 0;
 }
+// pass2_scheduler and pass2_audio are appended after pass2_sla_sparsity: a workflow saved before them has master_ui's "" in
+// pass2_scheduler and nothing in pass2_audio. Both mean the defaults (same scheduler as pass 1, pass-2 refined audio).
+export const PASS2_SCHEDULER_DEFAULT = "same as pass 1";
+export const PASS2_AUDIO_DEFAULT = "pass 2 (refined)";
+// A workflow saved on the PTD branch carries ptd_adapter ("none" or an adapter file) in this slot: anything that is not
+// one of the widget's own options falls back to the default.
+export function pass2SchedulerValue(value, options) {
+    if (typeof value !== "string" || value === "") return PASS2_SCHEDULER_DEFAULT;
+    if (Array.isArray(options) && !options.includes(value)) return PASS2_SCHEDULER_DEFAULT;
+    return value;
+}
+export function pass2AudioValue(value) {
+    return value === "pass 1" ? "pass 1" : PASS2_AUDIO_DEFAULT;
+}
 export function dualWidgetValue(name, value) {
     const fallback = DUAL_DEFAULTS[name];
     if (typeof fallback === "boolean") return typeof value === "boolean" ? value : fallback;

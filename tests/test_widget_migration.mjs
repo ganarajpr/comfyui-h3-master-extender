@@ -127,3 +127,19 @@ console.log("widget migration ok");
         assert(["clip_by_clip", "full_batch"].includes(node.widgets_values[names.indexOf("run_mode")]), `${file}: saved run_mode still valid`);
     }
 }
+
+{
+    const { pass2SchedulerValue, pass2AudioValue } = await import("../web/widget_migration.js");
+    assert.equal(pass2SchedulerValue(""), "same as pass 1");
+    assert.equal(pass2SchedulerValue(undefined), "same as pass 1");
+    assert.equal(pass2SchedulerValue("beta"), "beta");
+    assert.equal(pass2AudioValue(undefined), "pass 2 (refined)");
+    assert.equal(pass2AudioValue("pass 1"), "pass 1");
+    // PTD-branch workflows: ptd_adapter / pass2_engine sit in these two slots
+    const scheds = ["same as pass 1", "simple", "beta"];
+    assert.equal(pass2SchedulerValue("none", scheds), "same as pass 1");
+    assert.equal(pass2SchedulerValue("ptd_h3_ref2va_refasymopd_8step_int8.safetensors", scheds), "same as pass 1");
+    assert.equal(pass2SchedulerValue("beta", scheds), "beta");
+    assert.equal(pass2AudioValue("LoRA refine"), "pass 2 (refined)");
+    assert.equal(pass2AudioValue("PTD last hop"), "pass 2 (refined)");
+}
