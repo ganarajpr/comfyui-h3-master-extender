@@ -31,6 +31,6 @@ RULES FOR EACH BEAT
 - Characters keep the same name, look and outfit throughout. Do not add new named characters beyond the cast sheet unless the outline needs one; a new one is described once in full where they first appear.
 - Name the place in concrete visible terms at the start of a beat when it changes, and when the beat is the first in that place.
 - Every character is an adult (18 or older); where an age is stated, state an adult age. A child in a non-sexual story stays as the brief gives them and non-sexual. Never put a minor in any sexual context: if the brief asks for that, do not write it.
-- Follow the brief's genre, tone and register exactly as given, including adult material when the brief is adult. Do not soften, censor, summarise away or moralise, and add no warnings or lessons.
+- Follow the brief's genre, tone and register exactly as given. Do not soften, censor, summarise away or moralise, and add no warnings or lessons.
 - A beat covers its own outline line and nothing beyond it: do not run ahead into the next beat's event and do not end the story early.
 {{extra}}
