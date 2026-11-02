@@ -384,7 +384,8 @@ class MiniMaxH3MasterExtender:
                 "run_mode": (["clip_by_clip", "full_batch", "prompts_only"], {"default": "clip_by_clip", "tooltip": "clip_by_clip renders 1 clip then pauses for validation; full_batch renders all pending clips; prompts_only imports clips_in, plans and rewrites the prompts, writes them to the panel and the saved metadata, and stops before H3 is loaded (nothing is rendered; cache and last_frame are blocked so a Final Decode after it simply does not run)."}),
                 "pass1_resolution": (
                     ["608x352 (16:9)", "352x608 (9:16)", "512x512 (1:1)", "704x384", "896x576",
-                     "1056x608 (16:9)", "608x1056 (9:16)", "864x480 (16:9)", "480x864 (9:16)"],
+                     "1056x608 (16:9)", "608x1056 (9:16)", "864x480 (16:9)", "480x864 (9:16)",
+                     "736x416 (16:9)", "416x736 (9:16)"],
                     {"default": "608x352 (16:9)", "tooltip": "Stage 1 (Pass 1) draft generation resolution"},
                 ),
                 "pass2_resolution": (
@@ -507,6 +508,8 @@ class MiniMaxH3MasterExtender:
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
+                "pass2_scheduler": (["same as pass 1"] + list(comfy.samplers.KSampler.SCHEDULERS), {"default": "same as pass 1", "tooltip": "Scheduler for pass 2's tail sigmas (BasicScheduler over round(steps x pass2_denoise) steps at pass2_denoise). 'same as pass 1' = turbo_scheduler (the long-standing behaviour). Applies in Turbo LoRA mode and with a pass-2 LoRA; HyperFlow's own tail ignores it."}),
+                "pass2_audio": (["pass 2 (refined)", "pass 1"], {"default": "pass 2 (refined)", "tooltip": "Which audio the clip keeps. 'pass 2 (refined)' = the audio pass 2 re-sampled (the long-standing behaviour). 'pass 1' = the pass-1 audio latent is swapped back in after pass 2, so only the video comes from pass 2 (the '10Eros-Max' sample workflow's 'Use first pass audio')."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -862,6 +865,11 @@ class MiniMaxH3MasterExtender:
         )
         dual_requested = bool(kwargs.get("dual_sampling", False)) or dual_mode
         dual_active = dual_requested and not str(accel_mode).lower().startswith("turbo")
+        engine.configure_pass2_extras(
+            kwargs.get("pass2_scheduler", "same as pass 1"),
+            kwargs.get("pass2_audio", "pass 2 (refined)"),
+        )
+        pass2_audio_p1 = engine.pass2_audio_from_p1 and pass2_enabled
         engine.configure_dual_sampling(
             dual_requested,
             kwargs.get("dual_split_step", 2),
@@ -951,7 +959,7 @@ class MiniMaxH3MasterExtender:
             reuse = False
             if is_on_disk and (is_validated or not rerolls):
                 try:
-                    expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te)
+                    expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te, pass2_audio_p1)
                 except (TypeError, ValueError):
                     expected_fp = None
                 stored = _stored_fingerprints(data_path, manifest_path)
@@ -1037,7 +1045,7 @@ class MiniMaxH3MasterExtender:
             elif seed_mode == "decrement":
                 seed_val = max(0, seed_val - 1)
                 clip_cfg["seed"] = seed_val
-            clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te)
+            clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te, pass2_audio_p1)
             clip_p1_fp = _pass1_fingerprint(previous_p1_fp, clip_cfg, seed_val, p1_settings)
 
             # A pass-1 result rendered from exactly these pass-1 inputs is loaded instead of

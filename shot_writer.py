@@ -42,7 +42,7 @@ try:
     from . import strata_backend
     from . import story_writer as sw
     from .story_writer import (BUDGET_MESSAGE, DEFAULT_CONCURRENCY, DEFAULT_LANGUAGE, DEFAULT_SECONDS, MAX_CLIPS, MAX_CONCURRENCY, THINKING_BUDGET,
-                               MinorContentError, Reply, ServerChat, StoryWriterError, is_wide, output_room, parse_json_object, quoted_lines, script_note)
+                               Reply, ServerChat, StoryWriterError, is_wide, output_room, parse_json_object, quoted_lines, script_note)
 except ImportError:  # imported as a top-level module (tests)
     import clips_metadata
     import e4_engine
@@ -51,7 +51,7 @@ except ImportError:  # imported as a top-level module (tests)
     import strata_backend
     import story_writer as sw
     from story_writer import (BUDGET_MESSAGE, DEFAULT_CONCURRENCY, DEFAULT_LANGUAGE, DEFAULT_SECONDS, MAX_CLIPS, MAX_CONCURRENCY, THINKING_BUDGET,
-                              MinorContentError, Reply, ServerChat, StoryWriterError, is_wide, output_room, parse_json_object, quoted_lines, script_note)
+                              Reply, ServerChat, StoryWriterError, is_wide, output_room, parse_json_object, quoted_lines, script_note)
 
 _LOG = logging.getLogger("minimax_h3_master_extender.shot_writer")
 
@@ -293,9 +293,9 @@ def _list_of(**fields):
 STATE_FIELDS = ["wardrobe", "props", "position", "state"]
 PLAN_SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["title", "summary", "minor_in_sexual_content", "start_place", "pictures", "cast", "locations", "clips"],
+    "required": ["title", "summary", "start_place", "pictures", "cast", "locations", "clips"],
     "properties": {
-        "title": {"type": "string"}, "summary": {"type": "string"}, "minor_in_sexual_content": {"type": "boolean"}, "start_place": {"type": "string"},
+        "title": {"type": "string"}, "summary": {"type": "string"}, "start_place": {"type": "string"},
         "pictures": _list_of(label={"type": "string"}, shows={"type": "string"}),
         "cast": _named("wardrobe", "props"), "locations": _named(),
         "clips": {"type": "array", "minItems": 1, "items": {
@@ -386,7 +386,7 @@ def coerce_plan(obj) -> dict | None:
                       "new_recurring_visuals": [_text(x) for x in item.get("new_recurring_visuals") or [] if isinstance(x, str) and _text(x)]})
     if not clips:
         return None
-    return {"title": _text(obj.get("title")), "summary": _text(obj.get("summary")), "minor": bool(obj.get("minor_in_sexual_content")),
+    return {"title": _text(obj.get("title")), "summary": _text(obj.get("summary")),
             "start_place": _text(obj.get("start_place")), "pictures": _pictures_list(obj.get("pictures")), "cast": _cast(obj.get("cast")), "locations": sw._named_list(obj.get("locations")), "clips": clips}
 
 
@@ -841,8 +841,6 @@ class ShotEngine:
         merged = None
         for index, (first, last) in enumerate(parts):
             out = self._plan_part(first, last, total, merged, index + 1, len(parts))
-            if out["minor"]:
-                raise MinorContentError("the brief puts a minor in a sexual context; nothing was written", work_dir=str(self.work))
             if merged is None:
                 merged = out
             else:

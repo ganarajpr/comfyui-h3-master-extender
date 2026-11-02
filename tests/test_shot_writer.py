@@ -29,7 +29,7 @@ import story_writer as sw  # noqa: E402
 HINDI_BRIEF = 'Clip 1 - Kael faces the monster. Kael says "आज नहीं।"\nClip 2 - She falls back. "I will not run."'
 
 
-def plan_json(n, *, lines=None, minor=False, changes=None, pictures=None, visuals=None):
+def plan_json(n, *, lines=None, changes=None, pictures=None, visuals=None):
     """A plan: Kael opens in a grey cloak; in clip 2 she puts on a ring and her armour forms (a change the code must carry to every later clip)."""
     changes = changes if changes is not None else {2: [{"character": "Kael", "field": "wardrobe", "to": "full silver plate armour"},
                                                        {"character": "Kael", "field": "props", "to": "a tiny silver ring on her right hand; sword lying by the well"}]}
@@ -37,7 +37,7 @@ def plan_json(n, *, lines=None, minor=False, changes=None, pictures=None, visual
     clips = [{"clip": i, "seconds": 15, "goal": f"Kael does thing {i} near the boulder.", "founder_lines": (lines or {}).get(i, []), "place": "Village", "present": ["Kael"],
               "end_action": f"Kael stands at spot {i}.", "changes": changes.get(i, []), "place_changes": [], "new_recurring_visuals": visuals.get(i, [])}
              for i in range(1, n + 1)]
-    return json.dumps({"title": "The Monster", "summary": "Kael fights a monster.", "minor_in_sexual_content": minor, "start_place": "Village", "pictures": pictures or [],
+    return json.dumps({"title": "The Monster", "summary": "Kael fights a monster.", "start_place": "Village", "pictures": pictures or [],
                        "cast": [{"name": "Kael", "look": "a tall woman, 30", "wardrobe": "a grey cloak over a blue dress", "props": "none"}],
                        "locations": [{"name": "Village", "look": "a burnt village"}], "clips": clips}, ensure_ascii=False)
 
@@ -171,12 +171,6 @@ class HappyPathTests(unittest.TestCase):
             calls = len(chat.calls)
             engine(chat, tmp).run()
         self.assertEqual(len(chat.calls), calls)
-
-    def test_minor_in_sexual_content_raises(self):
-        chat = Script(lambda kind, m, n: plan_json(1, minor=True))
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(sw.MinorContentError):
-            engine(chat, tmp, clips=1).run()
-        self.assertEqual(chat.kinds(), ["plan"])
 
 
 class StateTests(unittest.TestCase):

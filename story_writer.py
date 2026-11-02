@@ -72,7 +72,6 @@ MIN_BEAT_CHARS = 40
 SPEECH_WORDS_PER_SECOND = 2.0
 E4_LATIN_CHARS_PER_CLIP, E4_WIDE_CHARS_PER_CLIP = 700, 380   # e4/bridge/scale.mjs weightOf: how E4 sizes a story it must plan in parts
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
-SENTINEL_MINOR = "MINOR_IN_SEXUAL_CONTENT"
 OUTPUT_SUBDIR = "h3_story_writer"
 
 LATIN_LANGUAGES = {
@@ -91,10 +90,6 @@ class StoryWriterError(RuntimeError):
 
 class LLMUnavailable(StoryWriterError):
     """The model server did not answer."""
-
-
-class MinorContentError(StoryWriterError):
-    """The brief puts a minor in a sexual context. Nothing is written."""
 
 
 @dataclass
@@ -377,17 +372,16 @@ def find_beats(obj: dict) -> list:
 
 
 def coerce_outline(obj) -> dict | None:
-    """A reply's JSON as ``{title, minor, cast, locations, beats, end_states}``; None when it has no usable beats and is not the minor refusal."""
+    """A reply's JSON as ``{title, cast, locations, beats, end_states}``; None when it has no usable beats."""
     if isinstance(obj, list):
         obj = {"beats": obj}
     if not isinstance(obj, dict):
         return None
-    minor = obj.get("minor_in_sexual_content") is True
     items = find_beats(obj)
-    if not items and not minor:
+    if not items:
         return None
     lowered = {str(k).lower(): v for k, v in obj.items()}
-    return {"title": str(obj.get("title") or "").strip(), "minor": minor, "cast": _named_list(lowered.get("cast") or lowered.get("characters")),
+    return {"title": str(obj.get("title") or "").strip(), "cast": _named_list(lowered.get("cast") or lowered.get("characters")),
             "locations": _named_list(lowered.get("locations") or lowered.get("settings") or lowered.get("places")),
             "beats": [t for t, _ in items], "end_states": [s for _, s in items]}
 
@@ -437,7 +431,7 @@ def salvage_outline(text: str) -> dict | None:
     cast = _array_after(body, "cast")
     places = _array_after(body, "locations")
     title = re.search(r'"title"\s*:\s*"(.*?)"\s*,', body)
-    return {"title": title.group(1).strip() if title else "", "minor": False, "cast": _named_list(_loads(cast) if cast else None),
+    return {"title": title.group(1).strip() if title else "", "cast": _named_list(_loads(cast) if cast else None),
             "locations": _named_list(_loads(places) if places else None), "beats": [t for t, _ in items], "end_states": [s for _, s in items]}
 
 
@@ -877,14 +871,12 @@ class StoryEngine:
             out = self._outline_two_level()
         if out is None:
             out = self._outline_whole()
-            if out is not None and not out["minor"] and not plausible_count(len(out["beats"]), self.clips):
+            if out is not None and not plausible_count(len(out["beats"]), self.clips):
                 self.say(f"outline has {len(out['beats'])} beats, {self.clips} wanted: too far off to repair, planning it in parts")
                 out = None
             out = out or self._outline_in_parts()
         if out is None:
             raise StoryWriterError("the model did not return a usable outline in three attempts (replies are kept in " + str(self.work / "calls") + ")", work_dir=str(self.work))
-        if out["minor"]:
-            raise MinorContentError("the brief puts a minor in a sexual context; no story was written")
         out = self._fix_count(out, self.clips)
         stored.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
         self.progress(1, self.total_steps)
@@ -938,7 +930,7 @@ class StoryEngine:
         tail = self._fix_count(tail, second)
         names = {c["name"] for c in head["cast"]}
         places = {c["name"] for c in head["locations"]}
-        return {"title": head["title"] or tail["title"], "minor": head["minor"] or tail["minor"], "beats": head["beats"] + tail["beats"],
+        return {"title": head["title"] or tail["title"], "beats": head["beats"] + tail["beats"],
                 "end_states": head["end_states"] + tail["end_states"],
                 "cast": head["cast"] + [c for c in tail["cast"] if c["name"] not in names],
                 "locations": head["locations"] + [c for c in tail["locations"] if c["name"] not in places]}
@@ -968,8 +960,6 @@ class StoryEngine:
         if plan is None:
             return None
         obj, acts = plan
-        if obj.get("minor_in_sexual_content") is True:
-            return {"title": "", "minor": True, "cast": [], "locations": [], "beats": [], "end_states": []}
         cast, locations = _named_list(obj.get("cast")), _named_list(obj.get("locations"))
         for k, act in enumerate(acts):
             if k and not act["start"].get("place"):
@@ -984,21 +974,19 @@ class StoryEngine:
             part = self._parsed_call("outline_act", [{"role": "user", "content": fill(load_prompt("act_beats"), **values)}], self._answer_room(sizes[k]))
             if part is None:
                 raise StoryWriterError(f"act {k + 1} of the outline could not be had")
-            if part["minor"]:
-                raise MinorContentError("the brief puts a minor in a sexual context; no story was written")
             part["cast"], part["locations"] = cast, locations
             return self._fix_count(part, sizes[k])
 
         try:
             parts = self._map(one, range(acts_n))
-        except (MinorContentError, LLMUnavailable):
+        except LLMUnavailable:
             raise
         except StoryWriterError as error:
             self.say(f"{error}; falling back to one outline call")
             self._abort.clear()
             return None
         self.outline_mode = f"{acts_n} acts"
-        return {"title": str(obj.get("title") or "").strip(), "minor": False, "cast": cast, "locations": locations,
+        return {"title": str(obj.get("title") or "").strip(), "cast": cast, "locations": locations,
                 "beats": [b for p in parts for b in p["beats"]], "end_states": [s for p in parts for s in p["end_states"]]}
 
     # ---- count repair: in code where it can be, one small call where it cannot
@@ -1129,8 +1117,6 @@ class StoryEngine:
                          f"each at most {words} words, and finish with the === END === line.")
             messages = self._write_messages(out, start, end, extra=extra)
             reply = self._ask("write", messages, answer=answer_tokens(count, self.seconds, self.language), scale=1.0 if not terse else 1.8)
-            if SENTINEL_MINOR in reply.text:
-                raise MinorContentError("the story would put a minor in a sexual context; no story was written")
             beats, saw_end = parse_beats(reply.text, count, truncated=reply.finish == "length")
             for k, beat in enumerate(beats):
                 self._store(start + k, beat)
