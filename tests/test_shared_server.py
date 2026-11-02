@@ -267,7 +267,7 @@ class ExtenderSourceTests(unittest.TestCase):
         close = body.index("shared_server.close()\n\n        if str(run_mode) == \"prompts_only\":")
         self.assertGreater(close, call)                                          # after the rewriter, also when it is off or had nothing to do
         self.assertLess(close, body.index("_manifest_for_first("))              # before anything of H3
-        self.assertLess(close, body.index("return self._prompts_only("))
+        self.assertLess(close, body.index("return self._prompts_only(owner, clips, rewrite_notes, imported)"))
         self.assertIn("except BaseException:\n                shared_server.close()\n                raise", body)   # a failing or cancelled rewrite
 
     @unittest.skipUnless((ROOT / "__init__.py").exists(), "no __init__.py in a scratch copy")
