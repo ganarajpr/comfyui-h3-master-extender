@@ -581,13 +581,20 @@ class MasterEngine:
     # ------------------------------------------------------------------
     # Turbo LoRA mode + SLA
     # ------------------------------------------------------------------
-    def _basic_sigmas(self, model, steps, denoise):
-        """Sigmas from core's BasicScheduler for the engine's scheduler_name.
+    def configure_pass2_extras(self, scheduler="same as pass 1", audio="pass 2 (refined)"):
+        """Opt-in pass-2 overrides. scheduler: a scheduler name for pass 2's tail sigmas ('same as pass 1' = the engine's
+        scheduler_name). audio: 'pass 1' decodes the pass-1 audio latent instead of the pass-2 refined one."""
+        sched = str(scheduler or "")
+        self.pass2_scheduler = None if sched in ("", "same as pass 1") else sched
+        self.pass2_audio_from_p1 = str(audio or "").strip().lower() == "pass 1"
+
+    def _basic_sigmas(self, model, steps, denoise, scheduler=None):
+        """Sigmas from core's BasicScheduler for the engine's scheduler_name (or `scheduler`).
         `steps` is the number of steps that will actually run; with denoise < 1
         they are the tail of a longer schedule (core's hires-fix semantics)."""
         from comfy_extras.nodes_custom_sampler import BasicScheduler
         steps = max(1, int(steps))
-        res = BasicScheduler.execute(model, self.scheduler_name, steps, float(denoise))
+        res = BasicScheduler.execute(model, scheduler or self.scheduler_name, steps, float(denoise))
         sigmas = _safe_get_output(res, 0, "sigmas")
         if sigmas is None:
             raise RuntimeError("BasicScheduler returned no sigmas")
@@ -724,6 +731,17 @@ class MasterEngine:
             _LOG.warning("Core BlockSparseAttention could not be applied (%s); continuing dense", exc)
         return model
 
+    def _pass2_basic_sigmas(self, model, tail, denoise):
+        scheduler = getattr(self, "pass2_scheduler", None)
+        sigmas = self._basic_sigmas(model, tail, denoise, scheduler)
+        if scheduler:
+            _LOG.info("Pass 2 scheduler override: %s (pass 1 uses %s), %d steps at denoise %.2f: %s",
+                      scheduler, self.scheduler_name, tail, denoise, [round(float(x), 4) for x in sigmas])
+        else:
+            _LOG.info("Pass 2 sigmas (%s, %d steps, denoise %.2f): %s", self.scheduler_name, tail, denoise,
+                      [round(float(x), 4) for x in sigmas])
+        return sigmas
+
     def _pass2_sigmas(self, model, pass2_denoise):
         """Quality-tail schedule for pass 2: the tail of HyperFlow's own grid, or the last
         round(steps x denoise) steps of the turbo schedule. With a pass-2 LoRA
@@ -747,11 +765,11 @@ class MasterEngine:
         if self._pass2_lora_active() and (self.pass2_steps > 0 or self.pass2_lora_mode == "replace" or self.turbo_mode):
             steps = int(self.pass2_steps or self.turbo_steps)
             tail = max(1, int(round(steps * float(pass2_denoise))))
-            return self._basic_sigmas(model, tail, float(pass2_denoise))
+            return self._pass2_basic_sigmas(model, tail, float(pass2_denoise))
         if self.turbo_mode:
             steps = int(self.turbo_steps)
             tail = max(1, int(round(steps * float(pass2_denoise))))
-            return self._basic_sigmas(model, tail, float(pass2_denoise))
+            return self._pass2_basic_sigmas(model, tail, float(pass2_denoise))
 
     # Make room for activations before each sampling pass.
     # With dynamic VRAM enabled, core's free_memory() does not evict one dynamic
@@ -1390,6 +1408,11 @@ class MasterEngine:
                 sigmas=sigmas_p2,
                 seed=seed,
             )
+
+        if getattr(self, "pass2_audio_from_p1", False):
+            video_p2, _ = _streams_from_latent(final_sampled, "samples")
+            _LOG.info("Clip %d: pass-2 video with the pass-1 audio latent (pass2_audio = pass 1)", clip_index + 1)
+            final_sampled = {**final_sampled, "samples": comfy.nested_tensor.NestedTensor((video_p2, audio_p1))}
 
         if getattr(self, "audio_refine_steps", 0) > 0:
             if progress_cb:

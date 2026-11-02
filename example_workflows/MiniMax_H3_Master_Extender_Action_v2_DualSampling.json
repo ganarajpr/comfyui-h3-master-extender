@@ -1410,7 +1410,7 @@
         "minimax_h3_bf16_CONSERVATIVE_v5.safetensors",
         "clip_by_clip",
         "608x352 (16:9)",
-        "1344x768 (16:9)",
+        "1280x720",
         0.25,
         "8",
         "22",
@@ -1474,7 +1474,7 @@
         "auto",
         "auto",
         false,
-        2,
+        3,
         false,
         ""
       ],

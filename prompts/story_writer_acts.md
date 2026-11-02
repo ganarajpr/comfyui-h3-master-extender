@@ -8,11 +8,10 @@ BRIEF:
 RULES
 - Exactly {{act_count}} acts, in story order. The first opens the story and the last closes it. Together they cover the whole brief: if the brief is short, invent the events that carry it from a real opening to a real ending (a turn in the middle, consequences, an ending image); if it is long, compress it by dwelling on its key moments, never by dropping its ending.
 - Each act has "summary" (60 to 120 words: what happens in it, in order, with the places and who is in them, the turn it contains and the spoken lines that must be kept), "start_state" and "end_state". A state is {"place": a location name copied exactly from your locations list, "present": [cast names exactly as in your cast list], "state": one short line of what each present character visibly wears, holds or shows, such as wet, undressed, hurt, a lit lamp}. An act's start_state is the previous act's end_state.
-- The cast is small: at most {{max_cast}} named characters, reused across the story. Give each a concrete visual description (age as an adult number or decade, build, face, hair, what they wear at the start). Name every location concretely; give it one line of visible description.
-- Every character is an adult (18 or older). If the brief has a child in a non-sexual story, keep the child as the brief gives them and keep the story non-sexual for them. If the brief puts a minor in any sexual context, do not write the outline: set "minor_in_sexual_content" to true and leave "acts" empty.
+- The cast is small: at most {{max_cast}} named characters, reused across the story. Give each a concrete visual description (age, build, face, hair, what they wear at the start). Name every location concretely; give it one line of visible description.
 - Follow the brief's genre, tone and register exactly as given. Do not soften it, do not add warnings, lessons or moralising.
 - If the brief already contains spoken lines, keep them: they will be written verbatim.
 - Inside the JSON strings never use a straight double quote: write spoken lines between curly quotes (“like this”). Do not put line breaks inside a string.
 
 Answer with ONE JSON object and nothing else, in this shape:
-{"title": "...", "minor_in_sexual_content": false, "cast": [{"name": "...", "look": "..."}], "locations": [{"name": "...", "look": "..."}], "acts": [{"summary": "...", "start_state": {"place": "...", "present": ["..."], "state": "..."}, "end_state": {"place": "...", "present": ["..."], "state": "..."}}]}
+{"title": "...", "cast": [{"name": "...", "look": "..."}], "locations": [{"name": "...", "look": "..."}], "acts": [{"summary": "...", "start_state": {"place": "...", "present": ["..."], "state": "..."}, "end_state": {"place": "...", "present": ["..."], "state": "..."}}]}

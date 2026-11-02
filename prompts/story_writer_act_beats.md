@@ -23,8 +23,7 @@ RULES
 - A beat is one line of 25 to 50 words: where, who, what they physically do, what visibly changes. Unless the story is wordless, put the actual spoken line or lines in quotes inside most beats (one to three short lines, at most {{max_words}} words in all, the speaker named); a beat without speech says what we see instead. Never write camera directions, shot types, "Beat 1" labels or numbering inside a beat.
 - Every beat carries an "end_state" ({"place": a location name copied exactly from the locations list, "present": [cast names exactly as in the cast sheet], "state": one short line of what each present character visibly wears, holds or shows}) for the moment the beat ENDS. The last beat's end_state is the act's end state above. States carry every visible change forward from beat to beat.
 - Inside the JSON strings never use a straight double quote: write spoken lines between curly quotes (“like this”). Do not put line breaks inside a string.
-- Every character is an adult (18 or older). If the story puts a minor in any sexual context, set "minor_in_sexual_content" to true and leave "beats" empty.
 - Follow the brief's genre, tone and register exactly as given. Do not soften it, do not add warnings, lessons or moralising.
 
 Answer with ONE JSON object and nothing else:
-{"minor_in_sexual_content": false, "beats": [{"beat": "...", "end_state": {"place": "...", "present": ["..."], "state": "..."}}]}
+{"beats": [{"beat": "...", "end_state": {"place": "...", "present": ["..."], "state": "..."}}]}

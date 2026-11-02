@@ -30,7 +30,6 @@ RULES FOR EACH BEAT
 - A beat opens in the state the previous beat ended in (same place, same people present, same clothes, same props, as its "ends:" line says) unless its outline line names a cut in time or place, which you then state in its first sentence. Your last beat ends in the state its "ends:" line gives, so the next writer can open from it. Place names are written exactly as in the locations list.
 - Characters keep the same name, look and outfit throughout. Do not add new named characters beyond the cast sheet unless the outline needs one; a new one is described once in full where they first appear.
 - Name the place in concrete visible terms at the start of a beat when it changes, and when the beat is the first in that place.
-- Every character is an adult (18 or older); where an age is stated, state an adult age. A child in a non-sexual story stays as the brief gives them and non-sexual. If the story you are asked to write puts a minor in any sexual context, write only the single line MINOR_IN_SEXUAL_CONTENT and nothing else.
 - Follow the brief's genre, tone and register exactly as given, including adult material when the brief is adult. Do not soften, censor, summarise away or moralise, and add no warnings or lessons.
 - A beat covers its own outline line and nothing beyond it: do not run ahead into the next beat's event and do not end the story early.
 {{extra}}
