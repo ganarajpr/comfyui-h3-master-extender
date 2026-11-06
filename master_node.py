@@ -58,6 +58,11 @@ from .pdd_pure_engine import (
     duration_to_h3_frames,
     with_dual_p1_settings,
     with_pass1_steps_p1_settings,
+    FLASH_ACCEL_MODE,
+    FLASH_DEFAULT_FILE,
+    FLASH_STEPS,
+    check_flash_steps,
+    resolve_flash_file,
 )
 
 PASS2_OFF = "off (pass 1 only)"
@@ -324,8 +329,9 @@ HYPERFLOW_DEFAULT_FILE = "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safete
 
 
 # Options are restored by name, so new ones are only ever appended.
-ACCEL_MODES = ["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling"]
-DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES[-1]
+ACCEL_MODES = ["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling",
+               "HyperFlow Flash (GGUF)"]
+DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES[2]
 
 
 def normalize_accel_mode(accel_mode):
@@ -356,6 +362,18 @@ def _hyperflow_files():
     except Exception:
         names = []
     return names or [HYPERFLOW_DEFAULT_FILE]
+
+
+def _flash_files():
+    """HyperFlow Flash GGUF builds: .gguf files with 'hyperflow_flash' in the name, in diffusion_models / unet."""
+    names = set()
+    for key in ("unet_gguf", "diffusion_models", "unet"):
+        try:
+            names.update(n for n in folder_paths.get_filename_list(key)
+                         if n.lower().endswith(".gguf") and "hyperflow_flash" in n.lower())
+        except Exception:
+            pass
+    return sorted(names) or [FLASH_DEFAULT_FILE]
 
 
 class MiniMaxH3MasterExtender:
@@ -510,6 +528,9 @@ class MiniMaxH3MasterExtender:
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
                 "pass2_scheduler": (["same as pass 1"] + list(comfy.samplers.KSampler.SCHEDULERS), {"default": "same as pass 1", "tooltip": "Scheduler for pass 2's tail sigmas (BasicScheduler over round(steps x pass2_denoise) steps at pass2_denoise). 'same as pass 1' = turbo_scheduler (the long-standing behaviour). Applies in Turbo LoRA mode and with a pass-2 LoRA; HyperFlow's own tail ignores it."}),
                 "pass2_audio": (["pass 2 (refined)", "pass 1"], {"default": "pass 2 (refined)", "tooltip": "Which audio the clip keeps. 'pass 2 (refined)' = the audio pass 2 re-sampled (the long-standing behaviour). 'pass 1' = the pass-1 audio latent is swapped back in after pass 2, so only the video comes from pass 2 (the '10Eros-Max' sample workflow's 'Use first pass audio')."}),
+                # --- HyperFlow Flash (GGUF) (appended last so saved workflows keep their widget order) ---
+                "hyperflow_flash_file": (_flash_files(), {"default": FLASH_DEFAULT_FILE, "tooltip": "HyperFlow Flash (GGUF) mode only: the Flash transformer for pass 1 (diffusion_models, needs ComfyUI-HyperFlow-Flash + ComfyUI-GGUF). The extender renders Ref2VA, so pick a ref2va build; an fl2va pick is swapped for its ref2va sibling when installed, otherwise the job stops. The base model input is used for pass 2 only in this mode."}),
+                "hyperflow_flash_steps": ("INT", {"default": 6, "min": 4, "max": 8, "step": 2, "tooltip": "HyperFlow Flash (GGUF) mode only: 4 = fastest, 6 = balanced (default), 8 = best quality. Euler, CFG 1, the checkpoint's own sigma grid."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -527,7 +548,8 @@ class MiniMaxH3MasterExtender:
     OUTPUT_NODE = False
 
     @classmethod
-    def VALIDATE_INPUTS(cls, hyperflow_file=None, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None):
+    def VALIDATE_INPUTS(cls, hyperflow_file=None, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
+                        hyperflow_flash_file=None, hyperflow_flash_steps=None):
         # accel_mode: API graphs saved before PDD mode was removed still send "PDD 8-step"; normalize_accel_mode maps
         # it to HyperFlow at run time. Naming it here skips core's combo check, so anything else unknown is rejected.
         if accel_mode is not None and accel_mode not in ACCEL_MODES and not str(accel_mode).lower().startswith("pdd"):
@@ -540,6 +562,12 @@ class MiniMaxH3MasterExtender:
                 return f"semantic_bridge: '{semantic_bridge}' not in {['none'] + adapters}"
         # rewrite_reasoning_budget was an INT: API graphs (render_clip.py) still send 4096 as a number, which the
         # combo check would reject. Naming it here skips that check; prompt_rewriter.reasoning_budget maps it.
+        # The Flash inputs are appended last, so an older workflow can carry master_ui's "" in the file slot: it means the default.
+        if normalize_accel_mode(accel_mode) == FLASH_ACCEL_MODE:
+            if hyperflow_flash_file and hyperflow_flash_file not in _flash_files():
+                return f"hyperflow_flash_file: '{hyperflow_flash_file}' not in {_flash_files()}"
+            if isinstance(hyperflow_flash_steps, (int, float)) and int(hyperflow_flash_steps) not in FLASH_STEPS:
+                return f"hyperflow_flash_steps: {hyperflow_flash_steps!r} not in {list(FLASH_STEPS)}"
         # Workflows saved before HyperFlow existed can load with hyperflow_file == "";
         # treat that as "use the default" instead of failing the combo check.
         if not hyperflow_file:
@@ -602,6 +630,17 @@ class MiniMaxH3MasterExtender:
         **kwargs,
     ):
         accel_mode, dual_mode, pass2_chunk_frames = resolve_accel_mode(accel_mode, pass2_chunk_frames)
+        flash_file, flash_steps = FLASH_DEFAULT_FILE, 6
+        if accel_mode == FLASH_ACCEL_MODE:
+            flash_steps = check_flash_steps(kwargs.get("hyperflow_flash_steps") or 6)
+            flash_file, flash_note = resolve_flash_file(kwargs.get("hyperflow_flash_file") or FLASH_DEFAULT_FILE, _flash_files())
+            if flash_note:
+                _LOG.warning("HyperFlow Flash: %s", flash_note)
+            if nodes.NODE_CLASS_MAPPINGS.get("HyperFlowGGUFLoader") is None:
+                raise RuntimeError("HyperFlow Flash (GGUF) needs the ComfyUI-HyperFlow-Flash node pack (and ComfyUI-GGUF) in custom_nodes: "
+                                   "git clone https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash, then restart ComfyUI.")
+            if dual_mode or kwargs.get("dual_sampling") or kwargs.get("pass1_steps"):
+                _LOG.warning("HyperFlow Flash: dual sampling and pass1_steps are HyperFlow 8-step features and are ignored")
         owner = str(unique_id if unique_id is not None else "master_extender")
         export_profile = None
         for config in (prompt or {}).values():
@@ -854,6 +893,8 @@ class MiniMaxH3MasterExtender:
             hyperflow_curve_refit=kwargs.get("hyperflow_curve_refit", True),
             hyperflow_strength=kwargs.get("hyperflow_strength", 1.0),
             hyperflow_lora_mode=kwargs.get("hyperflow_lora_mode") or "bypass",
+            hyperflow_flash_file=flash_file,
+            hyperflow_flash_steps=flash_steps,
             background_busy=lambda: background["worker"] is not None and background["worker"].busy(),
             wait_background=lambda: _finish_background(),
         )
@@ -864,7 +905,7 @@ class MiniMaxH3MasterExtender:
             kwargs.get("pass2_steps", 4),
         )
         dual_requested = bool(kwargs.get("dual_sampling", False)) or dual_mode
-        dual_active = dual_requested and not str(accel_mode).lower().startswith("turbo")
+        dual_active = dual_requested and not str(accel_mode).lower().startswith("turbo") and accel_mode != FLASH_ACCEL_MODE
         engine.configure_pass2_extras(
             kwargs.get("pass2_scheduler", "same as pass 1"),
             kwargs.get("pass2_audio", "pass 2 (refined)"),
@@ -912,6 +953,10 @@ class MiniMaxH3MasterExtender:
             "single_te": bool(single_te),
             "refs": _media_digest([refs, ref_videos, ref_video_audios, ref_audios]),
         }
+
+        if accel_mode == FLASH_ACCEL_MODE:
+            # Only in Flash mode, so pass-1 caches of every other mode keep their fingerprint.
+            p1_settings["flash"] = [flash_file, flash_steps]
 
         p1_settings = with_dual_p1_settings(
             p1_settings, dual_active and pass2_enabled, kwargs.get("dual_split_step", 2),

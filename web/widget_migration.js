@@ -76,6 +76,16 @@ export function pass2SchedulerValue(value, options) {
 export function pass2AudioValue(value) {
     return value === "pass 1" ? "pass 1" : PASS2_AUDIO_DEFAULT;
 }
+// hyperflow_flash_file and hyperflow_flash_steps are the last widgets (after pass2_audio): a workflow saved before them has
+// master_ui's "" in the file slot. "" / unknown file = the first installed option; steps outside 4 / 6 / 8 = 6.
+export const FLASH_STEPS_DEFAULT = 6;
+export function flashStepsValue(value) {
+    return value === 4 || value === 6 || value === 8 ? value : FLASH_STEPS_DEFAULT;
+}
+export function flashFileValue(value, options) {
+    if (typeof value === "string" && value !== "" && (!Array.isArray(options) || options.includes(value))) return value;
+    return Array.isArray(options) && options.length ? options[0] : "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf";
+}
 export function dualWidgetValue(name, value) {
     const fallback = DUAL_DEFAULTS[name];
     if (typeof fallback === "boolean") return typeof value === "boolean" ? value : fallback;

@@ -63,6 +63,7 @@ def make(p2=0.0, lora=False, method="sla", sla=0.9):
     e.sparse_tau = 1.3
     e.attention_backend = "pytorch attention"
     e.hyperflow_mode = True
+    e.flash_mode = False
     e.sparse_start_percent, e.sparse_dense_blocks, e.sparse_sink = -1.0, "auto", "auto"
     e._sparse_settings = lambda: {"start": 0.2, "dense_blocks": "", "sink": "off"}
     e.shifted_model = Model("shifted")

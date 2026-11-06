@@ -165,6 +165,8 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
         steps = inputs.get("pdd_nfe", "?")
         if str(accel).lower().startswith("turbo"):
             lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
+        elif str(accel).startswith("HyperFlow Flash"):
+            lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1")
         else:
             refit = "curve refit on" if inputs.get("hyperflow_curve_refit", True) else "curve refit off"
             label = "HyperFlow · dual sampling" if "dual sampling" in str(accel) else "HyperFlow 8-step"

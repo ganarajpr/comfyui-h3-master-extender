@@ -85,6 +85,7 @@ def make_engine(turbo=False, pass2_lora=None):
     e = Engine()
     e.turbo_mode = turbo
     e.hyperflow_mode = not turbo
+    e.flash_mode = False
     e.hyperflow_pruned_refit = False
     e.pass2_lora = pass2_lora
     e.pass2_model = object() if pass2_lora else None
@@ -133,7 +134,7 @@ class DefaultsAreUnchanged(unittest.TestCase):
         text = NODE.read_text(encoding="utf-8")
         names = re.findall(r'^\s{16}"(\w+)": \(', text[text.index("def INPUT_TYPES"):], re.M)
         self.assertEqual(names[:len(OLD_INPUT_NAMES)], OLD_INPUT_NAMES)
-        self.assertEqual(names[len(OLD_INPUT_NAMES):], ["dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps", "pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "clips_in"])
+        self.assertEqual(names[len(OLD_INPUT_NAMES):], ["dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps", "pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "hyperflow_flash_file", "hyperflow_flash_steps", "clips_in"])
 
     def test_new_inputs_default_off(self):
         text = NODE.read_text(encoding="utf-8")
@@ -296,7 +297,7 @@ class DualSamplingMode(unittest.TestCase):
     NEW = "HyperFlow 8-step \u00b7 dual sampling"
 
     def test_the_new_value_is_appended_last_and_the_default_is_unchanged(self):
-        self.assertEqual(_NODE["ACCEL_MODES"], ["HyperFlow 8-step", "Turbo LoRA", self.NEW])
+        self.assertEqual(_NODE["ACCEL_MODES"], ["HyperFlow 8-step", "Turbo LoRA", self.NEW, "HyperFlow Flash (GGUF)"])
         self.assertRegex(NODE.read_text(encoding="utf-8"), r'"accel_mode": \(ACCEL_MODES, \{"default": "HyperFlow 8-step"')
 
     def test_old_values_resolve_to_themselves(self):

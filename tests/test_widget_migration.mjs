@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, DUAL_DEFAULTS } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, DUAL_DEFAULTS, flashStepsValue, flashFileValue } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -93,8 +93,17 @@ for (const file of workflows) {
     const node = flow.nodes.find(n => n.type === "MiniMaxH3MasterExtender");
     const names = node.inputs.filter(i => i.widget).map(i => i.name);
     assert.equal(migrateAccelMode(names, node.widgets_values), null, `${file}: no PDD left`);
-    assert(["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling"].includes(node.widgets_values[names.indexOf("accel_mode")]), file);
+    assert(["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling", "HyperFlow Flash (GGUF)"].includes(node.widgets_values[names.indexOf("accel_mode")]), file);
 }
+
+// HyperFlow Flash widgets (appended last): master_ui's "" in the file slot and any non-4/6/8 steps fall back to the defaults
+assert.equal(flashStepsValue(""), 6);
+assert.equal(flashStepsValue(5), 6);
+assert.deepEqual([4, 6, 8].map(flashStepsValue), [4, 6, 8]);
+const flashFiles = ["a_ref2va_hyperflow_flash.gguf", "b_ref2va_hyperflow_flash.gguf"];
+assert.equal(flashFileValue("", flashFiles), flashFiles[0]);
+assert.equal(flashFileValue("gone.gguf", flashFiles), flashFiles[0]);
+assert.equal(flashFileValue(flashFiles[1], flashFiles), flashFiles[1]);
 console.log("widget migration ok");
 
 // pass 2 steps row: dual on -> dual_split_step, off -> pass2_steps; binding never writes

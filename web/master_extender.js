@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, pass2RowBinding } from "./widget_migration.js";
+import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, pass2RowBinding, flashStepsValue, flashFileValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -196,6 +196,10 @@ const TURBO_ONLY_WIDGETS = ["turbo_lora", "turbo_lora_strength", "turbo_sampler"
 const ALWAYS_HIDDEN_WIDGETS = ["pdd_file"];
 const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
 const HYPERFLOW_ONLY_WIDGETS = ["hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength", "hyperflow_lora_mode"];
+// HyperFlow Flash (GGUF) engine: its own two widgets, shown only in that mode; the HyperFlow 8-step widgets, dual sampling and pass 1 steps are hidden in it.
+const FLASH_MODE = "HyperFlow Flash (GGUF)";
+const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps"];
+const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
 const SLA_ONLY_WIDGETS = ["sla_sparsity", "pass2_sla_sparsity"];
 // Dual sampling (appended last, after sparse_sink): HyperFlow only; the split step and early stop only while it is on.
 const DUAL_WIDGET = "dual_sampling";
@@ -309,6 +313,10 @@ function repairDualWidgets(node) {
     if (p2Sched) p2Sched.value = pass2SchedulerValue(p2Sched.value, p2Sched.options?.values);
     const p2Audio = node.widgets?.find(x => x.name === "pass2_audio");
     if (p2Audio) p2Audio.value = pass2AudioValue(p2Audio.value);
+    const flashFile = node.widgets?.find(x => x.name === "hyperflow_flash_file");
+    if (flashFile) flashFile.value = flashFileValue(flashFile.value, comboValues(flashFile));
+    const flashSteps = node.widgets?.find(x => x.name === "hyperflow_flash_steps");
+    if (flashSteps) flashSteps.value = flashStepsValue(flashSteps.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -337,10 +345,12 @@ function setupModeWidgets(node) {
     const apply = () => {
         const mode = String(accel?.value ?? "").toLowerCase();
         const turbo = mode.startsWith("turbo");
-        const hyperflow = !turbo;
+        const flash = isFlashMode(accel?.value);
+        const hyperflow = !turbo && !flash;
         const slaOn = sla ? !!sla.value : false;
         TURBO_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         HYPERFLOW_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), hyperflow));
+        FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
         const dualMode = isDualMode(accel?.value);
         const dualOn = hyperflow && (dualMode || !!byName(DUAL_WIDGET)?.value);
         setWidgetVisible(byName(DUAL_WIDGET), hyperflow && !dualMode);
@@ -415,7 +425,7 @@ function comboValues(widget) {
 }
 
 function shortModelName(name) {
-    return String(name || "none").replace(/\.(safetensors|pt|pth|ckpt)$/i, "").replace(/^minimax[_-]?h3[_-]?/i, "");
+    return String(name || "none").replace(/\.(safetensors|pt|pth|ckpt|gguf)$/i, "").replace(/^minimax[_-]?h3[_-]?/i, "");
 }
 
 function hideNativeWidgets(node) {
@@ -800,7 +810,8 @@ app.registerExtension({
                 if (rerender) renderUI();
             };
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
-            const isHyperflow = () => !isTurbo();
+            const isFlash = () => isFlashMode(getW("accel_mode", ""));
+            const isHyperflow = () => !isTurbo() && !isFlash();
 
             function bindSelect(name, opts = {}) {
                 const w = W(name);
@@ -853,6 +864,7 @@ app.registerExtension({
                     ? ` · dual sampling (pass 2 from step ${getW("dual_split_step", 2)}${dualMode ? ", whole clip" : ""}${getW("pass1_early_stop", false) ? ", pass 1 early stop" : ""})` : "";
                 const p1s = Number(getW(PASS1_STEPS_WIDGET, 0));
                 const p1sNote = (isHyperflow() && !dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
+                if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
                 if (dualMode) return `HyperFlow · dual sampling · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${dualNote.replace(" · dual sampling", "")}${bridgeNote}`;
                 if (isHyperflow()) return `HyperFlow 8-step · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
@@ -1019,7 +1031,7 @@ app.registerExtension({
                     setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") ? "4" : "8", { rerender: false });
                     renderUI();
                 });
-                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count. HyperFlow 8-step: Video Rebirth's 8-step LoRA with two-time conditioning. HyperFlow 8-step \u00b7 dual sampling: HyperFlow with pass 2 as the grid tail over the whole clip in one window." }));
+                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count. HyperFlow 8-step: Video Rebirth's 8-step LoRA with two-time conditioning. HyperFlow 8-step \u00b7 dual sampling: HyperFlow with pass 2 as the grid tail over the whole clip in one window. HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." }));
                 if (isHyperflow()) {
                     wrap.appendChild(uiRow("hyperflow file", bindSelect("hyperflow_file", { render: shortModelName }),
                         { hint: "Pruned bases (Singularity) need the _pruned build; full bases need the one without. Always the trained 8-step grid with Euler." }));
@@ -1040,6 +1052,12 @@ app.registerExtension({
                         wrap.appendChild(uiRow("pass 1 steps", bindNumber(PASS1_STEPS_WIDGET),
                             { hint: "0 = all 8 HyperFlow steps. 1-7: stop pass 1 early, upscale its clean estimate, then the normal refine (same LoRA, windows, denoise). Saves the skipped steps." }));
                     }
+                } else if (isFlash()) {
+                    wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName }),
+                        { hint: "Pass 1 runs this Flash GGUF transformer (ref2va build). The base model input is used for pass 2 only." }));
+                    wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps"),
+                        { hint: "4 fastest, 6 balanced, 8 best quality. Euler, CFG 1." }));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD). Dual sampling, pass 1 steps and the HyperFlow 8-step rows do not apply."));
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
@@ -1521,7 +1539,7 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow · dual sampling" : `${isHyperflow() ? "HyperFlow" : "Turbo"} · ${isHyperflow() ? "8" : getW("pdd_nfe", "8")} steps · 2-pass`}</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow · dual sampling" : `${isFlash() ? "HyperFlow Flash" : isHyperflow() ? "HyperFlow" : "Turbo"} · ${isFlash() ? getW("hyperflow_flash_steps", 6) : isHyperflow() ? "8" : getW("pdd_nfe", "8")} steps · 2-pass`}</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">
