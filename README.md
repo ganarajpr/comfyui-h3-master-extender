@@ -70,6 +70,7 @@ The included workflows contain no prompts, references or saved project content b
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Builder.json` — the HyperFlow action preset set up for building a story clip by clip: built-in rewriter on `pending clips`, continuity `final prompts` (clip N continues from clip N-1's final rewritten prompt, written one after another) and a sample `rewrite_story` (the whole film's story; each clip's writer uses it only to pick that clip's beat). Two clips, the second saying "Continue the story from previous."
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Auto.json` — the Story Builder preset with one empty clip, a five-sentence sample `rewrite_story` and `auto_clips` = 4: the first run plans the story into four clips, then rewrites them one after another.
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Writer.json` — Story Auto with the H3 Story Writer node feeding `rewrite_story` and `story_engine` = `e4.10` (see [H3 Story Writer](#h3-story-writer-brief-to-story)).
+   - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_Flash.json` — the HyperFlow Flash (GGUF) engine: pass 1 on the Flash transformer (6 steps), pass 2 on the base model with the DMAD refiner (see [HYPERFLOW.md](HYPERFLOW.md#hyperflow-flash-gguf-mode)).
    - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_DualSampling.json` and `MiniMax_H3_Master_Extender_Action_v2_DualSampling.json` — HyperFlow dual sampling (see [HyperFlow dual sampling](#hyperflow-dual-sampling-opt-in)).
 
    Start with `clip_by_clip` and one clip. Inspect the preview and validate a clip before continuing the chain.
@@ -79,6 +80,7 @@ The included workflows contain no prompts, references or saved project content b
 | Pack | Needed for |
 | --- | --- |
 | [ComfyUI-HyperFlow-H3](https://github.com/Adudeguyman/ComfyUI-HyperFlow-H3) | **Required** for the default engine, HyperFlow 8-step. See [HYPERFLOW.md](HYPERFLOW.md). |
+| [ComfyUI-HyperFlow-Flash](https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash) + [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) | Only for the `HyperFlow Flash (GGUF)` engine. See [HYPERFLOW.md](HYPERFLOW.md#hyperflow-flash-gguf-mode). |
 | [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) | **Required.** Provides `MinimaxH3LatentUpscaler3D`, the upscale between the passes. |
 | [MiniMax-H3-Prompt-Rewriter-ComfyUI](https://github.com/pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI) | The built-in prompt rewriter, the story engines and the Story Writer node. |
 | [ComfyUI-MiniMaxH3_LatentUpscaler](https://github.com/TripleHeadedMonkey/ComfyUI-MiniMaxH3_LatentUpscaler) | The X2 Detail final decode (`final_decode`). |

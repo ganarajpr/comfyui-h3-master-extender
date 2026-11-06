@@ -142,6 +142,48 @@ def _upscaler_precision(model_name, default="fp16"):
     return precision
 
 
+FLASH_ACCEL_MODE = "HyperFlow Flash (GGUF)"
+FLASH_STEPS = (4, 6, 8)
+FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
+_FLASH_CACHE = {}
+
+
+def resolve_flash_file(name, available):
+    """The extender always renders Ref2VA, so a Flash file must be the ref2va build. A fl2va pick is swapped for its
+    ref2va sibling (same quant) when that is installed, otherwise it is an error. Returns (file, note or None)."""
+    name = str(name or FLASH_DEFAULT_FILE)
+    available = list(available or [])
+    if "fl2va" in name.lower():
+        sibling = name.replace("fl2va", "ref2va").replace("FL2VA", "REF2VA")
+        if sibling in available:
+            return sibling, f"{name} is the fl2va build but the extender renders Ref2VA; using {sibling}"
+        raise ValueError(f"hyperflow_flash_file {name} is the fl2va build and the extender renders Ref2VA; "
+                         f"install {sibling} in diffusion_models and select it.")
+    if available and name not in available:
+        raise ValueError(f"hyperflow_flash_file {name} not found; available: {available}")
+    return name, None
+
+
+def check_flash_steps(steps):
+    try:
+        steps = int(steps)
+    except (TypeError, ValueError):
+        steps = 6
+    if steps not in FLASH_STEPS:
+        raise ValueError(f"hyperflow_flash_steps must be one of {list(FLASH_STEPS)}, got {steps}")
+    return steps
+
+
+def _flash_pack():
+    """The ComfyUI-HyperFlow-Flash module (loader, schedule and path helpers), found through its node class."""
+    cls = nodes.NODE_CLASS_MAPPINGS.get("HyperFlowGGUFLoader")
+    if cls is None:
+        raise RuntimeError("HyperFlow Flash (GGUF) needs the ComfyUI-HyperFlow-Flash node pack "
+                           "(HyperFlowGGUFLoader) and ComfyUI-GGUF in custom_nodes. "
+                           "git clone https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash, then restart ComfyUI.")
+    return sys.modules[cls.__module__]
+
+
 def pass_sampler_name(turbo_mode, sampler_name):
     """HyperFlow was distilled for plain Euler; only Turbo LoRA mode uses the user's sampler."""
     return sampler_name if turbo_mode else "euler"
@@ -286,11 +328,18 @@ class MasterEngine:
         sparse_dense_blocks="auto",
         sparse_sink="auto",
         pass2_sla_sparsity=0.0,
+        hyperflow_flash_file=FLASH_DEFAULT_FILE,
+        hyperflow_flash_steps=6,
     ):
         self.raw_model = model
         self.accel_mode = str(accel_mode)
         self.turbo_mode = self.accel_mode.lower().startswith("turbo")
-        self.hyperflow_mode = not self.turbo_mode
+        self.flash_mode = self.accel_mode == FLASH_ACCEL_MODE
+        self.hyperflow_mode = not self.turbo_mode and not self.flash_mode
+        self.flash_file = str(hyperflow_flash_file or FLASH_DEFAULT_FILE)
+        self.flash_steps = int(hyperflow_flash_steps or 6)
+        self.flash_model = None
+        self.flash_raw = None
         self.hyperflow_file = str(hyperflow_file)
         self.hyperflow_curve_refit = bool(hyperflow_curve_refit)
         self.hyperflow_strength = float(hyperflow_strength)
@@ -340,27 +389,21 @@ class MasterEngine:
 
         if self.turbo_mode:
             accel_desc = f"Turbo LoRA: {self.turbo_lora or 'none'} ({self.turbo_steps} steps)"
+        elif self.flash_mode:
+            accel_desc = f"HyperFlow Flash (GGUF): {self.flash_file}, {self.flash_steps} steps"
         else:
             accel_desc = f"HyperFlow 8-step: {self.hyperflow_file}"
         _LOG.info(f"Initializing Master Engine: Shift ({self.shift_video}, {self.shift_audio}), {accel_desc}")
 
         # 1. Apply SigmaShift
-        try:
-            res_shift = MiniMaxH3SigmaShift.execute(
-                self.raw_model,
-                shift_video=self.shift_video,
-                shift_audio=self.shift_audio,
-            )
-            shifted_model = res_shift[0] if hasattr(res_shift, "__getitem__") else getattr(res_shift, "result", [self.raw_model])[0]
-        except Exception as e:
-            _LOG.warning(f"Error applying MiniMaxH3SigmaShift: {e}")
-            shifted_model = self.raw_model
-
+        shifted_model = self._apply_sigma_shift(self.raw_model)
         self.shifted_model = shifted_model
 
         # 2. Acceleration: a plain turbo / lightning LoRA, or HyperFlow
         if self.turbo_mode:
             accelerated, sigmas_p1 = self._prepare_turbo_model(shifted_model)
+        elif self.flash_mode:
+            accelerated, sigmas_p1 = self._prepare_flash_base(shifted_model)
         else:
             accelerated, sigmas_p1 = self._prepare_hyperflow_model(shifted_model)
         self.accel_model = accelerated
@@ -369,6 +412,88 @@ class MasterEngine:
         self.prepared_model = accelerated
         self.pass1_sigmas = sigmas_p1
         return self.prepared_model, self.pass1_sigmas
+
+    def _apply_sigma_shift(self, model):
+        try:
+            res_shift = MiniMaxH3SigmaShift.execute(
+                model,
+                shift_video=self.shift_video,
+                shift_audio=self.shift_audio,
+            )
+            return res_shift[0] if hasattr(res_shift, "__getitem__") else getattr(res_shift, "result", [model])[0]
+        except Exception as e:
+            _LOG.warning(f"Error applying MiniMaxH3SigmaShift: {e}")
+            return model
+
+    def _prepare_flash_base(self, model):
+        """Flash mode: the base model (SigmaShift) is the pass-2 / audio-refine model; pass 1 is the Flash transformer,
+        loaded lazily by initialize_flash_model. Only its sigmas are needed here (pass-2 tails and cached clips)."""
+        self.flash_steps = check_flash_steps(self.flash_steps)
+        self.turbo_steps = "8"
+        pack = _flash_pack()
+        _LOG.info("HyperFlow Flash: pass 1 runs the Flash GGUF transformer (%s, %d steps, euler, cfg 1); the base "
+                  "model input and any LoRAs stacked on it are NOT used for pass 1, only for pass 2 / audio refine",
+                  self.flash_file, self.flash_steps)
+        if self.shift_video != 12.0:
+            _LOG.warning("HyperFlow Flash: shift_video is %.2f but the Flash schedule is built for 12.0", self.shift_video)
+        return model, pack.step_sigmas(self.flash_steps).clone().cpu()
+
+    def initialize_flash_model(self):
+        """Pass-1 model in Flash mode: the GGUF transformer from the pack's loader (cached across clips and jobs), with
+        SigmaShift, the dense attention backend and sparse attention applied like for the base model."""
+        if self.flash_model is not None:
+            return self.flash_model
+        self.initialize_model()
+        pack = _flash_pack()
+        steps = check_flash_steps(self.flash_steps)
+        try:
+            available = [n for n in pack.gguf_files() if "hyperflow_flash" in n.lower()]
+        except Exception:
+            available = []
+        name, note = resolve_flash_file(self.flash_file, available)
+        if note:
+            _LOG.warning("HyperFlow Flash: %s", note)
+        key = name
+        patcher = _FLASH_CACHE.get(key)
+        if patcher is None:
+            _FLASH_CACHE.clear()
+            _LOG.info("HyperFlow Flash: loading %s", name)
+            patcher = pack.load_hyperflow_gguf(pack.gguf_path(name), "auto")
+            _FLASH_CACHE[key] = patcher
+        else:
+            _LOG.info("HyperFlow Flash: %s already loaded, reusing", name)
+        self.flash_raw = patcher
+        dm = patcher.model.diffusion_model
+        schedule = getattr(dm, "hyperflow_sigmas", None)
+        sigmas = schedule.clone().cpu() if (steps == 6 and schedule is not None) else pack.step_sigmas(steps).clone().cpu()
+        self.pass1_sigmas = sigmas
+        if self.sla_enabled:
+            _LOG.info("HyperFlow Flash: sparse attention ON for pass 1 (%s); the Flash blocks keep the attention module "
+                      "calls (qkv_proj / out_proj are plain modules), so it runs, but it is not validated on Flash "
+                      "weights. Turn sla_enabled off for a dense reference.", self.sparse_method)
+        _LOG.info("HyperFlow Flash: grid %s, sampler euler, cfg 1; feed-forward chunking is skipped for this pass "
+                  "(it assumes the dense fused fc1/fc2)", [round(float(x), 4) for x in sigmas])
+        self.flash_model = self._finish_model(self._apply_sigma_shift(patcher))
+        return self.flash_model
+
+    def _unload_flash(self):
+        """Evict ONLY the Flash transformer from the GPU, so it and the base model are never resident together."""
+        flash = self.flash_raw
+        if flash is None:
+            return
+        mm = comfy.model_management
+        try:
+            def is_flash(lm):
+                m = getattr(lm, "model", None)
+                return m is not None and (m is flash or m.is_clone(flash))
+            keep = [lm for lm in mm.current_loaded_models if not is_flash(lm)]
+            before = mm.get_free_memory(mm.get_torch_device())
+            mm.free_memory(1e30, mm.get_torch_device(), keep_loaded=keep)
+            mm.soft_empty_cache(force=True)
+            _LOG.info("HyperFlow Flash: transformer offloaded before pass 2: free %.1f -> %.1f GB",
+                      before / 1024 ** 3, mm.get_free_memory(mm.get_torch_device()) / 1024 ** 3)
+        except Exception as exc:
+            _LOG.warning("HyperFlow Flash: could not offload the transformer explicitly (%s); pass 2's VRAM reclaim evicts it", exc)
 
     def _finish_model(self, model, sparse=True, sparsity=None):
         """Dense attention backend, then optional block-sparse attention on top
@@ -402,6 +527,8 @@ class MasterEngine:
         self.pass2_lora = lora if lora and lora != "none" else None
         self.pass2_lora_strength = float(strength)
         self.pass2_lora_mode = "replace" if str(mode).lower().startswith("replace") else "stack"
+        if self.flash_mode and self.pass2_lora_mode != "replace":
+            self.pass2_lora_mode = "replace"
         if self.hyperflow_mode and self.pass2_lora and self.pass2_lora_mode != "replace":
             _LOG.info("HyperFlow: pass-2 LoRA forces 'replace' mode (pass 2 runs on the SigmaShift model + this "
                       "LoRA, without HyperFlow, so HyperFlow never sees a non-trained sigma tail)")
@@ -419,8 +546,9 @@ class MasterEngine:
         self.dual_split_step = int(split_step)
         if not enabled:
             return
-        if self.turbo_mode:
-            _LOG.warning("Dual sampling needs HyperFlow 8-step; Turbo LoRA mode runs the normal two passes")
+        if self.turbo_mode or self.flash_mode:
+            _LOG.warning("Dual sampling needs HyperFlow 8-step; %s mode runs the normal two passes",
+                         "Flash" if self.flash_mode else "Turbo LoRA")
             return
         if self.pass2_lora:
             _LOG.warning("Dual sampling: pass 2 runs the HyperFlow grid tail without a refine LoRA; ignoring pass-2 LoRA %s",
@@ -438,8 +566,9 @@ class MasterEngine:
         steps = int(steps or 0)
         if steps <= 0:
             return
-        if self.turbo_mode:
-            _LOG.warning("pass1_steps=%d ignored: it needs HyperFlow 8-step, Turbo LoRA mode runs the full pass 1", steps)
+        if self.turbo_mode or self.flash_mode:
+            _LOG.warning("pass1_steps=%d ignored: it needs HyperFlow 8-step, %s mode runs the full pass 1", steps,
+                         "Flash" if self.flash_mode else "Turbo LoRA")
             return
         if self.dual_active:
             _LOG.warning("pass1_steps=%d ignored: dual sampling sets the pass-1 length (dual_split_step)", steps)
@@ -753,7 +882,10 @@ class MasterEngine:
                       dual_split_index(self.pass1_sigmas, self.dual_split_step), len(tail) - 1,
                       [round(float(x), 4) for x in tail])
             return tail
-        if self.hyperflow_mode and not self._pass2_lora_active():
+        if self.flash_mode and not self._pass2_lora_active():
+            _LOG.warning("HyperFlow Flash without a pass-2 LoRA: pass 2 runs the tail of the Flash grid on the plain "
+                         "base model, which has no few-step distillation. Pick a pass-2 LoRA (DMAD).")
+        if (self.hyperflow_mode or self.flash_mode) and not self._pass2_lora_active():
             tail = hyperflow_tail_sigmas(self.pass1_sigmas, pass2_denoise)
             _LOG.info("HyperFlow: pass 2 uses the tail of HyperFlow's own grid (%d steps): %s",
                       len(tail) - 1, [round(float(x), 4) for x in tail])
@@ -999,7 +1131,7 @@ class MasterEngine:
             _LOG.exception("x0 debug dump: setup failed, rendering without it")
             return None
 
-    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False):
+    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False, ff_chunk=True):
         """Standard Euler sampling using ComfyUI core sampler internals directly.
 
         NOTE: Do NOT place any bare 'import comfy' statements inside this function.
@@ -1021,7 +1153,8 @@ class MasterEngine:
         noise_obj = Noise_RandomNoise(seed)
 
         # Size the feed-forward chunking to this pass's packed token count.
-        model = self._with_ff_chunking(model, self._packed_tokens(latent_image["samples"]))
+        if ff_chunk:
+            model = self._with_ff_chunking(model, self._packed_tokens(latent_image["samples"]))
 
         # Build guider directly — bypass ComfyUI v3 node wrapper (NodeOutput issue)
         # MiniMax H3 is a pure flow model: no negative conditioning needed.
@@ -1320,6 +1453,9 @@ class MasterEngine:
         if cached:
             sampled_p1 = {"samples": cached_pass1["samples"]}
         else:
+            if self.flash_mode:
+                model = self.initialize_flash_model()
+                sigmas_p1 = self.pass1_sigmas
             # Sample Pass 1 with the pass-1 sigmas
             early_stop = self.dual_active and self.pass1_early_stop and pass2_enabled
             if (not early_stop and self.pass1_steps > 0 and not self.dual_active and pass2_enabled
@@ -1341,7 +1477,10 @@ class MasterEngine:
                 sigmas=sigmas_p1,
                 seed=seed,
                 return_denoised=early_stop,
+                ff_chunk=not self.flash_mode,
             )
+            if self.flash_mode and pass2_enabled:
+                self._unload_flash()
 
         if not pass2_enabled:
             self.last_draft = None if cached else sampled_p1

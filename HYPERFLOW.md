@@ -52,3 +52,30 @@ The disk cache does not re-render when settings change. Clear the chain (panel "
 - `merge`: the LoRA is folded into the weights once, so each step should cost about the same as the
   plain model. The node pack warns that merging into quantized (int8) weights can change numerical
   results, so A/B it before relying on it. The two small base time projections stay in bypass in both modes.
+
+# HyperFlow Flash (GGUF) mode
+
+`accel_mode = "HyperFlow Flash (GGUF)"` runs pass 1 on Video Rebirth's HyperFlow H3 Flash: a separate compressed transformer (13.9B ref2va), pruned and low-rank factored, with a two-time (t, r) embedder, shipped as GGUF. It is not a LoRA on the base model.
+
+## Requirements
+
+- Node packs in `custom_nodes`: [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) and [ComfyUI-HyperFlow-Flash](https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash). The extender finds the pack through the `HyperFlowGGUFLoader` node class and calls its `load_hyperflow_gguf`; without it the job stops with a message naming the pack.
+- Weights in `diffusion_models`: `minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf` (the extender renders Ref2VA).
+
+## What the mode does
+
+- Pass 1: the Flash transformer, euler, CFG 1, the checkpoint's own 4 / 6 / 8-step grid (`hyperflow_flash_steps`, default 6; the embedded 6-step grid is used for 6). SigmaShift is applied to it like to the base model. The running schedule reaches the two-time embedder through the stock sampler (`transformer_options["sample_sigmas"]`), because pass 1 samples with `comfy.samplers.CFGGuider`.
+- The `model` input (base `unet_name` and any LoRAs stacked on it) is **not** used for pass 1; the log says so. It is used for pass 2 and audio refine. `turbo_lora` and `pdd_nfe` are ignored.
+- Pass 2: unchanged, the refiner LoRA (DMAD) on the base in replace mode, 1 step at `pass2_denoise` 0.25 with `pass2_steps` 4. With no pass-2 LoRA the plain base would run the tail of the Flash grid; the log warns, pick DMAD.
+- Memory: the Flash model is evicted from the GPU right after pass 1 (only it; the VAEs and a background decode are left alone), so it and the base are never resident together. The loaded GGUF stays cached in RAM across clips and jobs (single entry, replaced when another file is chosen). The base is reloaded for pass 2 and Flash for the next pass 1, once per clip.
+- File choice: an `fl2va` build is swapped for the `ref2va` file of the same quant when installed, otherwise the job stops (the extender renders Ref2VA).
+
+## Features that change in this mode
+
+| Feature | In Flash mode |
+|---|---|
+| Dual sampling, `pass1_steps`, `hyperflow_file` / curve refit / strength / lora mode | Not applicable (HyperFlow 8-step features). Ignored with a warning. |
+| Feed-forward chunking (KJNodes `MiniMaxChunkFeedForward`) | Skipped for pass 1: it replaces `mlp.forward` assuming the dense fused fc1/fc2, which Flash swaps for low-rank pairs. Pass 2 on the base still uses it. |
+| Sparse attention (`sla_enabled`) | Stays on if you set it. Core's block-sparse path calls `attn.qkv_proj(x)` and `attn.out_proj(x)` as modules, so the Flash `SplitQKV` / `LowRankLinear` replacements work. Not validated on Flash weights, and the HyperFlow sol-attn auto recipe is not applied (`auto` = the defaults). Turn it off for a dense reference. |
+| Motion-context chaining, semantic bridge, audio refine | Unchanged: they act on the conditioning and on the base model, not on the pass-1 transformer. Motion context with Flash is untested. |
+| Pass-1 cache | Keyed on the Flash file and steps in addition to the usual settings; other modes' fingerprints are unchanged. |

@@ -38,6 +38,7 @@ def make(**kw):
     e = Engine()
     e.dual_active = False
     e.hyperflow_mode = False
+    e.flash_mode = False
     e.turbo_mode = True
     e.turbo_steps = 8
     e.scheduler_name = "sgm_uniform"
@@ -102,7 +103,7 @@ class NodeInputs(unittest.TestCase):
         self.assertRegex(text, r'"pass2_scheduler": \(\["same as pass 1"\] \+ list\(comfy\.samplers\.KSampler\.SCHEDULERS\), \{"default": "same as pass 1"')
         self.assertRegex(text, r'"pass2_audio": \(\["pass 2 \(refined\)", "pass 1"\], \{"default": "pass 2 \(refined\)"')
         names = re.findall(r'^\s{16}"(\w+)": \(', text[text.index("def INPUT_TYPES"):], re.M)
-        self.assertEqual(names[-3:-1], ["pass2_scheduler", "pass2_audio"])
+        self.assertEqual(names[-5:-3], ["pass2_scheduler", "pass2_audio"])
 
     def test_parse_resolution(self):
         tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
