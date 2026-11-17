@@ -146,6 +146,8 @@ FLASH_ACCEL_MODE = "HyperFlow Flash (GGUF)"
 FLASH_STEPS = (4, 6, 8)
 FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
 FLASH_FALLBACK_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
+# The Pika x Flash merge baked into one file (founder 2026-11-17: "use baked"): preferred whenever it is installed.
+FLASH_MERGE_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikamerge.safetensors"
 _FLASH_CACHE = {}
 
 
@@ -167,9 +169,9 @@ def flash_file_list(pack, scanned):
 
 
 def default_flash_file(available):
-    """The INT8 convrot ref2va build when installed, else the Q8_0 GGUF, else any ref2va build."""
+    """The baked Pika x Flash merge when installed, else the INT8 convrot ref2va build, else the Q8_0 GGUF, else any ref2va build."""
     available = list(available or [])
-    for name in (FLASH_DEFAULT_FILE, FLASH_FALLBACK_FILE):
+    for name in (FLASH_MERGE_FILE, FLASH_DEFAULT_FILE, FLASH_FALLBACK_FILE):
         if name in available:
             return name
     return next((n for n in available if "ref2va" in n.lower()), FLASH_DEFAULT_FILE)

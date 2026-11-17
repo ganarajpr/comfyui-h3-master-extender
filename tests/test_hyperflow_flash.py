@@ -18,7 +18,7 @@ INT8_FL = "minimax_h3_fl2va_hyperflow_flash_14b-int8_convrot.safetensors"
 def _engine_ns():
     tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
     wanted = [n for n in tree.body
-              if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("FLASH_ACCEL_MODE", "FLASH_STEPS", "FLASH_DEFAULT_FILE", "FLASH_FALLBACK_FILE")
+              if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("FLASH_ACCEL_MODE", "FLASH_STEPS", "FLASH_DEFAULT_FILE", "FLASH_FALLBACK_FILE", "FLASH_MERGE_FILE")
                                                     for t in n.targets))
               or (isinstance(n, ast.FunctionDef) and n.name in ("resolve_flash_file", "check_flash_steps", "flash_file_list", "default_flash_file",
                                                                "check_flash_file_supported", "load_flash_model", "hyperflow_tail_sigmas",
@@ -123,6 +123,14 @@ class FlashKinds(unittest.TestCase):
         self.assertEqual(d([]), INT8)
         self.assertEqual(NS["resolve_flash_file"]("", [REF, INT8])[0], INT8)
         self.assertEqual(NS["resolve_flash_file"](None, [REF])[0], REF)
+
+    def test_default_prefers_the_baked_merge_when_installed(self):
+        d, merge = NS["default_flash_file"], NS["FLASH_MERGE_FILE"]
+        self.assertIn("pikamerge", merge)
+        self.assertEqual(d([REF, INT8, merge]), merge)
+        self.assertEqual(d([REF, INT8]), INT8)
+        self.assertEqual(NS["resolve_flash_file"]("", [INT8, merge])[0], merge)
+        self.assertEqual(NS["resolve_flash_file"](INT8, [INT8, merge])[0], INT8)  # an explicit pick is kept
 
     def test_int8_fl2va_is_swapped_for_the_int8_ref2va_sibling(self):
         name, note = NS["resolve_flash_file"](INT8_FL, [INT8, INT8_FL, REF])
