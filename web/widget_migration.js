@@ -126,8 +126,10 @@ export function pass2AudioValue(value) {
     return value === "pass 1" ? "pass 1" : PASS2_AUDIO_DEFAULT;
 }
 // hyperflow_flash_file and hyperflow_flash_steps are the last widgets (after pass2_audio): a workflow saved before them has
-// master_ui's "" in the file slot. "" / unknown file = the INT8 ref2va build, else the Q8_0 GGUF, else the first installed option; steps outside 4 / 6 / 8 = 6.
+// master_ui's "" in the file slot. "" / unknown file = the baked Pika x Flash merge, else the INT8 ref2va build, else the Q8_0 GGUF,
+// else the first installed option; steps outside 4 / 6 / 8 = 6.
 export const FLASH_FILE_PREFERENCE = [
+    "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikamerge.safetensors",
     "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors",
     "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf",
 ];

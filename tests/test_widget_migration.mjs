@@ -125,6 +125,9 @@ assert.equal(flashFileValue(flashFiles[1], flashFiles), flashFiles[1]);
 const flashMixed = ["minimax_h3_fl2va_hyperflow_flash_14b-Q8_0.gguf", "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf", "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"];
 assert.equal(flashFileValue("", flashMixed), flashMixed[2]);
 assert.equal(flashFileValue("", flashMixed.slice(0, 2)), flashMixed[1]);
+const flashWithMerge = [...flashMixed, "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikamerge.safetensors"];
+assert.equal(flashFileValue("", flashWithMerge), flashWithMerge[3]);
+assert.equal(flashFileValue(flashMixed[2], flashWithMerge), flashMixed[2]);
 console.log("widget migration ok");
 
 // run_mode gained prompts_only (last option, default unchanged) and clips_in was appended as the last input: a socket, so no widget value moves
