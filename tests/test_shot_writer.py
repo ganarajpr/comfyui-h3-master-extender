@@ -783,7 +783,7 @@ class ImportTests(unittest.TestCase):
         self.assertIn("_send_plan(owner, clips, range(len(clips)))", block)
         self.assertIn("clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)", block)
         self.assertLess(block.index("shot_writer.import_clips"), block.index("raise ValueError"))   # an empty list is only an error when nothing was imported
-        self.assertLess(text.index("clips_in=None,"), text.index("**kwargs,\n    ):\n        accel_mode"))
+        self.assertLess(text.index("clips_in=None,"), text.index("**kwargs,\n    ):\n        legacy_mode"))
 
 
 class PromptsOnlyTests(unittest.TestCase):

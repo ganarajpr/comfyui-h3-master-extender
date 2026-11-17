@@ -1136,46 +1136,6 @@
           "shape": 7
         },
         {
-          "localized_name": "hyperflow_file",
-          "name": "hyperflow_file",
-          "type": "COMBO",
-          "widget": {
-            "name": "hyperflow_file"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
-          "localized_name": "hyperflow_curve_refit",
-          "name": "hyperflow_curve_refit",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "hyperflow_curve_refit"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
-          "localized_name": "hyperflow_strength",
-          "name": "hyperflow_strength",
-          "type": "FLOAT",
-          "widget": {
-            "name": "hyperflow_strength"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
-          "localized_name": "hyperflow_lora_mode",
-          "name": "hyperflow_lora_mode",
-          "type": "COMBO",
-          "widget": {
-            "name": "hyperflow_lora_mode"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
           "localized_name": "audio_refine_steps",
           "name": "audio_refine_steps",
           "type": "INT",
@@ -1423,10 +1383,6 @@
         3,
         "",
         "raw asks",
-        "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors",
-        true,
-        1.0,
-        "bypass",
         0,
         0.5,
         true,

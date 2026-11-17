@@ -21,8 +21,7 @@ def _engine_ns():
               if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("FLASH_ACCEL_MODE", "FLASH_STEPS", "FLASH_DEFAULT_FILE", "FLASH_FALLBACK_FILE")
                                                     for t in n.targets))
               or (isinstance(n, ast.FunctionDef) and n.name in ("resolve_flash_file", "check_flash_steps", "flash_file_list", "default_flash_file",
-                                                               "check_flash_file_supported", "load_flash_model", "hyperflow_tail_sigmas",
-                                                               "dual_split_index", "dual_pass1_sigmas", "dual_pass2_sigmas"))]
+                                                               "check_flash_file_supported", "load_flash_model", "hyperflow_tail_sigmas"))]
     ns = {}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(ENGINE), "exec"), ns)
     return ns
@@ -41,22 +40,17 @@ def _engine_cls(*names):
     return ns["Engine"]
 
 
-Engine = _engine_cls("configure_dual_sampling", "configure_pass1_steps", "configure_pass2_lora", "_pass2_sigmas", "_pass2_lora_active")
+Engine = _engine_cls("configure_pass2_lora", "_pass2_sigmas", "_pass2_lora_active")
 
 
 def flash_engine(lora=None):
     e = Engine()
-    e.turbo_mode, e.flash_mode, e.hyperflow_mode = False, True, False
-    e.hyperflow_pruned_refit = False
+    e.turbo_mode, e.flash_mode = False, True
     e.pass2_lora = lora
     e.pass2_model = None
     e.pass2_steps = 4
     e.turbo_steps = "8"
     e.pass1_sigmas = list(GRID)
-    e.dual_active = False
-    e.dual_split_step = 2
-    e.pass1_early_stop = False
-    e.pass1_steps = 0
     return e
 
 
@@ -151,14 +145,6 @@ class FlashKinds(unittest.TestCase):
 
 
 class FlashEngine(unittest.TestCase):
-    def test_dual_sampling_and_pass1_steps_are_ignored(self):
-        e = flash_engine()
-        e.configure_dual_sampling(True, 2, True)
-        self.assertFalse(e.dual_active)
-        self.assertFalse(e.pass1_early_stop)
-        e.configure_pass1_steps(4)
-        self.assertEqual(e.pass1_steps, 0)
-
     def test_pass2_lora_is_forced_to_replace(self):
         e = flash_engine()
         e.configure_pass2_lora("dmad.safetensors", 1.0, "stack on engine LoRA", 4)
@@ -180,13 +166,13 @@ class FlashEngine(unittest.TestCase):
 class NodeWiring(unittest.TestCase):
     text = NODE.read_text(encoding="utf-8")
 
-    def test_mode_is_appended_last_and_default_is_unchanged(self):
+    def test_flash_is_a_mode_beside_turbo_and_the_default_is_turbo(self):
         tree = ast.parse(self.text)
         modes = next(ast.literal_eval(n.value) for n in tree.body
                      if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
         self.assertEqual(modes[-1], MODE)
-        self.assertEqual(modes[:3], ["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step · dual sampling"])
-        self.assertRegex(self.text, r'DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES\[2\]')
+        self.assertEqual(modes, ["Turbo LoRA", MODE])
+        self.assertRegex(self.text, r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
 
     def test_new_inputs_are_last_before_the_clips_in_socket(self):
         import re
@@ -203,9 +189,6 @@ class NodeWiring(unittest.TestCase):
         literal = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict)
                        and any(getattr(t, "id", "") == "p1_settings" for t in n.targets))
         self.assertNotIn("flash", [k.value for k in literal.value.keys])
-
-    def test_dual_sampling_is_off_in_flash_mode(self):
-        self.assertIn("accel_mode != FLASH_ACCEL_MODE", self.text)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """
 MiniMax H3 Master Extender Node
 ===============================
-Interactive Master multishot node combining the Pure 2-Stage 2-Pass HyperFlow 8-step
+Interactive Master multishot node combining the Pure 2-Stage 2-Pass Turbo LoRA / HyperFlow Flash
 / Turbo LoRA + 3D Latent Upscaler Engine with multishot continuity, per-clip controls,
 and clip-by-clip validation.
 """
@@ -56,8 +56,6 @@ from .pdd_pure_engine import (
     MasterEngine,
     parse_resolution,
     duration_to_h3_frames,
-    with_dual_p1_settings,
-    with_pass1_steps_p1_settings,
     FLASH_ACCEL_MODE,
     FLASH_DEFAULT_FILE,
     FLASH_STEPS,
@@ -330,43 +328,43 @@ def _semantic_bridge_adapters():
     return [n for n in names if n.lower().endswith(".safetensors") and not n.startswith("NO_ADAPTER_FOUND")]
 
 PASS2_LORA_DEFAULT = "h3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors"
-HYPERFLOW_DEFAULT_FILE = "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors"
+LEGACY_HYPERFLOW_FINGERPRINT = ["custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors", True, 1.0, "bypass"]
+PIKA_LORA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors"
+
+# Options are restored by name, so new ones are only ever appended. The HyperFlow 8-step options (plain and
+# dual sampling) were removed on 2026-11-17: they still load, and run as the Pika + DMAD recipe.
+ACCEL_MODES = ["Turbo LoRA", "HyperFlow Flash (GGUF)"]
 
 
-# Options are restored by name, so new ones are only ever appended.
-ACCEL_MODES = ["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling",
-               "HyperFlow Flash (GGUF)"]
-DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES[2]
+def is_legacy_accel_mode(accel_mode):
+    """PDD 8-step (removed earlier) and both HyperFlow 8-step options (removed 2026-11-17)."""
+    text = str(accel_mode).lower()
+    return text.startswith("pdd") or text.startswith("hyperflow 8-step")
 
 
 def normalize_accel_mode(accel_mode):
-    """Workflows saved before PDD mode was removed still send "PDD 8-step"."""
-    if str(accel_mode).lower().startswith("pdd"):
-        _LOG.warning("accel_mode %r was removed; running HyperFlow 8-step instead", accel_mode)
-        return "HyperFlow 8-step"
+    """Workflows saved before HyperFlow 8-step / PDD mode was removed still send those names: they run Turbo LoRA."""
+    if is_legacy_accel_mode(accel_mode):
+        _LOG.warning("accel_mode %r was removed; running the Pika + DMAD recipe (Turbo LoRA) instead", accel_mode)
+        return ACCEL_MODES[0]
     return accel_mode
 
 
-def resolve_accel_mode(accel_mode, pass2_chunk_frames=124):
-    """Split the engine combo into (engine mode, force dual sampling, pass-2 chunk frames).
-
-    "HyperFlow 8-step . dual sampling" is plain HyperFlow with dual sampling forced on and pass 2 over the whole
-    clip (chunk 0, no window seams). It resolves to "HyperFlow 8-step" so pass-1 fingerprints and every engine
-    check see the same mode as before; every other value passes through untouched."""
-    accel_mode = normalize_accel_mode(accel_mode)
-    if accel_mode == DUAL_SAMPLING_ACCEL_MODE:
-        return "HyperFlow 8-step", True, 0
-    return accel_mode, False, pass2_chunk_frames
-
-
-def _hyperflow_files():
-    """Converted HyperFlow builds in models/hyperflow (registered by the ComfyUI-HyperFlow-H3 pack)."""
-    try:
-        names = [n for n in folder_paths.get_filename_list("hyperflow")
-                 if not n.replace("\\", "/").startswith("curve_fits/")]
-    except Exception:
-        names = []
-    return names or [HYPERFLOW_DEFAULT_FILE]
+def migrate_legacy_accel(accel_mode, settings):
+    """Map a removed engine mode to Pika + DMAD. `settings` holds pdd_nfe, turbo_lora, turbo_lora_strength,
+    turbo_sampler, turbo_scheduler, pass2_lora, pass2_lora_strength, pass2_lora_mode and pass2_steps.
+    Only what the old workflow left unset ("none" LoRA, 0 steps) is filled; a LoRA the workflow set itself keeps
+    its own steps, sampler and scheduler. Returns (accel_mode, settings copy); other modes pass through untouched."""
+    if not is_legacy_accel_mode(accel_mode):
+        return accel_mode, settings
+    out = dict(settings)
+    if str(out.get("turbo_lora") or "none") == "none":
+        out.update(turbo_lora=PIKA_LORA, turbo_lora_strength=1.0, pdd_nfe="6", turbo_sampler="euler", turbo_scheduler="simple")
+    if str(out.get("pass2_lora") or "none") == "none":
+        out.update(pass2_lora=PASS2_LORA_DEFAULT, pass2_lora_strength=1.0, pass2_lora_mode="replace engine LoRA")
+        if not int(out.get("pass2_steps") or 0):
+            out["pass2_steps"] = 4
+    return normalize_accel_mode(accel_mode), out
 
 
 def _flash_files():
@@ -421,7 +419,7 @@ class MiniMaxH3MasterExtender:
                     {"default": "1344x768 (16:9)", "tooltip": "Stage 2 (Pass 2) target resolution. 1920x1088 is 1080p on H3's 32-px grid; it needs ~2x the VRAM of 1344x768, so keep clips shorter (~5-8 s) at 1080p on a 32 GB card. 'off (pass 1 only)' skips pass 2 and decodes the pass-1 result at the pass-1 size (2x with the X2 final decode). Pass-1 results stay cached, so switching pass 2 back on later only runs pass 2."},
                 ),
                 "pass2_denoise": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 1.0, "step": 0.01, "tooltip": "Quality tail refinement denoise factor (trained at 0.25)"}),
-                "pdd_nfe": (["8", "4", "6", "5", "10", "12", "16", "20"], {"default": "8", "tooltip": "Turbo LoRA steps: the turbo step count (e.g. 4-6 for a 4-step LoRA, 8 for an 8-step one). HyperFlow 8-step ignores it."}),
+                "pdd_nfe": (["8", "4", "6", "5", "10", "12", "16", "20"], {"default": "6", "tooltip": "Turbo LoRA steps: the turbo step count (6 for the Pika LoRA, 4 for a 4-step LoRA, 8 for an 8-step one). HyperFlow Flash uses its own steps."}),
                 "context_length": (["22", "5", "39", "56"], {"default": "22", "tooltip": "Number of video motion context frames passed to subsequent clips"}),
                 "audio_context_length": ("INT", {"default": 0, "min": 0, "max": 240, "step": 1, "tooltip": "Audio context frames (0 = auto-match video context)"}),
                 "identity_continuity": ("BOOLEAN", {"default": True, "tooltip": "Use an empty picture slot for the previous clip's last frame. With all nine pictures attached, motion continuity still applies but no extra guide is inserted."}),
@@ -447,13 +445,13 @@ class MiniMaxH3MasterExtender:
                 "pass2_chunk_frames": ("INT", {"default": 124, "min": 0, "max": 3600, "step": 1, "tooltip": "Refine pass 2 in overlapping temporal windows of this many frames (snapped to H3's 17k+5 grid) via MMH3SplitUpscale, so long/HD clips never outgrow VRAM. 124 = 5 s windows. 0 = refine the whole clip in one pass (original behaviour). Clips at or below the window size are unaffected."}),
                 "pass2_chunk_overlap": ("INT", {"default": 22, "min": 0, "max": 240, "step": 1, "tooltip": "Overlap between pass-2 windows, in frames."}),
                 "async_decode": (["off", "auto", "on"], {"default": "off", "tooltip": "EXPERIMENTAL, full_batch only: decode/cache the finished clip in a background thread while the next clip encodes and drafts; the identity guide frame is taken from the latent tail so the next clip never waits. Not available with dynamic VRAM (comfy-aimdo cannot stream weights from two threads) and unsafe if the decode triggers model eviction, so it defaults to off. auto = on only when the decode is small enough to sit beside the resident UNet."}),
-                "sparse_method": (["sla", "sol-attn", "vsa"], {"default": "sla", "tooltip": "Selection method for core BlockSparseAttention when sla_enabled is on. sla: keep a fixed top-k percent of key blocks (1 - sla_sparsity). sol-attn: training-free adaptive threshold per head/query block (tau), the choice for models without an SLA-distilled LoRA such as HyperFlow. vsa: FastVideo cube attention, only with FastH3-VSA weights."}),
+                "sparse_method": (["sla", "sol-attn", "vsa"], {"default": "sla", "tooltip": "Selection method for core BlockSparseAttention when sla_enabled is on. sla: keep a fixed top-k percent of key blocks (1 - sla_sparsity). sol-attn: training-free adaptive threshold per head/query block (tau). vsa: FastVideo cube attention, only with FastH3-VSA weights."}),
                 "sparse_tau": ("FLOAT", {"default": 1.3, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "sol-attn threshold in score sigmas. Higher = sparser: 1.0 keeps ~16% of key blocks, 1.5 ~7%, 2.0 ~2.7%."}),
-                # --- Acceleration: HyperFlow 8-step (default) or any turbo / lightning LoRA ---
-                "accel_mode": (ACCEL_MODES, {"default": "HyperFlow 8-step", "tooltip": "HyperFlow 8-step: Video Rebirth's 8-step LoRA + two-time conditioning (needs ComfyUI-HyperFlow-H3); always its own trained 8-step grid with Euler, 'steps' is ignored. Turbo LoRA: a plain step-distilled LoRA (turbo / lightning / lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count."}),
-                "turbo_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "Turbo LoRA file (models/loras). Used only in Turbo LoRA mode."}),
+                # --- Acceleration: Turbo LoRA (default: Pika) or HyperFlow Flash ---
+                "accel_mode": (ACCEL_MODES, {"default": "Turbo LoRA", "tooltip": "Turbo LoRA (default): a plain step-distilled LoRA (Pika, turbo, lightning, lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count. HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (needs ComfyUI-HyperFlow-Flash). The HyperFlow 8-step options were removed 2026-11-17; saved workflows with them run Pika + DMAD."}),
+                "turbo_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": PIKA_LORA if PIKA_LORA in folder_paths.get_filename_list("loras") else "none", "tooltip": "Turbo LoRA file (models/loras). Used only in Turbo LoRA mode. Default: the Pika H3 flex ref2va LoRA."}),
                 "turbo_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "Turbo LoRA strength."}),
-                "turbo_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "res_multistep", "tooltip": "Sampler for Turbo LoRA mode (HyperFlow mode always uses euler)."}),
+                "turbo_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "Sampler for Turbo LoRA mode (HyperFlow Flash always uses euler)."}),
                 "turbo_scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple", "tooltip": "Scheduler for Turbo LoRA mode. Pass 2 runs the last round(steps x pass2_denoise) steps of this schedule."}),
                 # --- Refine pass (pass 2) LoRA: a different LoRA for the high-res tail ---
                 "pass2_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": PASS2_LORA_DEFAULT if PASS2_LORA_DEFAULT in folder_paths.get_filename_list("loras") else "none", "tooltip": "LoRA applied only on the pass-2 refine tail. 'none' keeps the pass-1 model."}),
@@ -496,13 +494,8 @@ class MiniMaxH3MasterExtender:
                 "ref_audio_2": ("AUDIO", {"tooltip": "Standalone reference audio 2."}),
                 "ref_audio_3": ("AUDIO", {"tooltip": "Standalone reference audio 3."}),
                 "rewrite_previous_clips": (prompt_rewriter.CONTINUITY, {"default": "raw asks", "tooltip": "What the writer is told about the earlier clips when it writes clip N: 'raw asks' puts clips 1..N-1 as you typed them into the task message (previous_clips), so clip N continues where N-1 ends; clips can be written in parallel. 'final prompts' gives the writer the FULL final (rewritten) prompt of clip N-1 plus the raw asks of clips 1..N-2 as short memory, so clip N continues from what N-1 actually became; clips are then written one after another, and clip N is rewritten again when N-1's final prompt changes (re-rewritten or hand-edited). Editing an earlier clip's ask re-invalidates the later clips in both modes. off = no earlier clips shown."}),
-                # --- HyperFlow 8-step (appended last so saved workflows keep their widget order) ---
-                "hyperflow_file": (_hyperflow_files(), {"default": HYPERFLOW_DEFAULT_FILE, "tooltip": "Converted HyperFlow build (models/hyperflow), used only in HyperFlow 8-step mode. Full MiniMax-H3 bases need the file without '_pruned'; pruned bases (e.g. Singularity) need the '_pruned' build."}),
-                "hyperflow_curve_refit": ("BOOLEAN", {"default": True, "tooltip": "HyperFlow 8-step on a pruned base: restore most of the two-time (t, r) conditioning with the bundled curve fit for that exact checkpoint (Singularity ref2va pruned v1.3 is covered). Off = LoRA-only. Ignored on a full base."}),
-                "hyperflow_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "HyperFlow adapter strength. 1.0 is the released model; the curve refit needs 1.0."}),
-                "hyperflow_lora_mode": (["bypass", "merge"], {"default": "bypass", "tooltip": "HyperFlow LoRA application. bypass (default): computed on top of the model at every step, the reference behaviour. merge: folded into the weights once, so each step costs about the same as the plain model (faster), but merging into quantized (int8) weights can change numerical results. The two small base time projections stay in bypass either way."}),
                 # --- Audio-only refine (ComfyUI-H3-AudioRefine, optional dependency; appended last) ---
-                "audio_refine_steps": ("INT", {"default": 0, "min": 0, "max": 50, "step": 1, "tooltip": "Extra denoising steps on the AUDIO only, run on the finished clip after pass 2 with the video frozen (needs the ComfyUI-H3-AudioRefine pack). Runs on the undistilled base model, without the acceleration LoRA / HyperFlow, so it recovers the audio quality a few-step pass loses. 0 = off. 4-6 typical. The refined audio also feeds the next clip's audio context."}),
+                "audio_refine_steps": ("INT", {"default": 0, "min": 0, "max": 50, "step": 1, "tooltip": "Extra denoising steps on the AUDIO only, run on the finished clip after pass 2 with the video frozen (needs the ComfyUI-H3-AudioRefine pack). Runs on the undistilled base model, without the acceleration LoRA / Flash, so it recovers the audio quality a few-step pass loses. 0 = off. 4-6 typical. The refined audio also feeds the next clip's audio context."}),
                 "audio_refine_denoise": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 1.0, "step": 0.01, "tooltip": "How far the audio is re-noised before refining. 0.3-0.6 keeps the pass-2 audio and cleans it up; 1.0 regenerates it against the finished video."}),
                 "audio_refine_cache": ("BOOLEAN", {"default": True, "tooltip": "Use the pack's H3 Frozen Video Cache (hidden / int4, RAM or VRAM, freed after each clip): the first refine step builds it, later steps are ~5x cheaper. Costs about 1 GB of RAM per clip-second at 720p-1344p. Off = exact but every step costs a full model pass."}),
                 # --- One text-encoder pass per clip (appended last) ---
@@ -520,18 +513,13 @@ class MiniMaxH3MasterExtender:
                 "e4_score": (prompt_rewriter.E4_SCORES, {"default": "off", "tooltip": "story_engine=e4. off: non_diegetic_music is N/A in every clip and music-like words (hum, drone, resonance...) are swept out of the sound design. on: the film bible writes one instrumental score that every clip carries."}),
                 "e4_decision_budget": (prompt_rewriter.E4_DECISION_BUDGETS, {"default": "off", "tooltip": "story_engine=e4.10: thinking of each per-clip decision call (who is on screen, staging, the picture binding). off (default): no thinking (measured on 1,937 decision questions: 0.6 points below thinking 2048, not significant, and about 4.7 times faster); or 1024 / 2048 / 4096 thinking tokens at most (1024 measured worse than both). The planner, the film bible and the writer always think up to 4096."}),
                 "e4_picture_notes": ("STRING", {"default": "", "multiline": True, "tooltip": "story_engine=e4.10, optional. One line per connected picture: '2: the old tailor in a grey kurta'. With a model that sees, the lines are a hint beside the picture; with a model that cannot see, they are all it has to bind a picture to a character, prop or location (without them every entity is described in words only)."}),
-                # --- Core BlockSparseAttention recipe (appended last; 'auto' = HyperFlow's recipe with HyperFlow + sol-attn, else the old fixed values) ---
-                "sparse_start_percent": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of the schedule that stays dense before sparse attention starts. -1 = auto: 0.16 with HyperFlow 8-step + sol-attn (HyperFlow's validated recipe), otherwise 0.20 (the long-standing value). Any value 0-1 overrides."}),
-                "sparse_dense_blocks": ("STRING", {"default": "auto", "multiline": False, "tooltip": "Transformer blocks that stay dense, e.g. 0,1. auto = 0,1 with HyperFlow 8-step + sol-attn (HyperFlow's recipe), otherwise none. Empty = no dense blocks; any list overrides."}),
-                "sparse_sink": (["auto", "exact_kv_and_rows", "exact_kv", "off"], {"default": "auto", "tooltip": "Sink conditioning of core BlockSparseAttention. auto = off with HyperFlow 8-step + sol-attn (HyperFlow's recipe), otherwise exact_kv_and_rows (the long-standing value). Any other choice overrides."}),
-                # --- HyperFlow dual sampling (appended last; all off by default) ---
-                "dual_sampling": ("BOOLEAN", {"default": False, "tooltip": "HyperFlow 8-step only. Pass 2 becomes the tail of HyperFlow's trained 8-step grid starting at dual_split_step (2 -> 6 steps from sigma 0.9843): the image is generated at the pass-2 size and pass 1 only sets the layout. No pass-2 LoRA is used (pass2_lora is ignored) and pass2_denoise is ignored. Pair it with a small pass 1 (1056x608) and a larger pass 2 (1344x768). Off = the normal refine pass. Ignored in Turbo LoRA mode."}),
-                "dual_split_step": ("INT", {"default": 2, "min": 1, "max": 7, "step": 1, "tooltip": "Dual sampling: the grid index where pass 2 takes over, so pass 2 runs 8 minus this many steps (2 -> 6 steps, 6 -> 2 steps). Higher = pass 2 changes less of pass 1's image."}),
-                "pass1_early_stop": ("BOOLEAN", {"default": False, "tooltip": "EXPERIMENTAL, dual sampling only. Pass 1 runs only the first dual_split_step steps instead of all 8; its clean estimate is upscaled and pass 2 re-noises it to the split sigma and continues. Saves most of pass 1, but the 3D latent upscaler was trained on clean latents, so quality is not validated. Off keeps the full 8-step pass 1."}),
-                "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
+                # --- Core BlockSparseAttention recipe (appended last; 'auto' = the long-standing fixed values) ---
+                "sparse_start_percent": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Fraction of the schedule that stays dense before sparse attention starts. -1 = auto: 0.20 (the long-standing value). Any value 0-1 overrides."}),
+                "sparse_dense_blocks": ("STRING", {"default": "auto", "multiline": False, "tooltip": "Transformer blocks that stay dense, e.g. 0,1. auto = none. Empty = no dense blocks; any list overrides."}),
+                "sparse_sink": (["auto", "exact_kv_and_rows", "exact_kv", "off"], {"default": "auto", "tooltip": "Sink conditioning of core BlockSparseAttention. auto = exact_kv_and_rows (the long-standing value). Any other choice overrides."}),
                 "pass2_chunk_when": (["above 720p", "always"], {"default": "above 720p", "tooltip": "When pass 2 is refined in temporal windows (pass2_chunk_frames). above 720p = only when the pass-2 short side is over 800 px (1080p-class); 720p-class output refines the whole clip in one pass, which is faster with sparse attention because the window overlaps are not recomputed. always = window whenever the clip is longer than pass2_chunk_frames. pass2_chunk_frames 0 = never window."}),
                 "pass2_sla_sparsity": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01, "tooltip": "Pass-2-only sparsity for the sla / vsa methods when sla_enabled is on. 0 = same as sla_sparsity (the long-standing behaviour). Otherwise 0.5-0.99 (0.95 = keep 5% of key blocks in pass 2) while pass 1 keeps sla_sparsity. Ignored by sol-attn."}),
-                "pass2_scheduler": (["same as pass 1"] + list(comfy.samplers.KSampler.SCHEDULERS), {"default": "same as pass 1", "tooltip": "Scheduler for pass 2's tail sigmas (BasicScheduler over round(steps x pass2_denoise) steps at pass2_denoise). 'same as pass 1' = turbo_scheduler (the long-standing behaviour). Applies in Turbo LoRA mode and with a pass-2 LoRA; HyperFlow's own tail ignores it."}),
+                "pass2_scheduler": (["same as pass 1"] + list(comfy.samplers.KSampler.SCHEDULERS), {"default": "same as pass 1", "tooltip": "Scheduler for pass 2's tail sigmas (BasicScheduler over round(steps x pass2_denoise) steps at pass2_denoise). 'same as pass 1' = turbo_scheduler (the long-standing behaviour). Applies in Turbo LoRA mode and with a pass-2 LoRA; Flash's own grid tail ignores it."}),
                 "pass2_audio": (["pass 2 (refined)", "pass 1"], {"default": "pass 2 (refined)", "tooltip": "Which audio the clip keeps. 'pass 2 (refined)' = the audio pass 2 re-sampled (the long-standing behaviour). 'pass 1' = the pass-1 audio latent is swapped back in after pass 2, so only the video comes from pass 2 (the '10Eros-Max' sample workflow's 'Use first pass audio')."}),
                 # --- HyperFlow Flash (GGUF) (appended last so saved workflows keep their widget order) ---
                 "hyperflow_flash_file": (_flash_files(), {"default": default_flash_file(_flash_files()), "tooltip": "HyperFlow Flash (GGUF) mode only: the Flash transformer for pass 1: a GGUF build (needs ComfyUI-GGUF) or an INT8 convrot .safetensors build (needs ComfyUI-HyperFlow-Flash >= 1.1.0), from diffusion_models. The default is the INT8 ref2va build when installed, else the Q8_0 GGUF. The extender renders Ref2VA, so pick a ref2va build; an fl2va pick is swapped for its ref2va sibling when installed, otherwise the job stops. The base model input is used for pass 2 only in this mode."}),
@@ -553,11 +541,13 @@ class MiniMaxH3MasterExtender:
     OUTPUT_NODE = False
 
     @classmethod
-    def VALIDATE_INPUTS(cls, hyperflow_file=None, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
+    def VALIDATE_INPUTS(cls, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
                         hyperflow_flash_file=None, hyperflow_flash_steps=None):
-        # accel_mode: API graphs saved before PDD mode was removed still send "PDD 8-step"; normalize_accel_mode maps
-        # it to HyperFlow at run time. Naming it here skips core's combo check, so anything else unknown is rejected.
-        if accel_mode is not None and accel_mode not in ACCEL_MODES and not str(accel_mode).lower().startswith("pdd"):
+        # accel_mode: API graphs saved before PDD / HyperFlow 8-step were removed still send those names;
+        # migrate_legacy_accel maps them to Pika + DMAD at run time. Naming it here skips core's combo check, so
+        # anything else unknown is rejected. The retired hyperflow_* / dual sampling keys are not inputs any more
+        # and core's validation ignores them.
+        if accel_mode is not None and accel_mode not in ACCEL_MODES and not is_legacy_accel_mode(accel_mode):
             return f"accel_mode: '{accel_mode}' not in {ACCEL_MODES}"
         # semantic_bridge: a retired adapter (V1) is accepted and mapped to its replacement at run time. Naming the
         # input here skips core's combo check, so an unknown adapter is rejected below instead.
@@ -573,13 +563,6 @@ class MiniMaxH3MasterExtender:
                 return f"hyperflow_flash_file: '{hyperflow_flash_file}' not in {_flash_files()}"
             if isinstance(hyperflow_flash_steps, (int, float)) and int(hyperflow_flash_steps) not in FLASH_STEPS:
                 return f"hyperflow_flash_steps: {hyperflow_flash_steps!r} not in {list(FLASH_STEPS)}"
-        # Workflows saved before HyperFlow existed can load with hyperflow_file == "";
-        # treat that as "use the default" instead of failing the combo check.
-        if not hyperflow_file:
-            return True
-        files = _hyperflow_files()
-        if hyperflow_file not in files:
-            return f"hyperflow_file: '{hyperflow_file}' not in {files}"
         return True
 
     @classmethod
@@ -613,12 +596,12 @@ class MiniMaxH3MasterExtender:
         unique_id=None,
         prompt=None,
         extra_pnginfo=None,
-        pdd_nfe="8",
+        pdd_nfe="6",
         attention_backend="comfy kitchen attention",
-        accel_mode="HyperFlow 8-step",
-        turbo_lora="none",
+        accel_mode="Turbo LoRA",
+        turbo_lora=PIKA_LORA,
         turbo_lora_strength=1.0,
-        turbo_sampler="res_multistep",
+        turbo_sampler="euler",
         turbo_scheduler="simple",
         sla_enabled=False,
         sla_sparsity=0.9,
@@ -634,7 +617,21 @@ class MiniMaxH3MasterExtender:
         clips_in=None,
         **kwargs,
     ):
-        accel_mode, dual_mode, pass2_chunk_frames = resolve_accel_mode(accel_mode, pass2_chunk_frames)
+        legacy_mode = is_legacy_accel_mode(accel_mode)
+        accel_mode, migrated = migrate_legacy_accel(accel_mode, {
+            "pdd_nfe": pdd_nfe, "turbo_lora": turbo_lora, "turbo_lora_strength": turbo_lora_strength,
+            "turbo_sampler": turbo_sampler, "turbo_scheduler": turbo_scheduler,
+            "pass2_lora": kwargs.get("pass2_lora", "none"), "pass2_lora_strength": kwargs.get("pass2_lora_strength", 1.0),
+            "pass2_lora_mode": kwargs.get("pass2_lora_mode", "replace engine LoRA"), "pass2_steps": kwargs.get("pass2_steps", 4)})
+        if legacy_mode:
+            pdd_nfe, turbo_lora, turbo_lora_strength = migrated["pdd_nfe"], migrated["turbo_lora"], migrated["turbo_lora_strength"]
+            turbo_sampler, turbo_scheduler = migrated["turbo_sampler"], migrated["turbo_scheduler"]
+            kwargs.update({k: migrated[k] for k in ("pass2_lora", "pass2_lora_strength", "pass2_lora_mode", "pass2_steps")})
+            for key in ("hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength", "hyperflow_lora_mode",
+                        "dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps"):
+                kwargs.pop(key, None)
+            _LOG.info("Saved HyperFlow 8-step settings migrated: Turbo LoRA %s (%s steps, %s / %s), pass 2 %s (%s steps)",
+                      turbo_lora, pdd_nfe, turbo_sampler, turbo_scheduler, kwargs["pass2_lora"], kwargs["pass2_steps"])
         flash_file, flash_steps = FLASH_DEFAULT_FILE, 6
         if accel_mode == FLASH_ACCEL_MODE:
             flash_steps = check_flash_steps(kwargs.get("hyperflow_flash_steps") or 6)
@@ -646,8 +643,6 @@ class MiniMaxH3MasterExtender:
             flash_file, flash_note = resolve_flash_file(kwargs.get("hyperflow_flash_file"), _flash_files())
             if flash_note:
                 _LOG.warning("HyperFlow Flash: %s", flash_note)
-            if dual_mode or kwargs.get("dual_sampling") or kwargs.get("pass1_steps"):
-                _LOG.warning("HyperFlow Flash: dual sampling and pass1_steps are HyperFlow 8-step features and are ignored")
         owner = str(unique_id if unique_id is not None else "master_extender")
         export_profile = None
         for config in (prompt or {}).values():
@@ -913,10 +908,6 @@ class MiniMaxH3MasterExtender:
             sparse_dense_blocks=sparse_dense_blocks,
             sparse_sink=sparse_sink,
             pass2_sla_sparsity=pass2_sla_sparsity,
-            hyperflow_file=kwargs.get("hyperflow_file") or HYPERFLOW_DEFAULT_FILE,
-            hyperflow_curve_refit=kwargs.get("hyperflow_curve_refit", True),
-            hyperflow_strength=kwargs.get("hyperflow_strength", 1.0),
-            hyperflow_lora_mode=kwargs.get("hyperflow_lora_mode") or "bypass",
             hyperflow_flash_file=flash_file,
             hyperflow_flash_steps=flash_steps,
             background_busy=lambda: background["worker"] is not None and background["worker"].busy(),
@@ -928,19 +919,11 @@ class MiniMaxH3MasterExtender:
             kwargs.get("pass2_lora_mode", "replace engine LoRA"),
             kwargs.get("pass2_steps", 4),
         )
-        dual_requested = bool(kwargs.get("dual_sampling", False)) or dual_mode
-        dual_active = dual_requested and not str(accel_mode).lower().startswith("turbo") and accel_mode != FLASH_ACCEL_MODE
         engine.configure_pass2_extras(
             kwargs.get("pass2_scheduler", "same as pass 1"),
             kwargs.get("pass2_audio", "pass 2 (refined)"),
         )
         pass2_audio_p1 = engine.pass2_audio_from_p1 and pass2_enabled
-        engine.configure_dual_sampling(
-            dual_requested,
-            kwargs.get("dual_split_step", 2),
-            kwargs.get("pass1_early_stop", False),
-        )
-        engine.configure_pass1_steps(kwargs.get("pass1_steps", 0) if pass2_enabled else 0)
         audio_refine = _audio_refine_signature(
             kwargs.get("audio_refine_steps", 0), kwargs.get("audio_refine_denoise", 0.5),
             kwargs.get("audio_refine_cache", True))
@@ -964,14 +947,14 @@ class MiniMaxH3MasterExtender:
         )
 
         p1_settings = {
-            # pdd_file is inert now but stays in the fingerprint so pass-1 caches written before PDD's removal still hit
+            # pdd_file and "hyperflow" are inert now but stay in the fingerprint (the hyperflow entry at the removed inputs
+            # defaults) so pass-1 caches written before their removal still hit
             "p1_res": [int(w1), int(h1)], "pdd_file": str(kwargs.get("pdd_file", "")), "pdd_nfe": str(pdd_nfe),
             "accel_mode": str(accel_mode), "turbo_lora": str(turbo_lora), "turbo_lora_strength": float(turbo_lora_strength),
             "sampler": str(turbo_sampler), "scheduler": str(turbo_scheduler),
             "attention": str(attention_backend), "sla": [bool(sla_enabled), float(sla_sparsity)],
             "sparse": [str(sparse_method), float(sparse_tau), float(sparse_start_percent), str(sparse_dense_blocks), str(sparse_sink)],
-            "hyperflow": [str(kwargs.get("hyperflow_file") or HYPERFLOW_DEFAULT_FILE), bool(kwargs.get("hyperflow_curve_refit", True)),
-                          float(kwargs.get("hyperflow_strength", 1.0)), str(kwargs.get("hyperflow_lora_mode") or "bypass")],
+            "hyperflow": LEGACY_HYPERFLOW_FINGERPRINT,
             "context": [str(context_length), int(audio_context_length), bool(identity_continuity)],
             "bridge": [str(bridge), kwargs.get("semantic_bridge_alpha", 0.12), str(kwargs.get("semantic_bridge_match", "per_token"))],
             "single_te": bool(single_te),
@@ -981,12 +964,6 @@ class MiniMaxH3MasterExtender:
         if accel_mode == FLASH_ACCEL_MODE:
             # Only in Flash mode, so pass-1 caches of every other mode keep their fingerprint.
             p1_settings["flash"] = [flash_file, flash_steps]
-
-        p1_settings = with_dual_p1_settings(
-            p1_settings, dual_active and pass2_enabled, kwargs.get("dual_split_step", 2),
-            bool(kwargs.get("pass1_early_stop", False)))
-
-        p1_settings = with_pass1_steps_p1_settings(p1_settings, engine.pass1_steps)
 
         clip_pictures = [clip_picture_keys(c, refs, n + 1) for n, c in enumerate(clips)]
         if any(p is not None for p in clip_pictures):

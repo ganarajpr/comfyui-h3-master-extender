@@ -173,9 +173,8 @@
  },
  "accel_mode": {
   "options": [
-   "HyperFlow 8-step",
    "Turbo LoRA",
-   "HyperFlow 8-step \u00b7 dual sampling"
+   "HyperFlow Flash (GGUF)"
   ]
  },
  "turbo_lora": {
@@ -195,6 +194,7 @@
    "h3\\MM-H3%20-%20Age%20Slider%20v4.safetensors",
    "h3\\MinimaxH3_cinematic_realism_0.3.safetensors",
    "h3\\Minimax_H3_Unlocked_V2.1.safetensors",
+   "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors",
    "h3\\PlagueKind-tiddies-realismslider.safetensors",
    "h3\\TaoMate-H3-FL2VA-3Step-ComfyUI-BF16.safetensors",
    "h3\\VBVR_H3_attn_only.safetensors",
@@ -438,19 +438,19 @@
  },
  "rewrite_writer_model": {
   "options": [
-   "Swift-1.5-Qwen3.8-27B Uncensored (NInfer) \u00b7 ~31 GB (ninfer sizes its KV pool to the card) \u2014 kvnxiao ajgazin/OrcaRouter Swift-1.5 NVFP4 on ninfer-serve (DFlash2 K7, MTP head, vision built in)",
-   "Swift-Qwen3.8-27B Uncensored (local) \u00b7 ~21 GB with the guide in context \u2014 ajgazin abliterated Swift-Qwen3.8-27B UD-Q5_K_M, already on disk (same file the llama router preset swift-uncensored-27b serves)",
-   "Swift-1.5-Qwen3.8-27B Uncensored (local) \u00b7 ~21 GB with the guide in context \u2014 ajgazin abliterated Swift-1.5-Qwen3.8-27B (mradermacher static Q5_K_M), same file the llama router preset swift15-uncensored-27b serves",
-   "ThinkingCap-Qwen3.8-27B Heretic (NInfer) \u00b7 ~31 GB (ninfer sizes its KV pool to the card) \u2014 Dragoy revised-Heretic ThinkingCap-Qwen3.8-27B NVFP4 on ninfer-serve (DFlash2 K7, MTP head, vision built in); best rewrites in the 2026-09-27 bake-off, ~2x llama speed",
-   "Qwen3.5-4B \u00b7 2.6 GB download \u00b7 ~5 GB with the guide in context \u2014 smallest that still holds the format; start here on an 8 GB card",
-   "Qwen3.5-9B \u00b7 5.3 GB download \u00b7 ~8 GB with the guide in context \u2014 best writing per gigabyte; lower gpu_layers if 8 GB is tight",
-   "Qwen3.5-9B Uncensored (HauhauCS) \u00b7 5.2 GB download \u00b7 ~8 GB with the guide in context \u2014 abliterated fine-tune: does not refuse scenes the stock model declines to describe",
-   "Gemma 3 12B Instruct \u00b7 6.8 GB download \u00b7 ~10 GB with the guide in context \u2014 non-Qwen alternative; its chat template takes no system role, which the node handles",
-   "Mistral Small 3.2 24B Instruct \u00b7 13.4 GB download \u00b7 ~17 GB with the guide in context \u2014 for a 16 GB card and up, when the 9B's prose is not enough",
-   "Qwen3.8-27B Q2_K_XL \u00b7 9.2 GB download \u00b7 ~13 GB with the guide in context \u2014 the 27B's prose on a 16 GB card; unsloth's dynamic 2-bit, rougher than the Q4 but still the biggest writer this side of it",
-   "Qwen3.8-27B Q3_K_XL \u00b7 12.2 GB download \u00b7 ~16 GB with the guide in context \u2014 the middle road: most of the Q4's quality, three gigabytes less to hold",
-   "Qwen3.8-27B Q4_K_M \u00b7 15.3 GB download \u00b7 ~19 GB with the guide in context \u2014 the strongest prose in the list, for a 24 GB card; newer than the rewriter's own base, but its extra layer is why the 27B LoRA cannot ride it",
-   "Qwen3.8-27B Q6_K_XL \u00b7 23.6 GB download \u00b7 ~27 GB with the guide in context \u2014 near-lossless, for a 32 GB card - and little room for the video model beside it; lower gpu_layers if it will not fit",
+   "Swift-1.5-Qwen3.8-27B Uncensored (NInfer) · ~31 GB (ninfer sizes its KV pool to the card) — kvnxiao ajgazin/OrcaRouter Swift-1.5 NVFP4 on ninfer-serve (DFlash2 K7, MTP head, vision built in)",
+   "Swift-Qwen3.8-27B Uncensored (local) · ~21 GB with the guide in context — ajgazin abliterated Swift-Qwen3.8-27B UD-Q5_K_M, already on disk (same file the llama router preset swift-uncensored-27b serves)",
+   "Swift-1.5-Qwen3.8-27B Uncensored (local) · ~21 GB with the guide in context — ajgazin abliterated Swift-1.5-Qwen3.8-27B (mradermacher static Q5_K_M), same file the llama router preset swift15-uncensored-27b serves",
+   "ThinkingCap-Qwen3.8-27B Heretic (NInfer) · ~31 GB (ninfer sizes its KV pool to the card) — Dragoy revised-Heretic ThinkingCap-Qwen3.8-27B NVFP4 on ninfer-serve (DFlash2 K7, MTP head, vision built in); best rewrites in the 2026-09-27 bake-off, ~2x llama speed",
+   "Qwen3.5-4B · 2.6 GB download · ~5 GB with the guide in context — smallest that still holds the format; start here on an 8 GB card",
+   "Qwen3.5-9B · 5.3 GB download · ~8 GB with the guide in context — best writing per gigabyte; lower gpu_layers if 8 GB is tight",
+   "Qwen3.5-9B Uncensored (HauhauCS) · 5.2 GB download · ~8 GB with the guide in context — abliterated fine-tune: does not refuse scenes the stock model declines to describe",
+   "Gemma 3 12B Instruct · 6.8 GB download · ~10 GB with the guide in context — non-Qwen alternative; its chat template takes no system role, which the node handles",
+   "Mistral Small 3.2 24B Instruct · 13.4 GB download · ~17 GB with the guide in context — for a 16 GB card and up, when the 9B's prose is not enough",
+   "Qwen3.8-27B Q2_K_XL · 9.2 GB download · ~13 GB with the guide in context — the 27B's prose on a 16 GB card; unsloth's dynamic 2-bit, rougher than the Q4 but still the biggest writer this side of it",
+   "Qwen3.8-27B Q3_K_XL · 12.2 GB download · ~16 GB with the guide in context — the middle road: most of the Q4's quality, three gigabytes less to hold",
+   "Qwen3.8-27B Q4_K_M · 15.3 GB download · ~19 GB with the guide in context — the strongest prose in the list, for a 24 GB card; newer than the rewriter's own base, but its extra layer is why the 27B LoRA cannot ride it",
+   "Qwen3.8-27B Q6_K_XL · 23.6 GB download · ~27 GB with the guide in context — near-lossless, for a 32 GB card - and little room for the video model beside it; lower gpu_layers if it will not fit",
    "Strata - Qwen3.8-Flash-Next (local endpoint, 5090)"
   ]
  },
@@ -537,26 +537,6 @@
    "final prompts"
   ]
  },
- "hyperflow_file": {
-  "options": [
-   "custom_node_hyperflow_8step_v1.0_comfyui.safetensors",
-   "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors"
-  ]
- },
- "hyperflow_curve_refit": {
-  "type": "BOOLEAN"
- },
- "hyperflow_strength": {
-  "type": "FLOAT",
-  "min": 0.0,
-  "max": 2.0
- },
- "hyperflow_lora_mode": {
-  "options": [
-   "bypass",
-   "merge"
-  ]
- },
  "audio_refine_steps": {
   "type": "INT",
   "min": 0,
@@ -638,22 +618,6 @@
    "exact_kv",
    "off"
   ]
- },
- "dual_sampling": {
-  "type": "BOOLEAN"
- },
- "dual_split_step": {
-  "type": "INT",
-  "min": 1,
-  "max": 7
- },
- "pass1_early_stop": {
-  "type": "BOOLEAN"
- },
- "pass1_steps": {
-  "type": "INT",
-  "min": 0,
-  "max": 8
  },
  "pass2_chunk_when": {
   "options": [
