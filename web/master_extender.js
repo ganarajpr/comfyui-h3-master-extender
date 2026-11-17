@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue } from "./widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -197,7 +197,7 @@ const ALWAYS_HIDDEN_WIDGETS = ["pdd_file"];
 const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
 // HyperFlow Flash (GGUF) engine: its own two widgets, shown only in that mode. (HyperFlow 8-step, its widgets and dual sampling were removed 2026-11-17.)
 const FLASH_MODE = "HyperFlow Flash (GGUF)";
-const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps"];
+const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength"];
 const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
 const SLA_ONLY_WIDGETS = ["sla_sparsity", "pass2_sla_sparsity"];
 // Widgets appended after master_ui-less workflows were saved: a missing/invalid value is put back to the default.
@@ -303,6 +303,10 @@ function repairDualWidgets(node) {
     if (flashFile) flashFile.value = flashFileValue(flashFile.value, comboValues(flashFile));
     const flashSteps = node.widgets?.find(x => x.name === "hyperflow_flash_steps");
     if (flashSteps) flashSteps.value = flashStepsValue(flashSteps.value);
+    const flashLora = node.widgets?.find(x => x.name === "hyperflow_flash_lora");
+    if (flashLora) flashLora.value = flashLoraValue(flashLora.value, comboValues(flashLora));
+    const flashLoraStrength = node.widgets?.find(x => x.name === "hyperflow_flash_lora_strength");
+    if (flashLoraStrength) flashLoraStrength.value = flashLoraStrengthValue(flashLoraStrength.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -1008,6 +1012,10 @@ app.registerExtension({
                         { hint: "Pass 1 runs this Flash transformer (ref2va build, GGUF or INT8 convrot safetensors). The base model input is used for pass 2 only." }));
                     wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps"),
                         { hint: "4 fastest, 6 balanced, 8 best quality. Euler, CFG 1." }));
+                    wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora"),
+                        { hint: "A LoRA applied to the Flash pass-1 model (e.g. the _for_flash companion of a pikafold checkpoint). The LoRA stack only reaches pass 2." }));
+                    wrap.appendChild(uiRow("flash lora strength", bindNumber("hyperflow_flash_lora_strength"),
+                        { hint: "1.0 for the Pika x Flash companion." }));
                     wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));

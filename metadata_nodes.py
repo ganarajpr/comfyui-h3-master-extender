@@ -166,7 +166,8 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
         if str(accel).lower().startswith("turbo"):
             lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
         elif str(accel).startswith("HyperFlow Flash"):
-            lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1")
+            lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1"
+                         + (f" · Flash LoRA {inputs.get('hyperflow_flash_lora')} x{inputs.get('hyperflow_flash_lora_strength', 1.0)}" if inputs.get('hyperflow_flash_lora') not in (None, '', 'none') else ""))
         else:
             lines.append(f"Engine: {accel} {inputs.get('hyperflow_file', '')} (retired mode, saved before 2026-11-17)".replace("  ", " "))
         lines.append(f"Quality: draft {inputs.get('pass1_resolution', '?')} → refine {inputs.get('pass2_resolution', '?')} · denoise {inputs.get('pass2_denoise', '?')}{' · pass 2 scheduler ' + str(inputs.get('pass2_scheduler')) if inputs.get('pass2_scheduler') not in (None, '', 'same as pass 1') else ''}{' · pass-1 audio' if inputs.get('pass2_audio') == 'pass 1' else ''} · upscaler {inputs.get('upscaler_model', '?')}")

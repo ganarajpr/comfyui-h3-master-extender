@@ -214,6 +214,24 @@ def check_flash_steps(steps):
     return steps
 
 
+def warn_pikafold_without_lora(flash_file, lora):
+    if "pikafold" in str(flash_file).lower() and (not lora or lora == "none"):
+        _LOG.warning("HyperFlow Flash: %s is a pikafold checkpoint and needs its companion `_for_flash` LoRA "
+                     "(set hyperflow_flash_lora, e.g. h3\\pika_h3_flex_ref2va_for_flash.safetensors at 1.0); "
+                     "without it pass 1 is not the Pika x Flash merge", flash_file)
+
+
+def apply_flash_lora(model, lora, strength):
+    """Model-only LoRA on the Flash pass-1 ModelPatcher; returns the patched clone (the cached Flash patcher is untouched)."""
+    import comfy.sd
+    import folder_paths
+    lora_sd = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", lora), safe_load=True)
+    patched = comfy.sd.load_lora_for_models(model, None, lora_sd, float(strength), 0)[0]
+    count = len(getattr(patched, "patches", {}) or {})
+    _LOG.info("HyperFlow Flash: applied LoRA %s at strength %s to the pass-1 model (%d patched keys)", lora, strength, count)
+    return patched
+
+
 def flash_pack_module():
     """The ComfyUI-HyperFlow-Flash module (loader, schedule and path helpers), found through its node class; None when
     the pack is not installed. v1.1.0+ registers HyperFlowLoader, v1.0.0 only HyperFlowGGUFLoader."""
@@ -309,6 +327,8 @@ class MasterEngine:
         pass2_sla_sparsity=0.0,
         hyperflow_flash_file=FLASH_DEFAULT_FILE,
         hyperflow_flash_steps=6,
+        hyperflow_flash_lora="none",
+        hyperflow_flash_lora_strength=1.0,
     ):
         self.raw_model = model
         self.accel_mode = str(accel_mode)
@@ -316,6 +336,8 @@ class MasterEngine:
         self.flash_mode = self.accel_mode == FLASH_ACCEL_MODE
         self.flash_file = str(hyperflow_flash_file or FLASH_DEFAULT_FILE)
         self.flash_steps = int(hyperflow_flash_steps or 6)
+        self.flash_lora = hyperflow_flash_lora if hyperflow_flash_lora and hyperflow_flash_lora != "none" else None
+        self.flash_lora_strength = float(hyperflow_flash_lora_strength if hyperflow_flash_lora_strength is not None else 1.0)
         self.flash_model = None
         self.flash_raw = None
         self.turbo_lora = turbo_lora if turbo_lora and turbo_lora != "none" else None
@@ -430,6 +452,9 @@ class MasterEngine:
         else:
             _LOG.info("HyperFlow Flash: %s already loaded, reusing", name)
         self.flash_raw = patcher
+        warn_pikafold_without_lora(name, self.flash_lora)
+        if self.flash_lora:
+            patcher = apply_flash_lora(patcher, self.flash_lora, self.flash_lora_strength)
         dm = patcher.model.diffusion_model
         schedule = getattr(dm, "hyperflow_sigmas", None)
         sigmas = schedule.clone().cpu() if (steps == 6 and schedule is not None) else pack.step_sigmas(steps).clone().cpu()

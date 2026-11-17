@@ -28,3 +28,7 @@
 | Sparse attention (`sla_enabled`) | Stays on if you set it. Core's block-sparse path calls `attn.qkv_proj(x)` and `attn.out_proj(x)` as modules, so the Flash `SplitQKV` / `LowRankLinear` replacements work. Not validated on Flash weights, and `auto` resolves to the defaults. Turn it off for a dense reference. |
 | Motion-context chaining, semantic bridge, audio refine | Unchanged: they act on the conditioning and on the base model, not on the pass-1 transformer. Motion context with Flash is untested. |
 | Pass-1 cache | Keyed on the Flash file and steps in addition to the usual settings; other modes' fingerprints are unchanged. |
+
+## Pika x Flash merge
+
+`minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikafold.safetensors` is a Flash checkpoint that must be used with its companion LoRA `h3\pika_h3_flex_ref2va_for_flash.safetensors` at strength 1.0. The extender's own LoRA stack (the model input) only reaches pass 2 in this mode, so nothing could patch the Flash pass-1 model; `hyperflow_flash_lora` / `hyperflow_flash_lora_strength` apply a LoRA to that model (model-only) right after it is loaded. Pick the `_for_flash` LoRA at 1.0 with a pikafold checkpoint; the extender does not select it for you and logs a warning when a pikafold file runs with `none`. The pick is part of the pass-1 cache key.
