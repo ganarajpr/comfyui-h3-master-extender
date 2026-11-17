@@ -55,12 +55,13 @@ The disk cache does not re-render when settings change. Clear the chain (panel "
 
 # HyperFlow Flash (GGUF) mode
 
-`accel_mode = "HyperFlow Flash (GGUF)"` runs pass 1 on Video Rebirth's HyperFlow H3 Flash: a separate compressed transformer (13.9B ref2va), pruned and low-rank factored, with a two-time (t, r) embedder, shipped as GGUF. It is not a LoRA on the base model.
+`accel_mode = "HyperFlow Flash (GGUF)"` runs pass 1 on Video Rebirth's HyperFlow H3 Flash: a separate compressed transformer (13.9B ref2va), pruned and low-rank factored, with a two-time (t, r) embedder, shipped as GGUF or INT8 convrot safetensors. It is not a LoRA on the base model.
 
 ## Requirements
 
-- Node packs in `custom_nodes`: [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) and [ComfyUI-HyperFlow-Flash](https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash). The extender finds the pack through the `HyperFlowGGUFLoader` node class and calls its `load_hyperflow_gguf`; without it the job stops with a message naming the pack.
-- Weights in `diffusion_models`: `minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf` (the extender renders Ref2VA).
+- Node packs in `custom_nodes`: [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) and [ComfyUI-HyperFlow-Flash](https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash). ComfyUI-GGUF is only needed for GGUF builds. The extender finds the pack through the `HyperFlowLoader` node class (v1.1.0+; `HyperFlowGGUFLoader` on v1.0.0) and loads through its `load_hyperflow` (v1.0.0: `load_hyperflow_gguf`); without the pack the job stops with a message naming it.
+- Weights in `diffusion_models`, either kind (the extender renders Ref2VA): `minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors` (the default when installed) or `minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf` (the default otherwise). The file list shows the pack's `safetensors_files()` (only files carrying HyperFlow metadata) plus the GGUFs. Picking a `.safetensors` build with ComfyUI-HyperFlow-Flash older than 1.1.0 stops the job with a message to update the pack. An fl2va pick is swapped for the ref2va sibling with the same quant and extension.
+- The accel_mode value stays "HyperFlow Flash (GGUF)" so saved workflows keep working; it now covers both kinds.
 
 ## What the mode does
 

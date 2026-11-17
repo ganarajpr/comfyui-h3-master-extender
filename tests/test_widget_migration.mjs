@@ -104,6 +104,9 @@ const flashFiles = ["a_ref2va_hyperflow_flash.gguf", "b_ref2va_hyperflow_flash.g
 assert.equal(flashFileValue("", flashFiles), flashFiles[0]);
 assert.equal(flashFileValue("gone.gguf", flashFiles), flashFiles[0]);
 assert.equal(flashFileValue(flashFiles[1], flashFiles), flashFiles[1]);
+const flashMixed = ["minimax_h3_fl2va_hyperflow_flash_14b-Q8_0.gguf", "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf", "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"];
+assert.equal(flashFileValue("", flashMixed), flashMixed[2]);
+assert.equal(flashFileValue("", flashMixed.slice(0, 2)), flashMixed[1]);
 console.log("widget migration ok");
 
 // pass 2 steps row: dual on -> dual_split_step, off -> pass2_steps; binding never writes

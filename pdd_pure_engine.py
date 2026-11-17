@@ -144,15 +144,55 @@ def _upscaler_precision(model_name, default="fp16"):
 
 FLASH_ACCEL_MODE = "HyperFlow Flash (GGUF)"
 FLASH_STEPS = (4, 6, 8)
-FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
+FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
+FLASH_FALLBACK_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
 _FLASH_CACHE = {}
+
+
+def flash_file_list(pack, scanned):
+    """Flash builds: .gguf names from `scanned` plus .safetensors names, all with 'hyperflow_flash' in the name. With the
+    pack loaded the safetensors come from its own safetensors_files() (only files carrying HyperFlow metadata; a v1.0.0
+    pack has none, so GGUF only); without it they come from `scanned`."""
+    def keep(n):
+        return "hyperflow_flash" in str(n).lower()
+    names = [n for n in scanned if str(n).lower().endswith(".gguf") and keep(n)]
+    if pack is None:
+        names += [n for n in scanned if str(n).lower().endswith(".safetensors") and keep(n)]
+    elif hasattr(pack, "safetensors_files"):
+        try:
+            names += [n for n in pack.safetensors_files() if keep(n)]
+        except Exception:
+            pass
+    return sorted(set(names))
+
+
+def default_flash_file(available):
+    """The INT8 convrot ref2va build when installed, else the Q8_0 GGUF, else any ref2va build."""
+    available = list(available or [])
+    for name in (FLASH_DEFAULT_FILE, FLASH_FALLBACK_FILE):
+        if name in available:
+            return name
+    return next((n for n in available if "ref2va" in n.lower()), FLASH_DEFAULT_FILE)
+
+
+def check_flash_file_supported(pack, name):
+    if str(name or "").lower().endswith(".safetensors") and not hasattr(pack, "load_hyperflow"):
+        raise RuntimeError(f"hyperflow_flash_file {name} is a safetensors build, which needs ComfyUI-HyperFlow-Flash >= 1.1.0 "
+                           "(the installed pack only loads GGUF). Update the node pack and restart ComfyUI.")
+
+
+def load_flash_model(pack, name):
+    check_flash_file_supported(pack, name)
+    if hasattr(pack, "load_hyperflow"):
+        return pack.load_hyperflow(pack.model_path(name), "auto")
+    return pack.load_hyperflow_gguf(pack.gguf_path(name), "auto")
 
 
 def resolve_flash_file(name, available):
     """The extender always renders Ref2VA, so a Flash file must be the ref2va build. A fl2va pick is swapped for its
-    ref2va sibling (same quant) when that is installed, otherwise it is an error. Returns (file, note or None)."""
-    name = str(name or FLASH_DEFAULT_FILE)
+    ref2va sibling (same quant and extension) when that is installed, otherwise it is an error. Returns (file, note or None)."""
     available = list(available or [])
+    name = str(name or "") or default_flash_file(available)
     if "fl2va" in name.lower():
         sibling = name.replace("fl2va", "ref2va").replace("FL2VA", "REF2VA")
         if sibling in available:
@@ -174,14 +214,21 @@ def check_flash_steps(steps):
     return steps
 
 
+def flash_pack_module():
+    """The ComfyUI-HyperFlow-Flash module (loader, schedule and path helpers), found through its node class; None when
+    the pack is not installed. v1.1.0+ registers HyperFlowLoader, v1.0.0 only HyperFlowGGUFLoader."""
+    mappings = nodes.NODE_CLASS_MAPPINGS
+    cls = mappings.get("HyperFlowLoader") or mappings.get("HyperFlowGGUFLoader")
+    return sys.modules[cls.__module__] if cls is not None else None
+
+
 def _flash_pack():
-    """The ComfyUI-HyperFlow-Flash module (loader, schedule and path helpers), found through its node class."""
-    cls = nodes.NODE_CLASS_MAPPINGS.get("HyperFlowGGUFLoader")
-    if cls is None:
-        raise RuntimeError("HyperFlow Flash (GGUF) needs the ComfyUI-HyperFlow-Flash node pack "
-                           "(HyperFlowGGUFLoader) and ComfyUI-GGUF in custom_nodes. "
+    pack = flash_pack_module()
+    if pack is None:
+        raise RuntimeError("HyperFlow Flash needs the ComfyUI-HyperFlow-Flash node pack "
+                           "(HyperFlowLoader or HyperFlowGGUFLoader), and ComfyUI-GGUF for GGUF builds, in custom_nodes. "
                            "git clone https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash, then restart ComfyUI.")
-    return sys.modules[cls.__module__]
+    return pack
 
 
 def pass_sampler_name(turbo_mode, sampler_name):
@@ -431,7 +478,7 @@ class MasterEngine:
         self.flash_steps = check_flash_steps(self.flash_steps)
         self.turbo_steps = "8"
         pack = _flash_pack()
-        _LOG.info("HyperFlow Flash: pass 1 runs the Flash GGUF transformer (%s, %d steps, euler, cfg 1); the base "
+        _LOG.info("HyperFlow Flash: pass 1 runs the Flash transformer (%s, %d steps, euler, cfg 1); the base "
                   "model input and any LoRAs stacked on it are NOT used for pass 1, only for pass 2 / audio refine",
                   self.flash_file, self.flash_steps)
         if self.shift_video != 12.0:
@@ -439,15 +486,16 @@ class MasterEngine:
         return model, pack.step_sigmas(self.flash_steps).clone().cpu()
 
     def initialize_flash_model(self):
-        """Pass-1 model in Flash mode: the GGUF transformer from the pack's loader (cached across clips and jobs), with
+        """Pass-1 model in Flash mode: the GGUF / INT8 transformer from the pack's loader (cached across clips and jobs), with
         SigmaShift, the dense attention backend and sparse attention applied like for the base model."""
         if self.flash_model is not None:
             return self.flash_model
         self.initialize_model()
         pack = _flash_pack()
         steps = check_flash_steps(self.flash_steps)
+        check_flash_file_supported(pack, self.flash_file)
         try:
-            available = [n for n in pack.gguf_files() if "hyperflow_flash" in n.lower()]
+            available = flash_file_list(pack, pack.gguf_files())
         except Exception:
             available = []
         name, note = resolve_flash_file(self.flash_file, available)
@@ -458,7 +506,7 @@ class MasterEngine:
         if patcher is None:
             _FLASH_CACHE.clear()
             _LOG.info("HyperFlow Flash: loading %s", name)
-            patcher = pack.load_hyperflow_gguf(pack.gguf_path(name), "auto")
+            patcher = load_flash_model(pack, name)
             _FLASH_CACHE[key] = patcher
         else:
             _LOG.info("HyperFlow Flash: %s already loaded, reusing", name)

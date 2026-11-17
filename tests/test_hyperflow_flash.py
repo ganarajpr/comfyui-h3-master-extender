@@ -11,14 +11,17 @@ GRID = [1.0, 0.9939, 0.9843, 0.9661, 0.9231, 0.8349, 0.6969, 0.4688, 0.0]
 MODE = "HyperFlow Flash (GGUF)"
 REF = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
 FL = "minimax_h3_fl2va_hyperflow_flash_14b-Q8_0.gguf"
+INT8 = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
+INT8_FL = "minimax_h3_fl2va_hyperflow_flash_14b-int8_convrot.safetensors"
 
 
 def _engine_ns():
     tree = ast.parse(ENGINE.read_text(encoding="utf-8"))
     wanted = [n for n in tree.body
-              if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("FLASH_ACCEL_MODE", "FLASH_STEPS", "FLASH_DEFAULT_FILE")
+              if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("FLASH_ACCEL_MODE", "FLASH_STEPS", "FLASH_DEFAULT_FILE", "FLASH_FALLBACK_FILE")
                                                     for t in n.targets))
-              or (isinstance(n, ast.FunctionDef) and n.name in ("resolve_flash_file", "check_flash_steps", "hyperflow_tail_sigmas",
+              or (isinstance(n, ast.FunctionDef) and n.name in ("resolve_flash_file", "check_flash_steps", "flash_file_list", "default_flash_file",
+                                                               "check_flash_file_supported", "load_flash_model", "hyperflow_tail_sigmas",
                                                                "dual_split_index", "dual_pass1_sigmas", "dual_pass2_sigmas"))]
     ns = {}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(ENGINE), "exec"), ns)
@@ -84,6 +87,69 @@ class FlashFile(unittest.TestCase):
                 check(bad)
 
 
+class OldPack:
+    def gguf_files(self):
+        return [REF]
+
+    def gguf_path(self, name):
+        return "/models/" + name
+
+    def load_hyperflow_gguf(self, path, weights_in):
+        return ("gguf", path, weights_in)
+
+
+class NewPack(OldPack):
+    def safetensors_files(self):
+        return [INT8, "other_model.safetensors"]
+
+    def model_path(self, name):
+        return "/models/" + name
+
+    def load_hyperflow(self, path, weights_in="auto"):
+        return ("any", path, weights_in)
+
+
+class FlashKinds(unittest.TestCase):
+    scanned = [REF, FL, INT8, INT8_FL, "other.gguf", "other_model.safetensors"]
+
+    def test_listing_without_the_pack_scans_both_kinds(self):
+        self.assertEqual(NS["flash_file_list"](None, self.scanned), sorted([REF, FL, INT8, INT8_FL]))
+
+    def test_listing_with_a_new_pack_uses_its_safetensors_list(self):
+        self.assertEqual(NS["flash_file_list"](NewPack(), self.scanned), sorted([REF, FL, INT8]))
+
+    def test_listing_with_an_old_pack_is_gguf_only(self):
+        self.assertEqual(NS["flash_file_list"](OldPack(), self.scanned), sorted([REF, FL]))
+
+    def test_default_prefers_int8_then_q8(self):
+        d = NS["default_flash_file"]
+        self.assertEqual(d([REF, INT8]), INT8)
+        self.assertEqual(d([FL, REF]), REF)
+        self.assertEqual(d([]), INT8)
+        self.assertEqual(NS["resolve_flash_file"]("", [REF, INT8])[0], INT8)
+        self.assertEqual(NS["resolve_flash_file"](None, [REF])[0], REF)
+
+    def test_int8_fl2va_is_swapped_for_the_int8_ref2va_sibling(self):
+        name, note = NS["resolve_flash_file"](INT8_FL, [INT8, INT8_FL, REF])
+        self.assertEqual(name, INT8)
+        self.assertIn("fl2va", note)
+        with self.assertRaisesRegex(ValueError, "ref2va"):
+            NS["resolve_flash_file"](INT8_FL, [INT8_FL, REF])
+
+    def test_new_pack_loads_either_kind_through_load_hyperflow(self):
+        load = NS["load_flash_model"]
+        self.assertEqual(load(NewPack(), INT8), ("any", "/models/" + INT8, "auto"))
+        self.assertEqual(load(NewPack(), REF), ("any", "/models/" + REF, "auto"))
+
+    def test_old_pack_loads_gguf_and_refuses_safetensors(self):
+        self.assertEqual(NS["load_flash_model"](OldPack(), REF), ("gguf", "/models/" + REF, "auto"))
+        with self.assertRaisesRegex(RuntimeError, r"ComfyUI-HyperFlow-Flash >= 1\.1\.0"):
+            NS["load_flash_model"](OldPack(), INT8)
+        with self.assertRaisesRegex(RuntimeError, r"1\.1\.0"):
+            NS["check_flash_file_supported"](OldPack(), INT8)
+        NS["check_flash_file_supported"](OldPack(), None)
+
+
 class FlashEngine(unittest.TestCase):
     def test_dual_sampling_and_pass1_steps_are_ignored(self):
         e = flash_engine()
@@ -126,7 +192,7 @@ class NodeWiring(unittest.TestCase):
         import re
         names = re.findall(r'^\s{16}"(\w+)": \(', self.text[self.text.index("def INPUT_TYPES"):], re.M)
         self.assertEqual(names[-3:], ["hyperflow_flash_file", "hyperflow_flash_steps", "clips_in"])
-        self.assertRegex(self.text, r'"hyperflow_flash_file": \(_flash_files\(\), \{"default": FLASH_DEFAULT_FILE')
+        self.assertRegex(self.text, r'"hyperflow_flash_file": \(_flash_files\(\), \{"default": default_flash_file\(_flash_files\(\)\)')
         self.assertRegex(self.text, r'"hyperflow_flash_steps": \("INT", \{"default": 6, "min": 4, "max": 8, "step": 2')
 
     def test_flash_fingerprint_key_only_in_flash_mode(self):
