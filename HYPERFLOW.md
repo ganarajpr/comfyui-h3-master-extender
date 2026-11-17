@@ -46,8 +46,8 @@
 - Same conditioning (references, motion context, bridge) for both segments, both the video and the audio part of the packed latent.
 - Pika is evicted before Flash runs, and Flash after pass 1; pass 2 (base + DMAD refine) is unchanged.
 
-**Inputs.** Pika: `turbo_lora` (required, not none), `turbo_lora_strength`, `pdd_nfe`, `turbo_sampler`, `turbo_scheduler`. Flash: `hyperflow_flash_file`, `hyperflow_flash_steps` (only sets the grid Flash continues on), `hyperflow_flash_lora(_strength)`. `handoff_step` (1-7, default 3): Pika runs steps 1..N of its `pdd_nfe` schedule; it is clamped to `pdd_nfe - 1` (logged). Larger = more Pika (safer anatomy, less Flash texture); smaller = more Flash.
+**Inputs.** Pika: `turbo_lora` (required, not none), `turbo_lora_strength`, `pdd_nfe`, `turbo_sampler`, `turbo_scheduler`. Flash: `hyperflow_flash_file`, `hyperflow_flash_steps` (only sets the grid Flash continues on), `hyperflow_flash_lora(_strength)`. `handoff_step` (dropdown "1 · Pika to 0.98" ... "5 · Pika to 0.71", default 3; the decimal is the noise level left, exact for pdd_nfe 6): Pika runs steps 1..N of its `pdd_nfe` schedule; it is clamped to `pdd_nfe - 1` (logged). Larger = more Pika (safer anatomy, less Flash texture); smaller = more Flash.
 
 **Cache.** The pass-1 fingerprint includes the Flash parts and `handoff_step` in this mode only, so different hand-offs never share a cached pass 1.
 
-The log line reads `Pika → Flash hand-off: Pika steps 1..3 (sigma 1.0→0.7000), Flash 3 steps (0.7000→0) [file]`.
+The log line reads `Pika -> Flash hand-off: Pika steps 1..3 (sigma 1.0->0.7000), Flash 3 steps (0.7000->0) [file]`.

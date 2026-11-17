@@ -849,7 +849,7 @@ app.registerExtension({
                 const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
-                if (isHandoff()) return `Pika \u2192 Flash hand-off @${getW("handoff_step", 3)} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
+                if (isHandoff()) return `Pika \u2192 Flash hand-off @${parseInt(getW("handoff_step", 3), 10) || 3} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
                 if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
             }
@@ -1020,8 +1020,8 @@ app.registerExtension({
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName }),
                         { hint: "The Pika LoRA: runs pass-1 steps 1..N (composition, pose, anatomy)." }));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
-                    wrap.appendChild(uiRow("hand-off step", bindNumber("handoff_step"),
-                        { hint: "Pika runs steps 1..N of its schedule, then Flash finishes from that noise level (texture). Clamped to steps - 1." }));
+                    wrap.appendChild(uiRow("hand-off step", bindSelect("handoff_step"),
+                        { hint: "Pika runs steps 1..N of its schedule, then Flash finishes from that noise level (texture). The decimal is the noise level left (exact for 6 steps). Clamped to steps - 1." }));
                     wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName })));
                     wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps")));
                     wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora")));

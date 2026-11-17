@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from typing import Any
@@ -158,6 +159,11 @@ def _resolve_video_path(video: str, video_path: str) -> str:
     return folder_paths.get_annotated_filepath(video)
 
 
+def _handoff_k(value: Any) -> int:
+    m = re.match(r"\s*(\d+)", str(value))
+    return int(m.group(1)) if m else 3
+
+
 def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
     lines: list[str] = []
     if inputs:
@@ -166,7 +172,7 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
         if str(accel).lower().startswith("turbo"):
             lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
         elif str(accel).startswith("Pika"):
-            lines.append(f"Engine: Pika\u2192Flash hand-off @{inputs.get('handoff_step', 3)}: {inputs.get('turbo_lora', '')} \u2192 {inputs.get('hyperflow_flash_file', '')}")
+            lines.append(f"Engine: Pika\u2192Flash hand-off @{_handoff_k(inputs.get('handoff_step'))}: {inputs.get('turbo_lora', '')} \u2192 {inputs.get('hyperflow_flash_file', '')}")
         elif str(accel).startswith("HyperFlow Flash"):
             lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1"
                          + (f" · Flash LoRA {inputs.get('hyperflow_flash_lora')} x{inputs.get('hyperflow_flash_lora_strength', 1.0)}" if inputs.get('hyperflow_flash_lora') not in (None, '', 'none') else ""))
