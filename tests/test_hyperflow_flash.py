@@ -179,15 +179,14 @@ class NodeWiring(unittest.TestCase):
         tree = ast.parse(self.text)
         modes = next(ast.literal_eval(n.value) for n in tree.body
                      if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
-        self.assertEqual(modes[-1], MODE)
-        self.assertEqual(modes, ["Turbo LoRA", MODE])
+        self.assertEqual(modes, ["Turbo LoRA", MODE, "Pika \u2192 Flash hand-off"])
         self.assertRegex(self.text, r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
 
     def test_new_inputs_are_last_before_the_clips_in_socket(self):
         import re
         names = re.findall(r'^\s{16}"(\w+)": \(', self.text[self.text.index("def INPUT_TYPES"):], re.M)
-        self.assertEqual(names[-5:], ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora",
-                                      "hyperflow_flash_lora_strength", "clips_in"])
+        self.assertEqual(names[-6:], ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora",
+                                      "hyperflow_flash_lora_strength", "handoff_step", "clips_in"])
         self.assertRegex(self.text, r'"hyperflow_flash_lora": \(\["none"\] \+ folder_paths\.get_filename_list\("loras"\), \{"default": "none"')
         self.assertRegex(self.text, r'"hyperflow_flash_lora_strength": \("FLOAT", \{"default": 1\.0, "min": -4\.0, "max": 4\.0, "step": 0\.05')
         self.assertRegex(self.text, r'"hyperflow_flash_file": \(_flash_files\(\), \{"default": default_flash_file\(_flash_files\(\)\)')
@@ -210,7 +209,7 @@ class NodeWiring(unittest.TestCase):
 
     def test_lora_is_ignored_outside_flash_mode(self):
         i = self.text.index('flash_lora, flash_lora_strength = "none", 1.0')
-        j = self.text.index("if accel_mode == FLASH_ACCEL_MODE:", i)
+        j = self.text.index("if accel_mode in (FLASH_ACCEL_MODE, HANDOFF_ACCEL_MODE):", i)
         self.assertLess(i, j)
         self.assertEqual(self.text.count('kwargs.get("hyperflow_flash_lora")'), 1)
         self.assertGreater(self.text.index('kwargs.get("hyperflow_flash_lora")'), j)

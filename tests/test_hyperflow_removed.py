@@ -88,7 +88,7 @@ class HyperFlowEightStepMigration(unittest.TestCase):
     MODES = ("HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "PDD 8-step")
 
     def test_modes_are_turbo_then_flash_only(self):
-        self.assertEqual(_NODE["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)"])
+        self.assertEqual(_NODE["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off"])
 
     def test_old_modes_load_and_run_as_pika_dmad(self):
         for mode in self.MODES:
@@ -190,7 +190,7 @@ class Defaults(unittest.TestCase):
     def test_the_input_order_is_the_old_order_minus_the_removed_inputs(self):
         names = re.findall(r'^\s{16}"(\w+)": \(', self.text[self.text.index("def INPUT_TYPES"):], re.M)
         self.assertEqual(names[:len(KEPT_INPUT_NAMES)], KEPT_INPUT_NAMES)
-        self.assertEqual(names[len(KEPT_INPUT_NAMES):], ["pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength", "clips_in"])
+        self.assertEqual(names[len(KEPT_INPUT_NAMES):], ["pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength", "handoff_step", "clips_in"])
 
     def test_the_pass1_fingerprint_keeps_its_keys(self):
         tree = ast.parse(self.text)

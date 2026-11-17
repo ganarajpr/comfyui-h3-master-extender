@@ -32,7 +32,7 @@ class RemovePDDTests(unittest.TestCase):
         norm = self.ns["normalize_accel_mode"]
         self.assertEqual(norm("Turbo LoRA"), "Turbo LoRA")
         self.assertEqual(norm("HyperFlow Flash (GGUF)"), "HyperFlow Flash (GGUF)")
-        self.assertEqual(self.ns["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)"])
+        self.assertEqual(self.ns["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off"])
 
     def test_pdd_file_keeps_its_slot_and_accepts_any_string(self):
         text = SOURCE.read_text(encoding="utf-8")
