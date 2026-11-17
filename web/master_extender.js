@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue } from "./widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -199,6 +199,9 @@ const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
 const FLASH_MODE = "HyperFlow Flash (GGUF)";
 const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength"];
 const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
+// Pika \u2192 Flash hand-off: Pika (the turbo widgets) runs the first handoff_step steps, Flash (its widgets) the rest.
+const HANDOFF_MODE = "Pika \u2192 Flash hand-off";
+const isHandoffMode = (value) => String(value ?? "") === HANDOFF_MODE;
 const SLA_ONLY_WIDGETS = ["sla_sparsity", "pass2_sla_sparsity"];
 // Widgets appended after master_ui-less workflows were saved: a missing/invalid value is put back to the default.
 const AUDIO_REFINE_WIDGETS = ["audio_refine_steps", "audio_refine_denoise", "audio_refine_cache"];
@@ -307,6 +310,8 @@ function repairDualWidgets(node) {
     if (flashLora) flashLora.value = flashLoraValue(flashLora.value, comboValues(flashLora));
     const flashLoraStrength = node.widgets?.find(x => x.name === "hyperflow_flash_lora_strength");
     if (flashLoraStrength) flashLoraStrength.value = flashLoraStrengthValue(flashLoraStrength.value);
+    const handoffStep = node.widgets?.find(x => x.name === "handoff_step");
+    if (handoffStep) handoffStep.value = handoffStepValue(handoffStep.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -334,11 +339,13 @@ function setupModeWidgets(node) {
 
     const apply = () => {
         const mode = String(accel?.value ?? "").toLowerCase();
-        const turbo = mode.startsWith("turbo");
-        const flash = isFlashMode(accel?.value);
+        const handoff = isHandoffMode(accel?.value);
+        const turbo = mode.startsWith("turbo") || handoff;
+        const flash = isFlashMode(accel?.value) || handoff;
         const slaOn = sla ? !!sla.value : false;
         TURBO_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
+        setWidgetVisible(byName("handoff_step"), handoff);
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
         TURBO_STEPS_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         SLA_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), slaOn));
@@ -793,6 +800,7 @@ app.registerExtension({
                 if (rerender) renderUI();
             };
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
+            const isHandoff = () => isHandoffMode(getW("accel_mode", ""));
             const isFlash = () => isFlashMode(getW("accel_mode", ""));
 
             function bindSelect(name, opts = {}) {
@@ -841,6 +849,7 @@ app.registerExtension({
                 const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
+                if (isHandoff()) return `Pika \u2192 Flash hand-off @${getW("handoff_step", 3)} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
                 if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
             }
@@ -1003,11 +1012,22 @@ app.registerExtension({
                 const accelW = W("accel_mode");
                 const accelSel = uiSelect(comboValues(accelW), accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
-                    setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") ? "6" : "8", { rerender: false });
+                    setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) ? "6" : "8", { rerender: false });
                     renderUI();
                 });
                 wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." }));
-                if (isFlash()) {
+                if (isHandoff()) {
+                    wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName }),
+                        { hint: "The Pika LoRA: runs pass-1 steps 1..N (composition, pose, anatomy)." }));
+                    wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
+                    wrap.appendChild(uiRow("hand-off step", bindNumber("handoff_step"),
+                        { hint: "Pika runs steps 1..N of its schedule, then Flash finishes from that noise level (texture). Clamped to steps - 1." }));
+                    wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName })));
+                    wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps")));
+                    wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora")));
+                    wrap.appendChild(uiRow("flash lora strength", bindNumber("hyperflow_flash_lora_strength")));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
+                } else if (isFlash()) {
                     wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName }),
                         { hint: "Pass 1 runs this Flash transformer (ref2va build, GGUF or INT8 convrot safetensors). The base model input is used for pass 2 only." }));
                     wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps"),
@@ -1506,7 +1526,7 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isFlash() ? "HyperFlow Flash" : "Turbo"} · ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps · 2-pass</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : "Turbo"} · ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps · 2-pass</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">

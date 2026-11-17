@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, PIKA_LORA, DMAD_LORA, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, PIKA_LORA, DMAD_LORA, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -128,6 +128,12 @@ assert.equal(flashFileValue("", flashMixed.slice(0, 2)), flashMixed[1]);
 const flashWithMerge = [...flashMixed, "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikamerge.safetensors"];
 assert.equal(flashFileValue("", flashWithMerge), flashWithMerge[3]);
 assert.equal(flashFileValue(flashMixed[2], flashWithMerge), flashMixed[2]);
+// handoff_step (appended after the flash widgets): master_ui's "" and anything outside 1..7 fall back to 3
+assert.equal(handoffStepValue(""), 3);
+assert.equal(handoffStepValue(0), 3);
+assert.equal(handoffStepValue(8), 3);
+assert.equal(handoffStepValue(2.5), 3);
+assert.deepEqual([1, 3, 7].map(handoffStepValue), [1, 3, 7]);
 console.log("widget migration ok");
 
 // run_mode gained prompts_only (last option, default unchanged) and clips_in was appended as the last input: a socket, so no widget value moves

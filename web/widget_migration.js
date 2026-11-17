@@ -153,3 +153,9 @@ export function flashLoraValue(value, options) {
 export function flashLoraStrengthValue(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : FLASH_LORA_STRENGTH_DEFAULT;
 }
+// handoff_step is appended after hyperflow_flash_lora_strength: a workflow saved before it carries master_ui's "" in that slot.
+// A non-integer or out-of-range value = 3.
+export const HANDOFF_STEP_DEFAULT = 3;
+export function handoffStepValue(value) {
+    return Number.isInteger(value) && value >= 1 && value <= 7 ? value : HANDOFF_STEP_DEFAULT;
+}

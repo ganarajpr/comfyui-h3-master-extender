@@ -32,3 +32,22 @@
 ## Pika x Flash merge
 
 `minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikafold.safetensors` is a Flash checkpoint that must be used with its companion LoRA `h3\pika_h3_flex_ref2va_for_flash.safetensors` at strength 1.0. The extender's own LoRA stack (the model input) only reaches pass 2 in this mode, so nothing could patch the Flash pass-1 model; `hyperflow_flash_lora` / `hyperflow_flash_lora_strength` apply a LoRA to that model (model-only) right after it is loaded. Pick the `_for_flash` LoRA at 1.0 with a pikafold checkpoint; the extender does not select it for you and logs a warning when a pikafold file runs with `none`. The pick is part of the pass-1 cache key.
+
+## Pika → Flash hand-off
+
+`accel_mode` = "Pika → Flash hand-off" runs pass 1 as two models on one noise schedule.
+
+**Why.** Plain Flash gets anatomy wrong where plain Pika does not. Anatomy, pose, composition and prompt compliance are decided in the first, high-noise steps; materials and texture in the last, low-noise ones. So Pika takes the early steps and Flash the late ones: Pika's anatomy and Flash's texture, without merging weights. Neither model is modified.
+
+**How.** Example with `pdd_nfe` 6 and `handoff_step` 3. Pika's schedule is `[1.0, 0.98, 0.9, 0.7, 0.4, 0.15, 0]` (illustrative values):
+
+- Pika samples steps 1..3 on `[1.0, 0.98, 0.9, 0.7]` (its sampler / scheduler, Turbo LoRA mode as usual) and stops at sigma 0.7.
+- Flash continues on `[0.7, <its grid points below 0.7>, 0]`, euler, CFG 1, with zero added noise: the latent is already at sigma 0.7. With the 6-step Flash grid that is `[0.7, 0.6969, 0.4688, 0.0]`.
+- Same conditioning (references, motion context, bridge) for both segments, both the video and the audio part of the packed latent.
+- Pika is evicted before Flash runs, and Flash after pass 1; pass 2 (base + DMAD refine) is unchanged.
+
+**Inputs.** Pika: `turbo_lora` (required, not none), `turbo_lora_strength`, `pdd_nfe`, `turbo_sampler`, `turbo_scheduler`. Flash: `hyperflow_flash_file`, `hyperflow_flash_steps` (only sets the grid Flash continues on), `hyperflow_flash_lora(_strength)`. `handoff_step` (1-7, default 3): Pika runs steps 1..N of its `pdd_nfe` schedule; it is clamped to `pdd_nfe - 1` (logged). Larger = more Pika (safer anatomy, less Flash texture); smaller = more Flash.
+
+**Cache.** The pass-1 fingerprint includes the Flash parts and `handoff_step` in this mode only, so different hand-offs never share a cached pass 1.
+
+The log line reads `Pika → Flash hand-off: Pika steps 1..3 (sigma 1.0→0.7000), Flash 3 steps (0.7000→0) [file]`.

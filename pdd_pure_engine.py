@@ -143,6 +143,8 @@ def _upscaler_precision(model_name, default="fp16"):
 
 
 FLASH_ACCEL_MODE = "HyperFlow Flash (GGUF)"
+HANDOFF_ACCEL_MODE = "Pika \u2192 Flash hand-off"
+HANDOFF_STEP_DEFAULT = 3
 FLASH_STEPS = (4, 6, 8)
 FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
 FLASH_FALLBACK_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
@@ -263,6 +265,23 @@ def hyperflow_tail_sigmas(grid, denoise):
     return grid[-(tail + 1):]
 
 
+def clamp_handoff_step(step, nfe):
+    """Hand-off step k: Pika runs steps 1..k of its nfe-step schedule, so k is 1..nfe-1."""
+    k = max(1, min(int(step), int(nfe) - 1))
+    if k != int(step):
+        _LOG.info("Pika -> Flash hand-off: handoff_step %s clamped to %d (pdd_nfe %d)", step, k, int(nfe))
+    return k
+
+
+def split_handoff_sigmas(pika_sigmas, k, flash_grid):
+    """(pika_segment, flash_segment, sigma). Pika samples sigmas[0..k]; Flash continues from sigma = sigmas[k] on its own
+    grid: [sigma] + the grid points below sigma (the grid ends with 0)."""
+    pika = [float(x) for x in pika_sigmas]
+    sigma = pika[k]
+    flash = [sigma] + [float(g) for g in flash_grid if float(g) < sigma - 1e-6]
+    return pika[:k + 1], flash, sigma
+
+
 PASS2_CHUNK_WHEN = ("above 720p", "always")
 PASS2_CHUNK_MIN_SHORT_SIDE = 800
 
@@ -331,10 +350,15 @@ class MasterEngine:
         hyperflow_flash_steps=6,
         hyperflow_flash_lora="none",
         hyperflow_flash_lora_strength=1.0,
+        handoff_step=HANDOFF_STEP_DEFAULT,
     ):
         self.raw_model = model
         self.accel_mode = str(accel_mode)
-        self.turbo_mode = self.accel_mode.lower().startswith("turbo")
+        self.handoff_mode = self.accel_mode == HANDOFF_ACCEL_MODE
+        self.handoff_step = int(handoff_step or HANDOFF_STEP_DEFAULT)
+        self.flash_grid = None
+        # Hand-off pass 1 is Pika (Turbo LoRA) up to the hand-off step, so everything keyed on turbo (sampler, pass-2 tail) applies.
+        self.turbo_mode = self.accel_mode.lower().startswith("turbo") or self.handoff_mode
         self.flash_mode = self.accel_mode == FLASH_ACCEL_MODE
         self.flash_file = str(hyperflow_flash_file or FLASH_DEFAULT_FILE)
         self.flash_steps = int(hyperflow_flash_steps or 6)
@@ -460,7 +484,9 @@ class MasterEngine:
         dm = patcher.model.diffusion_model
         schedule = getattr(dm, "hyperflow_sigmas", None)
         sigmas = schedule.clone().cpu() if (steps == 6 and schedule is not None) else pack.step_sigmas(steps).clone().cpu()
-        self.pass1_sigmas = sigmas
+        self.flash_grid = sigmas
+        if not self.handoff_mode:
+            self.pass1_sigmas = sigmas
         if self.sla_enabled:
             _LOG.info("HyperFlow Flash: sparse attention ON for pass 1 (%s); the Flash blocks keep the attention module "
                       "calls (qkv_proj / out_proj are plain modules), so it runs, but it is not validated on Flash "
@@ -1014,7 +1040,19 @@ class MasterEngine:
             _LOG.exception("x0 debug dump: setup failed, rendering without it")
             return None
 
-    def _sample_euler(self, model, positive, latent_image, sigmas, seed, ff_chunk=True):
+    def _sample_handoff(self, pika_model, pika_sigmas, positive, latent, seed):
+        """Pass 1 as an expert hand-off: Pika samples steps 1..k of its schedule (composition, pose, anatomy), then Flash
+        finishes from the noise level Pika stopped at (materials, texture). Flash gets no new noise (_sample_euler add_noise)."""
+        flash_model = self.initialize_flash_model()
+        k = clamp_handoff_step(self.handoff_step, len(pika_sigmas) - 1)
+        pika_seg, flash_seg, sigma = split_handoff_sigmas(pika_sigmas, k, self.flash_grid)
+        _LOG.info("Pika \u2192 Flash hand-off: Pika steps 1..%d (sigma 1.0\u2192%.4f), Flash %d steps (%.4f\u21920) [%s]",
+                  k, sigma, len(flash_seg) - 1, sigma, self.flash_file)
+        mid = self._sample_euler(pika_model, positive, latent, torch.tensor(pika_seg, dtype=torch.float32), seed)
+        return self._sample_euler(flash_model, positive, mid, torch.tensor(flash_seg, dtype=torch.float32), seed,
+                                  ff_chunk=False, sampler_name="euler", add_noise=False)
+
+    def _sample_euler(self, model, positive, latent_image, sigmas, seed, ff_chunk=True, sampler_name=None, add_noise=True):
         """Standard Euler sampling using ComfyUI core sampler internals directly.
 
         NOTE: Do NOT place any bare 'import comfy' statements inside this function.
@@ -1025,7 +1063,7 @@ class MasterEngine:
         BasicGuider node, because ComfyUI v3 node calls return NodeOutput wrappers
         that don't expose .model_patcher, making them unusable for direct sampling.
         """
-        from comfy_extras.nodes_custom_sampler import Noise_RandomNoise
+        from comfy_extras.nodes_custom_sampler import Noise_RandomNoise, Noise_EmptyNoise
         try:
             import latent_preview as _lp
             _have_lp = True
@@ -1033,7 +1071,10 @@ class MasterEngine:
             _have_lp = False
 
         # Noise_RandomNoise is a plain class: Noise_RandomNoise(seed)
-        noise_obj = Noise_RandomNoise(seed)
+        # add_noise=False continues a partially denoised latent (the hand-off's Flash segment): zero noise, as the
+        # DisableNoise node does. The previous segment ended at this one's first sigma; the sampler's own
+        # inverse_noise_scaling (end of segment 1) / noise_scaling (start of segment 2) pair round-trips the latent.
+        noise_obj = Noise_RandomNoise(seed) if add_noise else Noise_EmptyNoise()
 
         # Size the feed-forward chunking to this pass's packed token count.
         if ff_chunk:
@@ -1049,7 +1090,7 @@ class MasterEngine:
 
         # Build sampler object: HyperFlow Flash was distilled for plain Euler; turbo mode
         # uses the user's sampler (res_multistep by default).
-        euler_sampler = comfy.samplers.sampler_object(pass_sampler_name(self.turbo_mode, self.sampler_name))
+        euler_sampler = comfy.samplers.sampler_object(sampler_name or pass_sampler_name(self.turbo_mode, self.sampler_name))
 
         # Fix empty latent channels if needed
         latent = dict(latent_image)
@@ -1335,15 +1376,18 @@ class MasterEngine:
                 model = self.initialize_flash_model()
                 sigmas_p1 = self.pass1_sigmas
             # Sample Pass 1 with the pass-1 sigmas
-            sampled_p1 = self._sample_euler(
-                model=model,
-                positive=pos_p1,
-                latent_image=latent_p1,
-                sigmas=sigmas_p1,
-                seed=seed,
-                ff_chunk=not self.flash_mode,
-            )
-            if self.flash_mode and pass2_enabled:
+            if self.handoff_mode:
+                sampled_p1 = self._sample_handoff(model, sigmas_p1, pos_p1, latent_p1, seed)
+            else:
+                sampled_p1 = self._sample_euler(
+                    model=model,
+                    positive=pos_p1,
+                    latent_image=latent_p1,
+                    sigmas=sigmas_p1,
+                    seed=seed,
+                    ff_chunk=not self.flash_mode,
+                )
+            if (self.flash_mode or self.handoff_mode) and pass2_enabled:
                 self._unload_flash()
 
         if not pass2_enabled:

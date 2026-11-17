@@ -57,6 +57,9 @@ from .pdd_pure_engine import (
     parse_resolution,
     duration_to_h3_frames,
     FLASH_ACCEL_MODE,
+    HANDOFF_ACCEL_MODE,
+    HANDOFF_STEP_DEFAULT,
+    clamp_handoff_step,
     FLASH_DEFAULT_FILE,
     FLASH_STEPS,
     check_flash_file_supported,
@@ -333,7 +336,7 @@ PIKA_LORA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors"
 
 # Options are restored by name, so new ones are only ever appended. The HyperFlow 8-step options (plain and
 # dual sampling) were removed on 2026-11-17: they still load, and run as the Pika + DMAD recipe.
-ACCEL_MODES = ["Turbo LoRA", "HyperFlow Flash (GGUF)"]
+ACCEL_MODES = ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off"]
 
 
 def is_legacy_accel_mode(accel_mode):
@@ -448,7 +451,7 @@ class MiniMaxH3MasterExtender:
                 "sparse_method": (["sla", "sol-attn", "vsa"], {"default": "sla", "tooltip": "Selection method for core BlockSparseAttention when sla_enabled is on. sla: keep a fixed top-k percent of key blocks (1 - sla_sparsity). sol-attn: training-free adaptive threshold per head/query block (tau). vsa: FastVideo cube attention, only with FastH3-VSA weights."}),
                 "sparse_tau": ("FLOAT", {"default": 1.3, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "sol-attn threshold in score sigmas. Higher = sparser: 1.0 keeps ~16% of key blocks, 1.5 ~7%, 2.0 ~2.7%."}),
                 # --- Acceleration: Turbo LoRA (default: Pika) or HyperFlow Flash ---
-                "accel_mode": (ACCEL_MODES, {"default": "Turbo LoRA", "tooltip": "Turbo LoRA (default): a plain step-distilled LoRA (Pika, turbo, lightning, lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count. HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (needs ComfyUI-HyperFlow-Flash). The HyperFlow 8-step options were removed 2026-11-17; saved workflows with them run Pika + DMAD."}),
+                "accel_mode": (ACCEL_MODES, {"default": "Turbo LoRA", "tooltip": "Turbo LoRA (default): a plain step-distilled LoRA (Pika, turbo, lightning, lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count. HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (needs ComfyUI-HyperFlow-Flash). Pika \u2192 Flash hand-off: Pika (turbo_lora) runs the first handoff_step steps of pass 1, then Flash finishes from that noise level (needs a turbo_lora and the Flash inputs). The HyperFlow 8-step options were removed 2026-11-17; saved workflows with them run Pika + DMAD."}),
                 "turbo_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": PIKA_LORA if PIKA_LORA in folder_paths.get_filename_list("loras") else "none", "tooltip": "Turbo LoRA file (models/loras). Used only in Turbo LoRA mode. Default: the Pika H3 flex ref2va LoRA."}),
                 "turbo_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "Turbo LoRA strength."}),
                 "turbo_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "Sampler for Turbo LoRA mode (HyperFlow Flash always uses euler)."}),
@@ -526,6 +529,7 @@ class MiniMaxH3MasterExtender:
                 "hyperflow_flash_steps": ("INT", {"default": 6, "min": 4, "max": 8, "step": 2, "tooltip": "HyperFlow Flash (GGUF) mode only: 4 = fastest, 6 = balanced (default), 8 = best quality. Euler, CFG 1, the checkpoint's own sigma grid."}),
                 "hyperflow_flash_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "HyperFlow Flash (GGUF) mode only: a LoRA applied to the Flash pass-1 model (e.g. the Pika-for-Flash companion of a pikafold checkpoint, h3\\pika_h3_flex_ref2va_for_flash.safetensors). The normal LoRA stack only reaches pass 2."}),
                 "hyperflow_flash_lora_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "tooltip": "HyperFlow Flash (GGUF) mode only: strength of hyperflow_flash_lora on the Flash pass-1 model."}),
+                "handoff_step": ("INT", {"default": HANDOFF_STEP_DEFAULT, "min": 1, "max": 7, "step": 1, "tooltip": "Pika \u2192 Flash hand-off only: Pika runs pass-1 steps 1..N of its pdd_nfe schedule, then Flash finishes from that noise level."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -544,7 +548,7 @@ class MiniMaxH3MasterExtender:
 
     @classmethod
     def VALIDATE_INPUTS(cls, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
-                        hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None):
+                        hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None, turbo_lora=None):
         # accel_mode: API graphs saved before PDD / HyperFlow 8-step were removed still send those names;
         # migrate_legacy_accel maps them to Pika + DMAD at run time. Naming it here skips core's combo check, so
         # anything else unknown is rejected. The retired hyperflow_* / dual sampling keys are not inputs any more
@@ -560,7 +564,12 @@ class MiniMaxH3MasterExtender:
         # rewrite_reasoning_budget was an INT: API graphs (render_clip.py) still send 4096 as a number, which the
         # combo check would reject. Naming it here skips that check; prompt_rewriter.reasoning_budget maps it.
         # The Flash inputs are appended last, so an older workflow can carry master_ui's "" in the file slot: it means the default.
-        if normalize_accel_mode(accel_mode) == FLASH_ACCEL_MODE:
+        # turbo_lora is named here only for the hand-off check; naming it skips core's combo check, so repeat it.
+        if isinstance(turbo_lora, str) and turbo_lora != "none" and turbo_lora not in folder_paths.get_filename_list("loras"):
+            return f"turbo_lora: '{turbo_lora}' not in loras"
+        if normalize_accel_mode(accel_mode) == HANDOFF_ACCEL_MODE and turbo_lora in ("", "none"):
+            return "accel_mode: Pika \u2192 Flash hand-off needs a turbo_lora (the Pika LoRA), not none"
+        if normalize_accel_mode(accel_mode) in (FLASH_ACCEL_MODE, HANDOFF_ACCEL_MODE):
             if hyperflow_flash_file and hyperflow_flash_file not in _flash_files():
                 return f"hyperflow_flash_file: '{hyperflow_flash_file}' not in {_flash_files()}"
             if isinstance(hyperflow_flash_steps, (int, float)) and int(hyperflow_flash_steps) not in FLASH_STEPS:
@@ -638,7 +647,7 @@ class MiniMaxH3MasterExtender:
                       turbo_lora, pdd_nfe, turbo_sampler, turbo_scheduler, kwargs["pass2_lora"], kwargs["pass2_steps"])
         flash_file, flash_steps = FLASH_DEFAULT_FILE, 6
         flash_lora, flash_lora_strength = "none", 1.0
-        if accel_mode == FLASH_ACCEL_MODE:
+        if accel_mode in (FLASH_ACCEL_MODE, HANDOFF_ACCEL_MODE):
             flash_lora = kwargs.get("hyperflow_flash_lora") or "none"
             strength = kwargs.get("hyperflow_flash_lora_strength")
             flash_lora_strength = float(strength) if isinstance(strength, (int, float)) else 1.0
@@ -651,6 +660,13 @@ class MiniMaxH3MasterExtender:
             flash_file, flash_note = resolve_flash_file(kwargs.get("hyperflow_flash_file"), _flash_files())
             if flash_note:
                 _LOG.warning("HyperFlow Flash: %s", flash_note)
+        handoff_step = HANDOFF_STEP_DEFAULT
+        if accel_mode == HANDOFF_ACCEL_MODE:
+            if turbo_lora in (None, "", "none"):
+                raise ValueError("Pika \u2192 Flash hand-off needs a turbo_lora (the Pika LoRA); it is none")
+            raw_step = kwargs.get("handoff_step")
+            handoff_step = clamp_handoff_step(raw_step if isinstance(raw_step, (int, float)) and raw_step else HANDOFF_STEP_DEFAULT,
+                                              int(pdd_nfe))
         owner = str(unique_id if unique_id is not None else "master_extender")
         export_profile = None
         for config in (prompt or {}).values():
@@ -920,6 +936,7 @@ class MiniMaxH3MasterExtender:
             hyperflow_flash_steps=flash_steps,
             hyperflow_flash_lora=flash_lora,
             hyperflow_flash_lora_strength=flash_lora_strength,
+            handoff_step=handoff_step,
             background_busy=lambda: background["worker"] is not None and background["worker"].busy(),
             wait_background=lambda: _finish_background(),
         )
@@ -976,6 +993,11 @@ class MiniMaxH3MasterExtender:
             p1_settings["flash"] = [flash_file, flash_steps]
             if flash_lora != "none":
                 p1_settings["flash"] += [flash_lora, flash_lora_strength]
+
+        if accel_mode == HANDOFF_ACCEL_MODE:
+            # Only in hand-off mode (the Pika parts are already in the base keys): a different Flash file / steps /
+            # LoRA or hand-off step never shares a cached pass 1.
+            p1_settings["handoff"] = [flash_file, flash_steps, flash_lora, flash_lora_strength, handoff_step]
 
         clip_pictures = [clip_picture_keys(c, refs, n + 1) for n, c in enumerate(clips)]
         if any(p is not None for p in clip_pictures):
