@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, PIKA_LORA, DMAD_LORA, flashStepsValue, flashFileValue } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, PIKA_LORA, DMAD_LORA, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -113,6 +113,11 @@ for (const file of workflows) {
 assert.equal(flashStepsValue(""), 6);
 assert.equal(flashStepsValue(5), 6);
 assert.deepEqual([4, 6, 8].map(flashStepsValue), [4, 6, 8]);
+assert.equal(flashLoraValue("", ["none", "a.safetensors"]), "none");
+assert.equal(flashLoraValue("gone.safetensors", ["none", "a.safetensors"]), "none");
+assert.equal(flashLoraValue("a.safetensors", ["none", "a.safetensors"]), "a.safetensors");
+assert.equal(flashLoraStrengthValue(""), 1.0);
+assert.equal(flashLoraStrengthValue(0.5), 0.5);
 const flashFiles = ["a_ref2va_hyperflow_flash.gguf", "b_ref2va_hyperflow_flash.gguf"];
 assert.equal(flashFileValue("", flashFiles), flashFiles[0]);
 assert.equal(flashFileValue("gone.gguf", flashFiles), flashFiles[0]);

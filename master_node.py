@@ -524,6 +524,8 @@ class MiniMaxH3MasterExtender:
                 # --- HyperFlow Flash (GGUF) (appended last so saved workflows keep their widget order) ---
                 "hyperflow_flash_file": (_flash_files(), {"default": default_flash_file(_flash_files()), "tooltip": "HyperFlow Flash (GGUF) mode only: the Flash transformer for pass 1: a GGUF build (needs ComfyUI-GGUF) or an INT8 convrot .safetensors build (needs ComfyUI-HyperFlow-Flash >= 1.1.0), from diffusion_models. The default is the INT8 ref2va build when installed, else the Q8_0 GGUF. The extender renders Ref2VA, so pick a ref2va build; an fl2va pick is swapped for its ref2va sibling when installed, otherwise the job stops. The base model input is used for pass 2 only in this mode."}),
                 "hyperflow_flash_steps": ("INT", {"default": 6, "min": 4, "max": 8, "step": 2, "tooltip": "HyperFlow Flash (GGUF) mode only: 4 = fastest, 6 = balanced (default), 8 = best quality. Euler, CFG 1, the checkpoint's own sigma grid."}),
+                "hyperflow_flash_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "HyperFlow Flash (GGUF) mode only: a LoRA applied to the Flash pass-1 model (e.g. the Pika-for-Flash companion of a pikafold checkpoint, h3\\pika_h3_flex_ref2va_for_flash.safetensors). The normal LoRA stack only reaches pass 2."}),
+                "hyperflow_flash_lora_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "tooltip": "HyperFlow Flash (GGUF) mode only: strength of hyperflow_flash_lora on the Flash pass-1 model."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -542,7 +544,7 @@ class MiniMaxH3MasterExtender:
 
     @classmethod
     def VALIDATE_INPUTS(cls, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
-                        hyperflow_flash_file=None, hyperflow_flash_steps=None):
+                        hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None):
         # accel_mode: API graphs saved before PDD / HyperFlow 8-step were removed still send those names;
         # migrate_legacy_accel maps them to Pika + DMAD at run time. Naming it here skips core's combo check, so
         # anything else unknown is rejected. The retired hyperflow_* / dual sampling keys are not inputs any more
@@ -563,6 +565,8 @@ class MiniMaxH3MasterExtender:
                 return f"hyperflow_flash_file: '{hyperflow_flash_file}' not in {_flash_files()}"
             if isinstance(hyperflow_flash_steps, (int, float)) and int(hyperflow_flash_steps) not in FLASH_STEPS:
                 return f"hyperflow_flash_steps: {hyperflow_flash_steps!r} not in {list(FLASH_STEPS)}"
+            if hyperflow_flash_lora and hyperflow_flash_lora != "none" and hyperflow_flash_lora not in folder_paths.get_filename_list("loras"):
+                return f"hyperflow_flash_lora: '{hyperflow_flash_lora}' not in loras"
         return True
 
     @classmethod
@@ -633,7 +637,11 @@ class MiniMaxH3MasterExtender:
             _LOG.info("Saved HyperFlow 8-step settings migrated: Turbo LoRA %s (%s steps, %s / %s), pass 2 %s (%s steps)",
                       turbo_lora, pdd_nfe, turbo_sampler, turbo_scheduler, kwargs["pass2_lora"], kwargs["pass2_steps"])
         flash_file, flash_steps = FLASH_DEFAULT_FILE, 6
+        flash_lora, flash_lora_strength = "none", 1.0
         if accel_mode == FLASH_ACCEL_MODE:
+            flash_lora = kwargs.get("hyperflow_flash_lora") or "none"
+            strength = kwargs.get("hyperflow_flash_lora_strength")
+            flash_lora_strength = float(strength) if isinstance(strength, (int, float)) else 1.0
             flash_steps = check_flash_steps(kwargs.get("hyperflow_flash_steps") or 6)
             pack = flash_pack_module()
             if pack is None:
@@ -910,6 +918,8 @@ class MiniMaxH3MasterExtender:
             pass2_sla_sparsity=pass2_sla_sparsity,
             hyperflow_flash_file=flash_file,
             hyperflow_flash_steps=flash_steps,
+            hyperflow_flash_lora=flash_lora,
+            hyperflow_flash_lora_strength=flash_lora_strength,
             background_busy=lambda: background["worker"] is not None and background["worker"].busy(),
             wait_background=lambda: _finish_background(),
         )
@@ -964,6 +974,8 @@ class MiniMaxH3MasterExtender:
         if accel_mode == FLASH_ACCEL_MODE:
             # Only in Flash mode, so pass-1 caches of every other mode keep their fingerprint.
             p1_settings["flash"] = [flash_file, flash_steps]
+            if flash_lora != "none":
+                p1_settings["flash"] += [flash_lora, flash_lora_strength]
 
         clip_pictures = [clip_picture_keys(c, refs, n + 1) for n, c in enumerate(clips)]
         if any(p is not None for p in clip_pictures):

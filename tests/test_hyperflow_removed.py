@@ -190,7 +190,7 @@ class Defaults(unittest.TestCase):
     def test_the_input_order_is_the_old_order_minus_the_removed_inputs(self):
         names = re.findall(r'^\s{16}"(\w+)": \(', self.text[self.text.index("def INPUT_TYPES"):], re.M)
         self.assertEqual(names[:len(KEPT_INPUT_NAMES)], KEPT_INPUT_NAMES)
-        self.assertEqual(names[len(KEPT_INPUT_NAMES):], ["pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "hyperflow_flash_file", "hyperflow_flash_steps", "clips_in"])
+        self.assertEqual(names[len(KEPT_INPUT_NAMES):], ["pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength", "clips_in"])
 
     def test_the_pass1_fingerprint_keeps_its_keys(self):
         tree = ast.parse(self.text)

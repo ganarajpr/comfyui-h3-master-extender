@@ -140,3 +140,14 @@ export function flashFileValue(value, options) {
     if (Array.isArray(options) && options.length) return FLASH_FILE_PREFERENCE.find(n => options.includes(n)) ?? options[0];
     return FLASH_FILE_PREFERENCE[0];
 }
+// hyperflow_flash_lora and hyperflow_flash_lora_strength are appended after hyperflow_flash_steps: a workflow saved before them
+// carries master_ui's "" in the lora slot. "" / unknown lora = "none"; a non-number strength = 1.
+export const FLASH_LORA_STRENGTH_DEFAULT = 1.0;
+export function flashLoraValue(value, options) {
+    if (typeof value !== "string" || value === "") return "none";
+    if (Array.isArray(options) && !options.includes(value)) return "none";
+    return value;
+}
+export function flashLoraStrengthValue(value) {
+    return typeof value === "number" && Number.isFinite(value) ? value : FLASH_LORA_STRENGTH_DEFAULT;
+}

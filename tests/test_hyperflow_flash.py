@@ -21,8 +21,9 @@ def _engine_ns():
               if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("FLASH_ACCEL_MODE", "FLASH_STEPS", "FLASH_DEFAULT_FILE", "FLASH_FALLBACK_FILE")
                                                     for t in n.targets))
               or (isinstance(n, ast.FunctionDef) and n.name in ("resolve_flash_file", "check_flash_steps", "flash_file_list", "default_flash_file",
-                                                               "check_flash_file_supported", "load_flash_model", "hyperflow_tail_sigmas"))]
-    ns = {}
+                                                               "check_flash_file_supported", "load_flash_model", "hyperflow_tail_sigmas",
+                                                               "warn_pikafold_without_lora", "apply_flash_lora"))]
+    ns = {"_LOG": logging.getLogger("test_hyperflow_flash")}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(ENGINE), "exec"), ns)
     return ns
 
@@ -177,7 +178,10 @@ class NodeWiring(unittest.TestCase):
     def test_new_inputs_are_last_before_the_clips_in_socket(self):
         import re
         names = re.findall(r'^\s{16}"(\w+)": \(', self.text[self.text.index("def INPUT_TYPES"):], re.M)
-        self.assertEqual(names[-3:], ["hyperflow_flash_file", "hyperflow_flash_steps", "clips_in"])
+        self.assertEqual(names[-5:], ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora",
+                                      "hyperflow_flash_lora_strength", "clips_in"])
+        self.assertRegex(self.text, r'"hyperflow_flash_lora": \(\["none"\] \+ folder_paths\.get_filename_list\("loras"\), \{"default": "none"')
+        self.assertRegex(self.text, r'"hyperflow_flash_lora_strength": \("FLOAT", \{"default": 1\.0, "min": -4\.0, "max": 4\.0, "step": 0\.05')
         self.assertRegex(self.text, r'"hyperflow_flash_file": \(_flash_files\(\), \{"default": default_flash_file\(_flash_files\(\)\)')
         self.assertRegex(self.text, r'"hyperflow_flash_steps": \("INT", \{"default": 6, "min": 4, "max": 8, "step": 2')
 
@@ -189,6 +193,78 @@ class NodeWiring(unittest.TestCase):
         literal = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict)
                        and any(getattr(t, "id", "") == "p1_settings" for t in n.targets))
         self.assertNotIn("flash", [k.value for k in literal.value.keys])
+
+    def test_flash_fingerprint_includes_the_lora_only_when_set(self):
+        i = self.text.index('p1_settings["flash"] = [flash_file, flash_steps]')
+        block = self.text[i:i + 250]
+        self.assertIn('if flash_lora != "none":', block)
+        self.assertIn('p1_settings["flash"] += [flash_lora, flash_lora_strength]', block)
+
+    def test_lora_is_ignored_outside_flash_mode(self):
+        i = self.text.index('flash_lora, flash_lora_strength = "none", 1.0')
+        j = self.text.index("if accel_mode == FLASH_ACCEL_MODE:", i)
+        self.assertLess(i, j)
+        self.assertEqual(self.text.count('kwargs.get("hyperflow_flash_lora")'), 1)
+        self.assertGreater(self.text.index('kwargs.get("hyperflow_flash_lora")'), j)
+
+
+class FlashLora(unittest.TestCase):
+    def setUp(self):
+        import sys
+        self.calls = []
+        calls = self.calls
+
+        class Patched:
+            patches = {"a": 1, "b": 2}
+
+        comfy = types.ModuleType("comfy")
+        sd = types.ModuleType("comfy.sd")
+        sd.load_lora_for_models = lambda m, c, sdict, sm, sc: calls.append(("apply", m, c, sdict, sm, sc)) or (Patched(), None)
+        utils = types.ModuleType("comfy.utils")
+        utils.load_torch_file = lambda path, safe_load=False: calls.append(("load", path, safe_load)) or {"w": 1}
+        fp = types.ModuleType("folder_paths")
+        fp.get_full_path_or_raise = lambda kind, name: f"/{kind}/{name}"
+        comfy.sd, comfy.utils = sd, utils
+        self.saved = {k: sys.modules.get(k) for k in ("comfy", "comfy.sd", "comfy.utils", "folder_paths")}
+        sys.modules.update({"comfy": comfy, "comfy.sd": sd, "comfy.utils": utils, "folder_paths": fp})
+        NS["comfy"] = comfy
+
+    def tearDown(self):
+        import sys
+        for k, v in self.saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        NS.pop("comfy", None)
+
+    def test_apply_loads_the_lora_and_patches_the_model_only(self):
+        model = object()
+        with self.assertLogs("test_hyperflow_flash", "INFO") as cm:
+            out = NS["apply_flash_lora"](model, "h3\\x_for_flash.safetensors", 1.0)
+        self.assertEqual(self.calls[0], ("load", "/loras/h3\\x_for_flash.safetensors", True))
+        self.assertEqual(self.calls[1][1:3], (model, None))
+        self.assertEqual(self.calls[1][4:], (1.0, 0))
+        self.assertEqual(len(out.patches), 2)
+        self.assertIn("2 patched keys", cm.output[0])
+
+    def test_engine_applies_it_after_the_load_and_before_sigma_shift(self):
+        src = ENGINE.read_text(encoding="utf-8")
+        i = src.index("warn_pikafold_without_lora(name, self.flash_lora)")
+        self.assertIn("apply_flash_lora(patcher, self.flash_lora, self.flash_lora_strength)", src[i:i + 300])
+        self.assertLess(i, src.index("self._apply_sigma_shift(patcher)"))
+        self.assertLess(src.index("patcher = load_flash_model(pack, name)"), i)
+
+    def test_warning_for_pikafold_without_lora(self):
+        warn = NS["warn_pikafold_without_lora"]
+        with self.assertLogs("test_hyperflow_flash", "WARNING") as cm:
+            warn("minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikafold.safetensors", "none")
+        self.assertIn("_for_flash", cm.output[0])
+        with self.assertLogs("test_hyperflow_flash", "INFO") as quiet:
+            logging.getLogger("test_hyperflow_flash").info("marker")
+            warn("minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikafold.safetensors", "h3\\x_for_flash.safetensors")
+            warn(INT8, "none")
+        self.assertEqual([r.levelname for r in quiet.records], ["INFO"])
 
 
 if __name__ == "__main__":
