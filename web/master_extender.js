@@ -1054,7 +1054,7 @@ app.registerExtension({
                     }
                 } else if (isFlash()) {
                     wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName }),
-                        { hint: "Pass 1 runs this Flash GGUF transformer (ref2va build). The base model input is used for pass 2 only." }));
+                        { hint: "Pass 1 runs this Flash transformer (ref2va build, GGUF or INT8 convrot safetensors). The base model input is used for pass 2 only." }));
                     wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps"),
                         { hint: "4 fastest, 6 balanced, 8 best quality. Euler, CFG 1." }));
                     wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD). Dual sampling, pass 1 steps and the HyperFlow 8-step rows do not apply."));

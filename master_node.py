@@ -61,7 +61,11 @@ from .pdd_pure_engine import (
     FLASH_ACCEL_MODE,
     FLASH_DEFAULT_FILE,
     FLASH_STEPS,
+    check_flash_file_supported,
     check_flash_steps,
+    default_flash_file,
+    flash_file_list,
+    flash_pack_module,
     resolve_flash_file,
 )
 
@@ -366,15 +370,14 @@ def _hyperflow_files():
 
 
 def _flash_files():
-    """HyperFlow Flash GGUF builds: .gguf files with 'hyperflow_flash' in the name, in diffusion_models / unet."""
-    names = set()
+    """HyperFlow Flash builds: .gguf and .safetensors files with 'hyperflow_flash' in the name, in diffusion_models / unet."""
+    scanned = set()
     for key in ("unet_gguf", "diffusion_models", "unet"):
         try:
-            names.update(n for n in folder_paths.get_filename_list(key)
-                         if n.lower().endswith(".gguf") and "hyperflow_flash" in n.lower())
+            scanned.update(folder_paths.get_filename_list(key))
         except Exception:
             pass
-    return sorted(names) or [FLASH_DEFAULT_FILE]
+    return flash_file_list(flash_pack_module(), sorted(scanned)) or [FLASH_DEFAULT_FILE]
 
 
 class MiniMaxH3MasterExtender:
@@ -531,7 +534,7 @@ class MiniMaxH3MasterExtender:
                 "pass2_scheduler": (["same as pass 1"] + list(comfy.samplers.KSampler.SCHEDULERS), {"default": "same as pass 1", "tooltip": "Scheduler for pass 2's tail sigmas (BasicScheduler over round(steps x pass2_denoise) steps at pass2_denoise). 'same as pass 1' = turbo_scheduler (the long-standing behaviour). Applies in Turbo LoRA mode and with a pass-2 LoRA; HyperFlow's own tail ignores it."}),
                 "pass2_audio": (["pass 2 (refined)", "pass 1"], {"default": "pass 2 (refined)", "tooltip": "Which audio the clip keeps. 'pass 2 (refined)' = the audio pass 2 re-sampled (the long-standing behaviour). 'pass 1' = the pass-1 audio latent is swapped back in after pass 2, so only the video comes from pass 2 (the '10Eros-Max' sample workflow's 'Use first pass audio')."}),
                 # --- HyperFlow Flash (GGUF) (appended last so saved workflows keep their widget order) ---
-                "hyperflow_flash_file": (_flash_files(), {"default": FLASH_DEFAULT_FILE, "tooltip": "HyperFlow Flash (GGUF) mode only: the Flash transformer for pass 1 (diffusion_models, needs ComfyUI-HyperFlow-Flash + ComfyUI-GGUF). The extender renders Ref2VA, so pick a ref2va build; an fl2va pick is swapped for its ref2va sibling when installed, otherwise the job stops. The base model input is used for pass 2 only in this mode."}),
+                "hyperflow_flash_file": (_flash_files(), {"default": default_flash_file(_flash_files()), "tooltip": "HyperFlow Flash (GGUF) mode only: the Flash transformer for pass 1: a GGUF build (needs ComfyUI-GGUF) or an INT8 convrot .safetensors build (needs ComfyUI-HyperFlow-Flash >= 1.1.0), from diffusion_models. The default is the INT8 ref2va build when installed, else the Q8_0 GGUF. The extender renders Ref2VA, so pick a ref2va build; an fl2va pick is swapped for its ref2va sibling when installed, otherwise the job stops. The base model input is used for pass 2 only in this mode."}),
                 "hyperflow_flash_steps": ("INT", {"default": 6, "min": 4, "max": 8, "step": 2, "tooltip": "HyperFlow Flash (GGUF) mode only: 4 = fastest, 6 = balanced (default), 8 = best quality. Euler, CFG 1, the checkpoint's own sigma grid."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -635,12 +638,14 @@ class MiniMaxH3MasterExtender:
         flash_file, flash_steps = FLASH_DEFAULT_FILE, 6
         if accel_mode == FLASH_ACCEL_MODE:
             flash_steps = check_flash_steps(kwargs.get("hyperflow_flash_steps") or 6)
-            flash_file, flash_note = resolve_flash_file(kwargs.get("hyperflow_flash_file") or FLASH_DEFAULT_FILE, _flash_files())
+            pack = flash_pack_module()
+            if pack is None:
+                raise RuntimeError("HyperFlow Flash needs the ComfyUI-HyperFlow-Flash node pack (and ComfyUI-GGUF for GGUF builds) in custom_nodes: "
+                                   "git clone https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash, then restart ComfyUI.")
+            check_flash_file_supported(pack, kwargs.get("hyperflow_flash_file"))
+            flash_file, flash_note = resolve_flash_file(kwargs.get("hyperflow_flash_file"), _flash_files())
             if flash_note:
                 _LOG.warning("HyperFlow Flash: %s", flash_note)
-            if nodes.NODE_CLASS_MAPPINGS.get("HyperFlowGGUFLoader") is None:
-                raise RuntimeError("HyperFlow Flash (GGUF) needs the ComfyUI-HyperFlow-Flash node pack (and ComfyUI-GGUF) in custom_nodes: "
-                                   "git clone https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash, then restart ComfyUI.")
             if dual_mode or kwargs.get("dual_sampling") or kwargs.get("pass1_steps"):
                 _LOG.warning("HyperFlow Flash: dual sampling and pass1_steps are HyperFlow 8-step features and are ignored")
         owner = str(unique_id if unique_id is not None else "master_extender")
