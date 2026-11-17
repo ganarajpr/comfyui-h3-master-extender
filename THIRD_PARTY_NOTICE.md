@@ -39,9 +39,6 @@ change is recorded in CHANGELOG.md and the git history.
   Provides MinimaxH3LatentUpscaler3D. Refer to that project for its terms.
   (The original build linked xmarre's copy, since renamed
   xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus.)
-- Adudeguyman/ComfyUI-HyperFlow-H3:
-  https://github.com/Adudeguyman/ComfyUI-HyperFlow-H3
-  Provides ApplyHyperFlowH3 for the HyperFlow 8-step mode.
 - pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI:
   https://github.com/pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI
   Model sessions for the built-in prompt rewriter and story engines.
@@ -53,7 +50,7 @@ Dependency code and model artifacts are not bundled in this release.
 
 ## Changes in this distribution
 
-The Master Extender combines two-pass HyperFlow / Turbo LoRA generation and learned 3D latent
+The Master Extender combines two-pass Turbo LoRA / HyperFlow Flash generation and learned 3D latent
 upscaling with clip review, continuity, project controls, and final decoding.
 The release prepared on 2026-09-11 blanks the initial Python and frontend prompt
 defaults and supplies a sanitized workflow, requirements, and installation
