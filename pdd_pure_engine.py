@@ -11,6 +11,7 @@ import inspect
 import math
 import logging
 import os
+import re
 import sys
 import torch
 import comfy.model_management
@@ -144,7 +145,15 @@ def _upscaler_precision(model_name, default="fp16"):
 
 FLASH_ACCEL_MODE = "HyperFlow Flash (GGUF)"
 HANDOFF_ACCEL_MODE = "Pika \u2192 Flash hand-off"
+HANDOFF_STEP_OPTIONS = [
+    "1 \u00b7 Pika to 0.98",
+    "2 \u00b7 Pika to 0.96",
+    "3 \u00b7 Pika to 0.92",
+    "4 \u00b7 Pika to 0.86",
+    "5 \u00b7 Pika to 0.71",
+]
 HANDOFF_STEP_DEFAULT = 3
+HANDOFF_STEP_DEFAULT_LABEL = HANDOFF_STEP_OPTIONS[2]
 FLASH_STEPS = (4, 6, 8)
 FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
 FLASH_FALLBACK_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
@@ -263,6 +272,12 @@ def hyperflow_tail_sigmas(grid, denoise):
     steps = len(grid) - 1
     tail = max(1, int(round(steps * float(denoise))))
     return grid[-(tail + 1):]
+
+
+def parse_handoff_step(value):
+    """Combo label ("3 \u00b7 Pika to 0.92") -> its leading integer; an unparseable value is the default."""
+    m = re.match(r"\s*(\d+)", str(value))
+    return int(m.group(1)) if m else HANDOFF_STEP_DEFAULT
 
 
 def clamp_handoff_step(step, nfe):
@@ -1046,7 +1061,7 @@ class MasterEngine:
         flash_model = self.initialize_flash_model()
         k = clamp_handoff_step(self.handoff_step, len(pika_sigmas) - 1)
         pika_seg, flash_seg, sigma = split_handoff_sigmas(pika_sigmas, k, self.flash_grid)
-        _LOG.info("Pika \u2192 Flash hand-off: Pika steps 1..%d (sigma 1.0\u2192%.4f), Flash %d steps (%.4f\u21920) [%s]",
+        _LOG.info("Pika -> Flash hand-off: Pika steps 1..%d (sigma 1.0->%.4f), Flash %d steps (%.4f->0) [%s]",
                   k, sigma, len(flash_seg) - 1, sigma, self.flash_file)
         mid = self._sample_euler(pika_model, positive, latent, torch.tensor(pika_seg, dtype=torch.float32), seed)
         return self._sample_euler(flash_model, positive, mid, torch.tensor(flash_seg, dtype=torch.float32), seed,

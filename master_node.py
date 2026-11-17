@@ -60,6 +60,9 @@ from .pdd_pure_engine import (
     HANDOFF_ACCEL_MODE,
     HANDOFF_STEP_DEFAULT,
     clamp_handoff_step,
+    parse_handoff_step,
+    HANDOFF_STEP_OPTIONS,
+    HANDOFF_STEP_DEFAULT_LABEL,
     FLASH_DEFAULT_FILE,
     FLASH_STEPS,
     check_flash_file_supported,
@@ -529,7 +532,7 @@ class MiniMaxH3MasterExtender:
                 "hyperflow_flash_steps": ("INT", {"default": 6, "min": 4, "max": 8, "step": 2, "tooltip": "HyperFlow Flash (GGUF) mode only: 4 = fastest, 6 = balanced (default), 8 = best quality. Euler, CFG 1, the checkpoint's own sigma grid."}),
                 "hyperflow_flash_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "HyperFlow Flash (GGUF) mode only: a LoRA applied to the Flash pass-1 model (e.g. the Pika-for-Flash companion of a pikafold checkpoint, h3\\pika_h3_flex_ref2va_for_flash.safetensors). The normal LoRA stack only reaches pass 2."}),
                 "hyperflow_flash_lora_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "tooltip": "HyperFlow Flash (GGUF) mode only: strength of hyperflow_flash_lora on the Flash pass-1 model."}),
-                "handoff_step": ("INT", {"default": HANDOFF_STEP_DEFAULT, "min": 1, "max": 7, "step": 1, "tooltip": "Pika \u2192 Flash hand-off only: Pika runs pass-1 steps 1..N of its pdd_nfe schedule, then Flash finishes from that noise level."}),
+                "handoff_step": (HANDOFF_STEP_OPTIONS, {"default": HANDOFF_STEP_DEFAULT_LABEL, "tooltip": "Pika \u2192 Flash hand-off only: how many of Pika's 6 pass-1 steps run before Flash takes over; the decimal is the noise level left at the hand-off (measured for pdd_nfe 6, simple scheduler, shift 12). With other pdd_nfe values the decimal is approximate, and the step is clamped to pdd_nfe - 1."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -664,9 +667,7 @@ class MiniMaxH3MasterExtender:
         if accel_mode == HANDOFF_ACCEL_MODE:
             if turbo_lora in (None, "", "none"):
                 raise ValueError("Pika \u2192 Flash hand-off needs a turbo_lora (the Pika LoRA); it is none")
-            raw_step = kwargs.get("handoff_step")
-            handoff_step = clamp_handoff_step(raw_step if isinstance(raw_step, (int, float)) and raw_step else HANDOFF_STEP_DEFAULT,
-                                              int(pdd_nfe))
+            handoff_step = clamp_handoff_step(parse_handoff_step(kwargs.get("handoff_step")), int(pdd_nfe))
         owner = str(unique_id if unique_id is not None else "master_extender")
         export_profile = None
         for config in (prompt or {}).values():

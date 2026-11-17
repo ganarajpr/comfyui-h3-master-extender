@@ -154,8 +154,9 @@ export function flashLoraStrengthValue(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : FLASH_LORA_STRENGTH_DEFAULT;
 }
 // handoff_step is appended after hyperflow_flash_lora_strength: a workflow saved before it carries master_ui's "" in that slot.
-// A non-integer or out-of-range value = 3.
-export const HANDOFF_STEP_DEFAULT = 3;
+// Anything that is not one of the combo labels = the default.
+export const HANDOFF_STEP_OPTIONS = ["1 \u00b7 Pika to 0.98", "2 \u00b7 Pika to 0.96", "3 \u00b7 Pika to 0.92", "4 \u00b7 Pika to 0.86", "5 \u00b7 Pika to 0.71"];
+export const HANDOFF_STEP_DEFAULT = HANDOFF_STEP_OPTIONS[2];
 export function handoffStepValue(value) {
-    return Number.isInteger(value) && value >= 1 && value <= 7 ? value : HANDOFF_STEP_DEFAULT;
+    return HANDOFF_STEP_OPTIONS.includes(value) ? value : HANDOFF_STEP_DEFAULT;
 }
