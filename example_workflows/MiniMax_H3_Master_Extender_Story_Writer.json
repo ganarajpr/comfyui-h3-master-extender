@@ -239,7 +239,7 @@
       },
       "widgets_values": [
         24,
-        "MiniMax_H3_Master_HyperFlow_Action",
+        "MiniMax_H3_Master_Action",
         "",
         "H.264",
         17,
@@ -250,7 +250,7 @@
       ],
       "widgets_values_named": {
         "fps": 24,
-        "filename_prefix": "MiniMax_H3_Master_HyperFlow_Action",
+        "filename_prefix": "MiniMax_H3_Master_Action",
         "output_directory": "",
         "codec": "H.264",
         "crf": 17,
@@ -410,13 +410,13 @@
         "Node name for S&R": "SaveVideo"
       },
       "widgets_values": [
-        "video/MiniMax_H3_Master_HyperFlow_Action",
+        "video/MiniMax_H3_Master_Action",
         "auto",
         "auto",
         "auto"
       ],
       "widgets_values_named": {
-        "filename_prefix": "video/MiniMax_H3_Master_HyperFlow_Action",
+        "filename_prefix": "video/MiniMax_H3_Master_Action",
         "format": "auto",
         "format.codec": "auto",
         "codec": "auto"
@@ -1136,46 +1136,6 @@
           "shape": 7
         },
         {
-          "localized_name": "hyperflow_file",
-          "name": "hyperflow_file",
-          "type": "COMBO",
-          "widget": {
-            "name": "hyperflow_file"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
-          "localized_name": "hyperflow_curve_refit",
-          "name": "hyperflow_curve_refit",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "hyperflow_curve_refit"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
-          "localized_name": "hyperflow_strength",
-          "name": "hyperflow_strength",
-          "type": "FLOAT",
-          "widget": {
-            "name": "hyperflow_strength"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
-          "localized_name": "hyperflow_lora_mode",
-          "name": "hyperflow_lora_mode",
-          "type": "COMBO",
-          "widget": {
-            "name": "hyperflow_lora_mode"
-          },
-          "link": null,
-          "shape": 7
-        },
-        {
           "localized_name": "audio_refine_steps",
           "name": "audio_refine_steps",
           "type": "INT",
@@ -1382,7 +1342,7 @@
         "608x352 (16:9)",
         "1280x720",
         0.25,
-        "8",
+        "6",
         "22",
         0,
         true,
@@ -1397,12 +1357,12 @@
         "off",
         "sla",
         1.3,
-        "HyperFlow 8-step",
-        "none",
+        "Turbo LoRA",
+        "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors",
         1.0,
-        "res_multistep",
+        "euler",
         "simple",
-        "h3\\taomate_h3_3step_comfy.safetensors",
+        "h3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors",
         1.0,
         "replace engine LoRA",
         4,
@@ -1423,10 +1383,6 @@
         3,
         "",
         "final prompts",
-        "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors",
-        true,
-        1.0,
-        "bypass",
         0,
         0.5,
         true,
@@ -1667,7 +1623,7 @@
       18,
       0,
       6,
-      82,
+      78,
       "STRING"
     ],
     [
@@ -1682,7 +1638,7 @@
   "groups": [
     {
       "id": 1,
-      "title": "MiniMax H3 Master Extender (HyperFlow 8-step action preset, SLA 0.9, taomate pass 2)",
+      "title": "MiniMax H3 Master Extender (Pika + DMAD action preset, SLA 0.9)",
       "bounding": [
         -284.322879052461,
         -174.0795973838694,

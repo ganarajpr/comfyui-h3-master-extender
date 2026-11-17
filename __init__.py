@@ -1,7 +1,7 @@
 """
 MiniMax H3 Master Extender Suite
 =================================
-Combining the Pure 2-Stage 2-Pass HyperFlow 8-step / Turbo LoRA + 3D Latent Upscaler Engine
+Combining the Pure 2-Stage 2-Pass Turbo LoRA / HyperFlow Flash + 3D Latent Upscaler Engine
 with the Multishot Master Extender UI & Continuity Architecture.
 """
 

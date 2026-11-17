@@ -1,22 +1,20 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, DUAL_DEFAULTS, flashStepsValue, flashFileValue } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, PIKA_LORA, DMAD_LORA, flashStepsValue, flashFileValue } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
+assert(!workflows.some(f => /DualSampling/.test(f)), "the dual sampling examples were removed with HyperFlow 8-step");
 
 for (const file of workflows) {
     const flow = JSON.parse(fs.readFileSync(new URL(`../example_workflows/${file}`, import.meta.url), "utf8"));
     const node = flow.nodes.find(n => n.type === "MiniMaxH3MasterExtender");
     // widget order of the current node = its widget inputs, then the JS-only master_ui
-    const DUAL = Object.keys(DUAL_DEFAULTS);
-    const allNames = [...node.inputs.filter(i => i.widget).map(i => i.name), "master_ui"];
-    const allValues = node.widgets_values;
-    // dual sampling widgets sit between sparse_sink and master_ui; the older layout assertions below run without them
-    const hasDual = allNames.includes("dual_sampling");
-    if (hasDual) assert.deepEqual(allNames.slice(-4), [...DUAL, "master_ui"].slice(0, 3).concat("master_ui"), `${file}: dual widgets are last`);
-    const names = allNames.filter(n => !DUAL.includes(n));
-    const current = allValues.filter((_, i) => !DUAL.includes(allNames[i]));
+    const names = [...node.inputs.filter(i => i.widget).map(i => i.name), "master_ui"];
+    const current = node.widgets_values;
+    for (const gone of ["hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength", "hyperflow_lora_mode", "dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps"]) {
+        assert(!names.includes(gone), `${file}: ${gone} is gone`);
+    }
     assert.deepEqual(names.slice(-5), ["e4_picture_notes", "sparse_start_percent", "sparse_dense_blocks", "sparse_sink", "master_ui"], `${file}: sparse widgets are last`);
     assert.deepEqual(current.slice(-4), [-1, "auto", "auto", ""], file);
     assert.equal(names.length, current.length, file);
@@ -55,45 +53,60 @@ for (const file of workflows) {
 
 assert.equal(dropCaptionModelValue(["rewrite_writer_model"], ["w"]), null);
 
-// dual sampling widgets: old arrays leave them undefined or hold master_ui's "" -> defaults; real values are kept
-for (const name of Object.keys(DUAL_DEFAULTS)) {
-    for (const bad of [undefined, "", null, "x", 0, 7, 2.5]) assert.equal(dualWidgetValue(name, bad), DUAL_DEFAULTS[name], `${name} <- ${String(bad)}`);
-}
-assert.equal(dualWidgetValue("dual_sampling", true), true);
-assert.equal(dualWidgetValue("pass1_early_stop", true), true);
-assert.equal(dualWidgetValue("dual_split_step", 6), 6);
-assert.deepEqual(DUAL_DEFAULTS, { dual_sampling: false, dual_split_step: 2, pass1_early_stop: false });
-{
-    const flow = JSON.parse(fs.readFileSync(new URL("../example_workflows/MiniMax_H3_Master_Extender_HyperFlow_DualSampling.json", import.meta.url), "utf8"));
-    const node = flow.nodes.find(n => n.type === "MiniMaxH3MasterExtender");
-    const names = [...node.inputs.filter(i => i.widget).map(i => i.name), "master_ui"];
-    assert.equal(names.length, node.widgets_values.length);
-    const get = (n) => node.widgets_values[names.indexOf(n)];
-    assert.deepEqual([get("dual_sampling"), get("dual_split_step"), get("pass1_early_stop")], [true, 2, false]);
-    assert.equal(get("pass2_lora"), "none");
-    assert.equal(get("accel_mode"), "HyperFlow 8-step");
-    assert.equal(get("pass1_resolution"), "608x352 (16:9)");
-    assert.equal(get("pass2_resolution"), "1344x768 (16:9)");
-}
 assert.equal(dropCaptionModelValue(["rewrite_writer_model", "rewrite_caption_length"], undefined), null);
 
 const table = [[-1, "4096"], [0, "4096"], [512, "1024"], [1024, "1024"], [1500, "1024"], [1536, "2048"], [2048, "2048"],
     [3072, "4096"], [4096, "4096"], [8192, "4096"], [16384, "4096"], [32768, "4096"], ["2048", "2048"], ["", "4096"], [null, "4096"], ["x", "4096"]];
 for (const [given, want] of table) assert.equal(normalizeReasoningBudget(given), want, String(given));
-const accelNames = ["pdd_file", "accel_mode", "pdd_nfe"];
-const saved = ["minimax_h3_ref2va_pdd_acc_8step_comfyui.safetensors", "PDD 8-step", "8"];
-assert.deepEqual(migrateAccelMode(accelNames, saved), [saved[0], "HyperFlow 8-step", "8"]);
-assert.deepEqual(saved[1], "PDD 8-step", "input array is not mutated");
-assert.equal(migrateAccelMode(accelNames, [saved[0], "HyperFlow 8-step", "8"]), null);
-assert.equal(migrateAccelMode(accelNames, [saved[0], "Turbo LoRA", "4"]), null);
+const accelNames = ["pdd_file", "accel_mode", "pdd_nfe", "turbo_lora", "turbo_lora_strength", "turbo_sampler", "turbo_scheduler", "pass2_lora", "pass2_lora_strength", "pass2_lora_mode", "pass2_steps"];
+const RECIPE = [PIKA_LORA, 1.0, "euler", "simple", DMAD_LORA, 1.0, "replace engine LoRA", 4];
+// the settings of a saved HyperFlow 8-step node: no turbo LoRA, the ignored 8 / res_multistep defaults, no pass-2 LoRA, 0 steps
+const hyperflowSaved = (mode, p2 = "none", p2steps = 0) => ["x.safetensors", mode, "8", "none", 1.0, "res_multistep", "simple", p2, 1.0, "stack on engine LoRA", p2steps];
+for (const mode of ["PDD 8-step", "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"]) {
+    const saved = hyperflowSaved(mode);
+    assert.deepEqual(migrateAccelMode(accelNames, saved), ["x.safetensors", "Turbo LoRA", "6", ...RECIPE], mode);
+    assert.equal(saved[1], mode, "input array is not mutated");
+}
+// only what the old workflow left unset is filled: its own pass-2 LoRA and step count stay
+assert.deepEqual(migrateAccelMode(accelNames, hyperflowSaved("HyperFlow 8-step", "h3\\other.safetensors", 3)).slice(7), ["h3\\other.safetensors", 1.0, "stack on engine LoRA", 3]);
+// a turbo LoRA the workflow chose keeps its steps / sampler / scheduler
+assert.deepEqual(migrateAccelMode(accelNames, ["x", "HyperFlow 8-step", "8", "h3\\mine.safetensors", 0.8, "dpmpp_2m", "beta", "none", 1.0, "stack on engine LoRA", 0]).slice(1, 7), ["Turbo LoRA", "8", "h3\\mine.safetensors", 0.8, "dpmpp_2m", "beta"]);
+for (const keep of ["Turbo LoRA", "HyperFlow Flash (GGUF)"]) assert.equal(migrateAccelMode(accelNames, hyperflowSaved(keep)), null, keep);
 assert.equal(migrateAccelMode(["pdd_file"], ["x"]), null);
 assert.equal(migrateAccelMode(accelNames, undefined), null);
+assert(isLegacyAccelMode("HyperFlow 8-step") && isLegacyAccelMode("PDD 8-step") && !isLegacyAccelMode("HyperFlow Flash (GGUF)") && !isLegacyAccelMode("Turbo LoRA"));
 for (const file of workflows) {
     const flow = JSON.parse(fs.readFileSync(new URL(`../example_workflows/${file}`, import.meta.url), "utf8"));
     const node = flow.nodes.find(n => n.type === "MiniMaxH3MasterExtender");
     const names = node.inputs.filter(i => i.widget).map(i => i.name);
-    assert.equal(migrateAccelMode(names, node.widgets_values), null, `${file}: no PDD left`);
-    assert(["HyperFlow 8-step", "Turbo LoRA", "HyperFlow 8-step \u00b7 dual sampling", "HyperFlow Flash (GGUF)"].includes(node.widgets_values[names.indexOf("accel_mode")]), file);
+    assert.equal(migrateAccelMode(names, node.widgets_values), null, `${file}: no legacy mode left`);
+    assert(["Turbo LoRA", "HyperFlow Flash (GGUF)"].includes(node.widgets_values[names.indexOf("accel_mode")]), file);
+}
+
+// A saved UI workflow carries the removed widgets as extra values: dropped, later widgets re-seated.
+{
+    const names = ["rewrite_previous_clips", "audio_refine_steps", "audio_refine_denoise", "sparse_sink", "pass2_chunk_when", "pass2_sla_sparsity", "master_ui"];
+    const now = ["raw asks", 0, 0.5, "auto", "above 720p", 0, ""];
+    assert.equal(dropHyperflowValues(names, now), null, "current layout untouched (hyperflow block)");
+    assert.equal(dropDualSamplingValues(names, now), null, "current layout untouched (dual block)");
+    const hf = [...now.slice(0, 1), "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors", true, 1.0, "bypass", ...now.slice(1)];
+    assert.deepEqual(dropHyperflowValues(names, hf), now);
+    for (const mode of ["bypass", "merge"]) assert.deepEqual(dropHyperflowValues(names, [now[0], "", false, 0.5, mode, ...now.slice(1)]), now);
+    // dual block: dual_sampling, dual_split_step, pass1_early_stop (+ pass1_steps in later saves)
+    const dual3 = [...now.slice(0, 4), true, 2, false, ...now.slice(4)];
+    const dual4 = [...now.slice(0, 4), false, 3, true, 5, ...now.slice(4)];
+    assert.deepEqual(dropDualSamplingValues(names, dual3), now);
+    assert.deepEqual(dropDualSamplingValues(names, dual4), now);
+    // a save that ended right after the dual widgets: master_ui's "" follows them
+    assert.deepEqual(dropDualSamplingValues(names, [...now.slice(0, 4), true, 2, false, ""]), [...now.slice(0, 4), ""]);
+    // both blocks at once, in the order the panel applies them
+    const both = dropDualSamplingValues(names, dropHyperflowValues(names, [now[0], "f.safetensors", true, 1.0, "bypass", ...now.slice(1, 4), true, 2, false, 0, ...now.slice(4)]));
+    assert.deepEqual(both, now);
+    // pre-HyperFlow / pre-dual saves: nothing to drop
+    assert.equal(dropHyperflowValues(names, [now[0], 4, 0.5, "auto", "", 0, ""]), null);
+    assert.equal(dropDualSamplingValues(names, [...now.slice(0, 4), "", undefined]), null);
+    assert.equal(dropHyperflowValues(names, undefined), null);
+    assert.equal(dropDualSamplingValues(["x"], ["y"]), null);
 }
 
 // HyperFlow Flash widgets (appended last): master_ui's "" in the file slot and any non-4/6/8 steps fall back to the defaults
@@ -108,23 +121,6 @@ const flashMixed = ["minimax_h3_fl2va_hyperflow_flash_14b-Q8_0.gguf", "minimax_h
 assert.equal(flashFileValue("", flashMixed), flashMixed[2]);
 assert.equal(flashFileValue("", flashMixed.slice(0, 2)), flashMixed[1]);
 console.log("widget migration ok");
-
-// pass 2 steps row: dual on -> dual_split_step, off -> pass2_steps; binding never writes
-{
-    const { pass2RowBinding } = await import("../web/widget_migration.js");
-    assert.equal(pass2RowBinding(true, 3).widget, "dual_split_step");
-    assert.match(pass2RowBinding(true, 3).hint, /3 HyperFlow steps.*then 5/);
-    assert.equal(pass2RowBinding(false, 3).widget, "pass2_steps");
-    assert.match(pass2RowBinding(false).hint, /Refine schedule/);
-    const dir = new URL("../example_workflows/", import.meta.url);
-    for (const file of fs.readdirSync(dir).filter(f => f.endsWith(".json"))) {
-        const node = JSON.parse(fs.readFileSync(new URL(file, dir), "utf8")).nodes.find(n => n.type === "MiniMaxH3MasterExtender");
-        const before = JSON.stringify(node.widgets_values);
-        const frozen = Object.freeze([...node.widgets_values]);
-        pass2RowBinding(true, frozen[0]); pass2RowBinding(false, frozen[0]);
-        assert.equal(JSON.stringify(node.widgets_values), before, `${file}: pass2 row binding leaves values unchanged`);
-    }
-}
 
 // run_mode gained prompts_only (last option, default unchanged) and clips_in was appended as the last input: a socket, so no widget value moves
 {

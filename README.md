@@ -1,6 +1,6 @@
 # comfyui-h3-master-extender
 
-Multi-clip MiniMax H3 video generation for ComfyUI. It runs a two-pass render (HyperFlow 8-step or Turbo LoRA draft, learned 3D latent upscale, refine pass), carries motion and audio continuity from clip to clip, and adds clip validation, project save/load, a built-in prompt rewriter and two story engines that plan a whole film from a story.
+Multi-clip MiniMax H3 video generation for ComfyUI. It runs a two-pass render (Pika Turbo LoRA draft by default, or the HyperFlow Flash engine, learned 3D latent upscale, refine pass), carries motion and audio continuity from clip to clip, and adds clip validation, project save/load, a built-in prompt rewriter and two story engines that plan a whole film from a story.
 
 This is a community integration, not an official MiniMax or ComfyUI release.
 
@@ -12,7 +12,7 @@ Since then the code has diverged a long way (about 150 commits), so on 2026-10-2
 
 ## Features
 
-- **Two-pass render:** a draft pass, a learned 3D latent upscale and a refine pass. HyperFlow 8-step is the default draft engine, with Turbo LoRA as the alternative. A panel preset dropdown fills the engine settings in one click.
+- **Two-pass render:** a draft pass, a learned 3D latent upscale and a refine pass. Turbo LoRA (the Pika LoRA, 6 steps) with the DMAD refiner is the default recipe; HyperFlow Flash (GGUF) is the alternative draft engine. The old HyperFlow 8-step engine was removed 2026-11-17. A panel preset dropdown fills the engine settings in one click.
 - **Clips:** clip-by-clip review or full-batch generation, with per-clip prompts, seeds, durations (5-30 s) and LoRAs. Clips can be validated, re-rolled or rewritten, and every render and cache state shows on the clip card.
 - **References:** up to nine reference pictures, plus video and audio references. A clip can use a subset of the pictures (per-clip refs).
 - **Continuity:** motion context between clips, run in RAM, and continuation seams decoded from the tail of the previous clip.
@@ -64,14 +64,13 @@ The included workflows contain no prompts, references or saved project content b
 
 4. Download the models separately and place them as described below. Restart ComfyUI, then refresh the browser.
 5. Open one of the example workflows, select your installed model files, write a prompt, and attach reference pictures if needed:
-   - `example_workflows/MiniMax_H3_Master_Extender_Blank.json` — the HyperFlow 8-step graph with every input at its default.
+   - `example_workflows/MiniMax_H3_Master_Extender_Blank.json` — the Pika + DMAD graph with every input at its default.
    - `example_workflows/MiniMax_H3_Master_Extender_Turbo_SLA.json` — the faster graph: Turbo LoRA (ref2v turbo 4-step), comfy kitchen attention with SLA 0.9, chunked refine pass, 608x352 draft to 1280x720, one blank 15 s clip. On an RTX 5090 a 15 s clip renders in roughly 85–90 s. Needs a converted Turbo LoRA in `models/loras` (see `turbo_lora`).
-   - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_Action.json` — the locked action preset: HyperFlow 8-step (pruned file, curve refit on, LoRA mode bypass) with an empty LoRA stack (any LoRA disables the curve fit), SLA 0.9, and the taomate 3-step LoRA replacing the engine LoRA on pass 2. Base model: Singularity v1.3 int8.
-   - `example_workflows/MiniMax_H3_Master_Extender_Story_Builder.json` — the HyperFlow action preset set up for building a story clip by clip: built-in rewriter on `pending clips`, continuity `final prompts` (clip N continues from clip N-1's final rewritten prompt, written one after another) and a sample `rewrite_story` (the whole film's story; each clip's writer uses it only to pick that clip's beat). Two clips, the second saying "Continue the story from previous."
+   - `example_workflows/MiniMax_H3_Master_Extender_Action.json` — the action preset: Pika Turbo LoRA (6 steps, euler / simple), SLA 0.9, and the DMAD refiner replacing the engine LoRA on pass 2. Base model: Singularity v1.3 int8. (Renamed from `..._HyperFlow_Action.json` when HyperFlow 8-step was removed.)
+   - `example_workflows/MiniMax_H3_Master_Extender_Story_Builder.json` — the action preset set up for building a story clip by clip: built-in rewriter on `pending clips`, continuity `final prompts` (clip N continues from clip N-1's final rewritten prompt, written one after another) and a sample `rewrite_story` (the whole film's story; each clip's writer uses it only to pick that clip's beat). Two clips, the second saying "Continue the story from previous."
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Auto.json` — the Story Builder preset with one empty clip, a five-sentence sample `rewrite_story` and `auto_clips` = 4: the first run plans the story into four clips, then rewrites them one after another.
    - `example_workflows/MiniMax_H3_Master_Extender_Story_Writer.json` — Story Auto with the H3 Story Writer node feeding `rewrite_story` and `story_engine` = `e4.10` (see [H3 Story Writer](#h3-story-writer-brief-to-story)).
    - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_Flash.json` — the HyperFlow Flash (GGUF) engine: pass 1 on the Flash transformer (6 steps), pass 2 on the base model with the DMAD refiner (see [HYPERFLOW.md](HYPERFLOW.md#hyperflow-flash-gguf-mode)).
-   - `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_DualSampling.json` and `MiniMax_H3_Master_Extender_Action_v2_DualSampling.json` — HyperFlow dual sampling (see [HyperFlow dual sampling](#hyperflow-dual-sampling-opt-in)).
 
    Start with `clip_by_clip` and one clip. Inspect the preview and validate a clip before continuing the chain.
 
@@ -79,7 +78,6 @@ The included workflows contain no prompts, references or saved project content b
 
 | Pack | Needed for |
 | --- | --- |
-| [ComfyUI-HyperFlow-H3](https://github.com/Adudeguyman/ComfyUI-HyperFlow-H3) | **Required** for the default engine, HyperFlow 8-step. See [HYPERFLOW.md](HYPERFLOW.md). |
 | [ComfyUI-HyperFlow-Flash](https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash) + [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) | Only for the `HyperFlow Flash (GGUF)` engine. See [HYPERFLOW.md](HYPERFLOW.md#hyperflow-flash-gguf-mode). |
 | [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) | **Required.** Provides `MinimaxH3LatentUpscaler3D`, the upscale between the passes. |
 | [MiniMax-H3-Prompt-Rewriter-ComfyUI](https://github.com/pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI) | The built-in prompt rewriter, the story engines and the Story Writer node. |
@@ -177,15 +175,15 @@ The panel's Engine section starts with a **preset** dropdown that fills the engi
 
 | Preset | Engine | Pass 1 | Pass 2 | 15 s clip |
 |---|---|---|---|---|
-| Standard | HyperFlow 8-step, DMAD refiner (4 steps, replace) | 608x352 | 1280x720 | ~122 s |
-| K4 / K5 / K6 / K7 · 352p | HyperFlow dual sampling, split 4/5/6/7, early stop | 608x352 | 1280x720 | ~198 / ~176 / n.m. / ~112 s |
-| K4 / K5 / K6 / K7 · 480p | same | 864x480 | 1280x720 | ~188 / ~172 / ~158 / n.m. s |
+| Standard | Pika Turbo LoRA (6 steps, euler / simple), DMAD refiner (4 steps, replace) | 608x352 | 1280x720 | ~65-71 s |
 
 Add a preset by adding one entry to `MASTER_PRESETS` in `web/presets.js`.
 
-## HyperFlow 8-step mode
+## Engine modes
 
-The default acceleration mode (the other is Turbo LoRA). See [HYPERFLOW.md](HYPERFLOW.md) for the node pack, weights, base/build pairing, the pass-2 rule and the sparse attention recipe inputs (`sparse_start_percent`, `sparse_dense_blocks`, `sparse_sink`).
+`accel_mode` is `Turbo LoRA` (default) or `HyperFlow Flash (GGUF)`. The default recipe is Pika + DMAD: the Pika H3 flex ref2va LoRA (`h3\pika_h3_flex_ref2va_comfy_bf16.safetensors`, `turbo_lora`) at 6 steps (`pdd_nfe`), euler / simple, then the DMAD refiner as `pass2_lora` in replace mode with `pass2_steps` 4. HyperFlow Flash is documented in [HYPERFLOW.md](HYPERFLOW.md).
+
+**HyperFlow 8-step was removed on 2026-11-17** (with its dual sampling variants and the inputs `hyperflow_file`, `hyperflow_curve_refit`, `hyperflow_strength`, `hyperflow_lora_mode`, `dual_sampling`, `dual_split_step`, `pass1_early_stop`, `pass1_steps`): it lost to Pika on both speed and quality. Saved workflows and API graphs still load: an `accel_mode` of `HyperFlow 8-step` (or `... dual sampling`, or the long-gone `PDD 8-step`) runs as Pika + DMAD, filling only what the old workflow left unset (`turbo_lora` none -> Pika at strength 1.0 with 6 steps, euler, simple; `pass2_lora` none -> DMAD in replace mode, `pass2_steps` 0 -> 4), and the log says it was migrated. Stale `hyperflow_*` / dual sampling keys in API graphs are ignored. Saved UI workflows have the removed widget values dropped so the later widgets keep their values.
 
 ## Render controls
 
@@ -195,37 +193,16 @@ All of these inputs are appended after the existing ones, so saved workflows kee
 | --- | --- |
 | `pass2_resolution` = `off (pass 1 only)` | Skips pass 2 and decodes the draft at the pass-1 size (2x that with the X2 decode). Its text encode runs at the 720p size, so a draft matches the pass 1 of a 720p render. |
 | Pass-1 cache | The draft chain on disk is keyed only on pass-1 inputs. Changing the pass-2 resolution, the pass-2 LoRA or steps, `final_decode`, or turning pass 2 on or off reuses the cached pass 1 (`Clip N: PASS 1 LOADED FROM CACHE`). The log says why when it can't. |
-| `pass1_steps` | Default 0, the full 8 steps. k = 1..7 stops HyperFlow pass 1 after k steps and hands the clean x0 estimate to the normal upscale and refine. It is ignored with dual sampling or Turbo LoRA. |
 | Per-clip refs | In `clips_json`, a clip with `"refs": [i, j, ...]` (1-based indices into the job's pictures) is conditioned only on those pictures, numbered `<Picture 1..k>` in that order. A clip without it gets every picture. A bad list fails before any clip renders. The prompt rewriter still writes against all job pictures. |
 | `final_decode` | `standard`, or a 2x VAE such as MiniMax-H3-X2-Detail, which decodes the final video at 2x the refine size (about +23 s per 15 s clip). Only final clips use it, and the VAE is found by its safetensors header. |
 | `pass2_sla_sparsity` | Default 0, which means the same as `sla_sparsity`. Otherwise it sets a pass-2-only keep rate for the sla / vsa methods (0.95 keeps 5% of key blocks) while pass 1 keeps `sla_sparsity`. sol-attn ignores it. |
-| `pass2_chunk_when` | `above 720p` (default) or `always`. See [HyperFlow dual sampling](#hyperflow-dual-sampling-opt-in). This one does change the default at 720p: those clips are now refined in one window. |
+| `pass2_chunk_when` | `above 720p` (default) or `always`. See [Pass-2 windowing](#pass-2-windowing-pass2_chunk_when). This one does change the default at 720p: those clips are now refined in one window. |
 | VRAM release | No input. Node-scoped VRAM is released between passes and between clips. ComfyUI's "unload all models" also frees the extender's cached X2 VAE and empties the CUDA cache, so an external model server is not starved after a job. |
 | MiniMax H3 Prompt From Video | A separate node. It reads the prompt graph a render embedded in its MP4/PNG and returns the Master Extender clip prompts as STRING outputs that plug into `clip_prompt_1..4`. |
 
-## HyperFlow dual sampling (opt-in)
+## Pass-2 windowing (`pass2_chunk_when`)
 
-Three inputs at the end of the node, all off by default (a workflow or API graph that does not send them renders exactly as before):
-
-| input | default | meaning |
-|---|---|---|
-| `dual_sampling` | off | HyperFlow 8-step only. Pass 2 = the tail of HyperFlow's trained grid `[1.0, 0.9939, 0.9843, 0.9661, 0.9231, 0.8349, 0.6969, 0.4688, 0.0]` from index `dual_split_step`. No pass-2 LoRA (`pass2_lora` is ignored, with a warning) and `pass2_denoise` is ignored. |
-| `dual_split_step` | 2 | Grid index where pass 2 takes over: 2 = 6 pass-2 steps from sigma 0.9843, 6 = 2 steps. |
-| `pass1_early_stop` | off | Experimental, needs dual sampling. Pass 1 runs only `grid[:k+1]`. |
-
-The image is generated at the pass-2 size and pass 1 only sets the layout. Recommended: pass 1 `608x352` (renders matched a 1056x608 pass 1 and are cheaper), pass 2 `1344x768`, split 2 (see `example_workflows/MiniMax_H3_Master_Extender_HyperFlow_DualSampling.json`). In Turbo LoRA mode dual sampling logs a warning and runs the normal two passes.
-
-**Early stop.** Pass 1 runs the first k steps, then the model's clean (x0) estimate from the last step is upscaled, and pass 2 re-noises it to `grid[k]` the same way every pass 2 does (the sampler blends noise into the start latent at the first sigma, same seed) and runs the rest. The 3D latent upscaler was trained on clean latents, which is why the x0 estimate is used instead of the noisy step latent, but quality is not validated; keep it off for approved looks. With pass 2 off, early stop is ignored.
-
-**Caching.** `dual_sampling` alone does not change pass 1, so pass-1 caches keep hitting. Early stop adds `dual: [k, true]` to the pass-1 fingerprint, only when on. As with any other pass-2 setting, the final-clip cache does not track these inputs: re-roll the clip (or change the seed) to re-render pass 2.
-
-### Engine mode "HyperFlow 8-step · dual sampling"
-
-The same thing as one `accel_mode` choice, appended last so saved workflows and API graphs are untouched (the default stays "HyperFlow 8-step"). Picking it means: HyperFlow 8-step, dual sampling on with split = `dual_split_step` (default 2), no pass-2 refine LoRA, and pass 2 over the whole clip in one window (`pass2_chunk_frames` is treated as 0 in this mode, which avoids window seams for a near-full regeneration; whole-clip pass 2 at 1344x768 x 362 frames ran in VRAM at about 33.5 s/step). The `dual_sampling` toggle keeps working in the other modes. The panel shows the HyperFlow rows plus split step and early stop, and the badge reads "HyperFlow · dual sampling". Pass-1 caches are shared with plain HyperFlow (the mode resolves to it before the fingerprint is built).
-
-**Pass-2 windowing (`pass2_chunk_when`, appended last).** `above 720p` (default): pass 2 is refined in temporal windows (`pass2_chunk_frames`/`pass2_chunk_overlap`) only when its short side is over 800 px (1080p-class). 720p-class output (1280x720/736, 1344x768) refines the whole clip in one pass, which is faster with sparse attention since the window overlaps are not recomputed. `always` windows any clip longer than `pass2_chunk_frames`; `pass2_chunk_frames` 0 never windows.
-
-Example: `example_workflows/MiniMax_H3_Master_Extender_Action_v2_DualSampling.json` (Singularity ref2va v2 pruned int8, pass 1 `608x352`, pass 2 `1344x768`, pruned HyperFlow file with curve refit, SLA 0.9, early stop off). **Use prompts under 5,000 characters.**
+`above 720p` (default): pass 2 is refined in temporal windows (`pass2_chunk_frames`/`pass2_chunk_overlap`) only when its short side is over 800 px (1080p-class). 720p-class output (1280x720/736, 1344x768) refines the whole clip in one pass, which is faster with sparse attention since the window overlaps are not recomputed. `always` windows any clip longer than `pass2_chunk_frames`; `pass2_chunk_frames` 0 never windows.
 
 ## Debugging: per-step x0 dump
 
@@ -258,8 +235,8 @@ These are the filenames selected in the example workflows. Choose compatible alt
 | Video VAE | `vae` | `minimax_h3_video_vae_int8_convrot.safetensors` |
 | Audio VAE | `vae` | `minimax_h3_audio_vae_fp32.safetensors` |
 | Learned 3D latent upscaler | `latent_upscale_models` | `minimax_h3_latent_upscaler_3d_fp16.safetensors` |
-| HyperFlow 8-step | `hyperflow` | `custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors` (pruned bases) or the build without `_pruned` (full base) |
-| Pass-2 refiner LoRA (default) | `loras/h3` | `minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors` (optional; with none, pass 2 runs on HyperFlow's own grid tail) |
+| Pika turbo LoRA (default engine) | `loras/h3` | `pika_h3_flex_ref2va_comfy_bf16.safetensors` |
+| Pass-2 refiner LoRA (default) | `loras/h3` | `minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors` (optional; with none, pass 2 runs on the engine's own schedule tail) |
 
 Keep the CLIPLoader type set to `minimax`. The selected quantized models require compatible ComfyUI kernels and hardware; they are not universal defaults.
 
@@ -321,7 +298,6 @@ This project brings together adapted code and separately installed dependencies.
 | [tritant / ComfyUI_MiniMax_H3_Extender](https://github.com/tritant/ComfyUI_MiniMax_H3_Extender) | Extender foundation and inherited continuity/decode implementation. |
 | [NikoDemon80 / ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) | GPL-3.0 motion-context temporal anchor and payload patch foundation. |
 | [LBH-123-AI / Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler) | External learned latent upscaling dependency and its weights. The original build linked xmarre's copy, now [xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus). |
-| [Adudeguyman / ComfyUI-HyperFlow-H3](https://github.com/Adudeguyman/ComfyUI-HyperFlow-H3) | External HyperFlow 8-step node pack (Video Rebirth's HyperFlow). |
 | [pytraveler / MiniMax-H3-Prompt-Rewriter-ComfyUI](https://github.com/pytraveler/MiniMax-H3-Prompt-Rewriter-ComfyUI) | External prompt-rewriter pack the built-in rewriter runs on. |
 | [Comfy-Org / ComfyUI](https://github.com/Comfy-Org/ComfyUI) | Runtime and native MiniMax H3 model integration. |
 

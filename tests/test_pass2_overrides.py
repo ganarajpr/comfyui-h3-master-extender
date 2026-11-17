@@ -36,8 +36,6 @@ Engine = _engine_class()
 
 def make(**kw):
     e = Engine()
-    e.dual_active = False
-    e.hyperflow_mode = False
     e.flash_mode = False
     e.turbo_mode = True
     e.turbo_steps = 8
