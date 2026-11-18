@@ -174,7 +174,9 @@
  "accel_mode": {
   "options": [
    "Turbo LoRA",
-   "HyperFlow Flash (GGUF)"
+   "HyperFlow Flash (GGUF)",
+   "HyperFlow 8-step",
+   "HyperFlow 8-step · dual sampling"
   ]
  },
  "turbo_lora": {
@@ -629,6 +631,42 @@
   "type": "FLOAT",
   "min": 0.0,
   "max": 0.99
+ },
+ "hyperflow_file": {
+  "options": [
+   "custom_node_hyperflow_8step_v1.0_comfyui.safetensors",
+   "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors"
+  ]
+ },
+ "hyperflow_curve_refit": {
+  "type": "BOOLEAN"
+ },
+ "hyperflow_strength": {
+  "type": "FLOAT",
+  "min": 0.0,
+  "max": 2.0
+ },
+ "hyperflow_lora_mode": {
+  "options": [
+   "bypass",
+   "merge"
+  ]
+ },
+ "dual_sampling": {
+  "type": "BOOLEAN"
+ },
+ "dual_split_step": {
+  "type": "INT",
+  "min": 1,
+  "max": 7
+ },
+ "pass1_early_stop": {
+  "type": "BOOLEAN"
+ },
+ "pass1_steps": {
+  "type": "INT",
+  "min": 0,
+  "max": 8
  },
  "clips_in": {
   "type": "STRING"

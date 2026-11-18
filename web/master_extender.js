@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -195,7 +195,15 @@ const TURBO_ONLY_WIDGETS = ["turbo_lora", "turbo_lora_strength", "turbo_sampler"
 // pdd_file is retired: it keeps its slot in widgets_values (saved workflows) but is never shown.
 const ALWAYS_HIDDEN_WIDGETS = ["pdd_file"];
 const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
-// HyperFlow Flash (GGUF) engine: its own two widgets, shown only in that mode. (HyperFlow 8-step, its widgets and dual sampling were removed 2026-11-17.)
+// Legacy HyperFlow 8-step (retired as a choice 2026-11-17, kept for workflows saved before): its four widgets are shown only in
+// its two modes. dual_sampling only in plain HyperFlow; the split step and early stop only while dual sampling is on;
+// pass1_steps only without dual sampling. Appended after tst_tau, so saved workflows keep their widget order.
+const HYPERFLOW_ONLY_WIDGETS = HYPERFLOW_WIDGETS;
+const DUAL_WIDGET = "dual_sampling";
+const DUAL_DETAIL_WIDGETS = ["dual_split_step", "pass1_early_stop"];
+const PASS1_STEPS_WIDGET = "pass1_steps";
+const isDualMode = (value) => String(value ?? "") === DUAL_MODE;
+// HyperFlow Flash (GGUF) engine: its own two widgets, shown only in that mode.
 const FLASH_MODE = "HyperFlow Flash (GGUF)";
 const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength"];
 const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
@@ -266,16 +274,17 @@ function repairReasoningBudget(node) {
 function repairMergedRewriterModel(node, info) {
     const names = (node.widgets || []).map(w => w.name);
     const values = info?.widgets_values;
-    const afterCaption = dropCaptionModelValue(names, values);
-    // Order matters: each step uses the current layout's names on the array the earlier steps left behind, so the
-    // removals go from the earliest slot (caption model) to the latest (dual sampling), then accel_mode is migrated.
-    let migrated = afterCaption;
-    for (const step of [dropHyperflowValues, dropSingleTextEncodeValue, dropDualSamplingValues, migrateAccelMode]) {
-        migrated = step(names, migrated ?? values) ?? migrated;
+    // The legacy HyperFlow values leave the positional array (the widgets after them re-seat) and come back by name:
+    // those widgets are appended after tst_tau now. info.widgets_values stays the shortened array, which is what
+    // repairTstForOldWorkflow reads (a workflow from before TST loads with it off).
+    const result = migrateSavedValues(names, values);
+    if (!result) return;
+    info.widgets_values = result.values;
+    result.values.forEach((value, i) => { if (node.widgets[i]) node.widgets[i].value = value; });
+    for (const [name, value] of Object.entries(result.legacy)) {
+        const w = node.widgets?.find(x => x.name === name);
+        if (w) w.value = value;
     }
-    if (!migrated) return;
-    info.widgets_values = migrated;
-    migrated.forEach((value, i) => { if (node.widgets[i]) node.widgets[i].value = value; });
 }
 
 // sparse_start_percent / sparse_dense_blocks / sparse_sink are the last widgets, after e4_picture_notes; a workflow
@@ -299,7 +308,15 @@ function repairStoryEngine(node) {
     if (w && (w.value === "e4" || w.value === "e4.8")) w.value = "e4.10";
 }
 
-function repairDualWidgets(node) {
+function repairDualWidgets(node, defaults) {
+    for (const name of DUAL_WIDGETS) {
+        const w = node.widgets?.find(x => x.name === name);
+        if (w) w.value = dualWidgetValue(name, w.value);
+    }
+    for (const name of HYPERFLOW_WIDGETS) {
+        const w = node.widgets?.find(x => x.name === name);
+        if (w) w.value = hyperflowWidgetValue(name, w.value, defaults?.hyperflow_file ?? comboValues(w)[0] ?? "");
+    }
     const chunkWhen = node.widgets?.find(x => x.name === "pass2_chunk_when");
     if (chunkWhen) chunkWhen.value = pass2ChunkWhenValue(chunkWhen.value);
     const p2Sla = node.widgets?.find(x => x.name === "pass2_sla_sparsity");
@@ -337,14 +354,13 @@ function repairDualWidgets(node) {
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
 // or nothing). It was rendered without TST, so it loads with TST off whatever lands in the slot.
 function repairTstForOldWorkflow(node, info) {
-    const values = info?.widgets_values;
-    const idx = node.widgets?.findIndex(x => x.name === "tst_tau") ?? -1;
+    const names = (node.widgets || []).map(w => w.name);
     const tst = node.widgets?.find(x => x.name === "tst_enabled");
-    if (tst && Array.isArray(values) && idx >= 0 && values.length <= idx) tst.value = false;
+    if (tst && tstOffForSavedValues(names, info?.widgets_values)) tst.value = false;
 }
 
 function repairHyperflowWidgets(node, defaults) {
-    repairDualWidgets(node);
+    repairDualWidgets(node, defaults);
     repairFinalDecode(node);
     repairStoryEngine(node);
     repairReasoningBudget(node);
@@ -373,8 +389,15 @@ function setupModeWidgets(node) {
         const cfgHandoff = isCfgHandoffMode(accel?.value);
         const turbo = mode.startsWith("turbo") || handoff || cfgHandoff;
         const flash = isFlashMode(accel?.value) || handoff;
+        const hyperflow = isHyperflowMode(accel?.value) || mode.startsWith("pdd");
         const slaOn = sla ? !!sla.value : false;
         TURBO_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
+        HYPERFLOW_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), hyperflow));
+        const dualMode = isDualMode(accel?.value);
+        const dualOn = hyperflow && (dualMode || !!byName(DUAL_WIDGET)?.value);
+        setWidgetVisible(byName(DUAL_WIDGET), hyperflow && !dualMode);
+        DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
+        setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
         setWidgetVisible(byName("handoff_step"), handoff);
         CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
@@ -390,7 +413,7 @@ function setupModeWidgets(node) {
     };
     node.applyModeWidgets = apply;
 
-    for (const w of [accel, sla]) {
+    for (const w of [accel, sla, byName(DUAL_WIDGET)]) {
         if (!w) continue;
         const original = w.callback;
         w.callback = function () {
@@ -601,7 +624,7 @@ app.registerExtension({
         };
 
         const hyperflowDefaults = {};
-        for (const name of REPAIRED_WIDGETS) {
+        for (const name of [...REPAIRED_WIDGETS, "hyperflow_file"]) {
             const spec = nodeData.input?.optional?.[name] ?? nodeData.input?.required?.[name];
             if (spec?.[1]?.default !== undefined) hyperflowDefaults[name] = spec[1].default;
         }
@@ -845,6 +868,7 @@ app.registerExtension({
             const isFlash = () => isFlashMode(getW("accel_mode", ""));
             const isCfg = () => isCfgMode(getW("accel_mode", ""));
             const isCfgHandoff = () => isCfgHandoffMode(getW("accel_mode", ""));
+            const isHyperflow = () => isHyperflowMode(getW("accel_mode", ""));
 
             function bindSelect(name, opts = {}) {
                 const w = W(name);
@@ -896,6 +920,14 @@ app.registerExtension({
                 if (isCfgHandoff()) return `CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} \u2192 Pika @${getW("cfg_handoff_steps", 8)}/${getW("cfg_steps", 24)} · ${shortModelName(getW("turbo_lora"))} · ${steps} steps${p2note}${bridgeNote}`;
                 if (isHandoff()) return `Pika \u2192 Flash hand-off @${parseInt(getW("handoff_step", 3), 10) || 3} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
                 if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
+                if (isHyperflow()) {
+                    const dualMode = isDualMode(getW("accel_mode", ""));
+                    const dualNote = (dualMode || getW(DUAL_WIDGET, false))
+                        ? ` · dual sampling (pass 2 from step ${getW("dual_split_step", 2)}${dualMode ? ", whole clip" : ""}${getW("pass1_early_stop", false) ? ", pass 1 early stop" : ""})` : "";
+                    const p1s = Number(getW(PASS1_STEPS_WIDGET, 0));
+                    const p1sNote = (!dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
+                    return `HyperFlow 8-step (legacy) · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
+                }
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
             }
             function qualitySummary() {
@@ -1055,12 +1087,37 @@ app.registerExtension({
                     } catch (e) { console.warn("[H3 Master] preset row skipped", e); }
                 }
                 const accelW = W("accel_mode");
-                const accelSel = uiSelect(comboValues(accelW), accelW?.value, (v) => {
+                // The HyperFlow 8-step options are offered only while the node already holds one (a workflow saved before
+                // 2026-11-17): the engine is retired as a choice, so a new pick never lands on it.
+                const accelOptions = comboValues(accelW).filter(v => !isHyperflowMode(v) || isHyperflowMode(accelW?.value));
+                const accelSel = uiSelect(accelOptions, accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
                     setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) || isCfgMode(v) || isCfgHandoffMode(v) ? "6" : "8", { rerender: false });
                     renderUI();
-                });
-                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." }));
+                }, { render: (v) => isHyperflowMode(v) ? `${v} (legacy)` : String(v) });
+                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." + (isHyperflow() ? " HyperFlow 8-step is the retired legacy engine: it is here only so a workflow saved before 2026-11-17 re-renders as saved." : "") }));
+                if (isHyperflow()) {
+                    wrap.appendChild(uiHint("Legacy engine (retired 2026-11-17): this workflow was saved with HyperFlow 8-step and re-renders with it as saved. Switch the engine to Turbo LoRA for Pika + DMAD."));
+                    wrap.appendChild(uiRow("hyperflow file", bindSelect("hyperflow_file", { render: shortModelName }),
+                        { hint: "Pruned bases (Singularity) need the _pruned build; full bases need the one without. Always the trained 8-step grid with Euler." }));
+                    wrap.appendChild(uiRow("curve refit", bindToggle("hyperflow_curve_refit"),
+                        { hint: "Pruned base only: restores most of the two-time (t, r) conditioning. Off = LoRA-only." }));
+                    if (expert()) wrap.appendChild(uiRow("strength", bindNumber("hyperflow_strength"), { indent: true }));
+                    wrap.appendChild(uiHint("Pass 2 without a refine LoRA is cut from HyperFlow's own grid; a refine LoRA forces replace mode (no HyperFlow on that tail)."));
+                    const dualModeNow = isDualMode(getW("accel_mode", ""));
+                    if (W(DUAL_WIDGET)) {
+                        if (!dualModeNow) wrap.appendChild(uiRow("dual sampling", bindToggle(DUAL_WIDGET),
+                            { hint: "Pass 2 = the grid tail from the split step, generated at the pass-2 size; pass 1 only sets the layout. No refine LoRA, refine denoise ignored." }));
+                        if (dualModeNow || getW(DUAL_WIDGET, false)) {
+                            wrap.appendChild(uiRow("pass 1 early stop", bindToggle("pass1_early_stop"),
+                                { indent: true, hint: "Experimental: pass 1 runs only the first split-step steps. The 3D upscaler was trained on clean latents." }));
+                        }
+                    }
+                    if (W(PASS1_STEPS_WIDGET) && !(dualModeNow || getW(DUAL_WIDGET, false))) {
+                        wrap.appendChild(uiRow("pass 1 steps", bindNumber(PASS1_STEPS_WIDGET),
+                            { hint: "0 = all 8 HyperFlow steps. 1-7: stop pass 1 early, upscale its clean estimate, then the normal refine (same LoRA, windows, denoise). Saves the skipped steps." }));
+                    }
+                }
                 if (isCfg() || isCfgHandoff()) {
                     wrap.appendChild(uiRow("cfg scale", bindNumber("pass1_cfg"),
                         { hint: "Guidance of the undistilled pass 1. 1.0 = no guidance (plain positive-only path). Above 1 each CFG step also runs the negative branch, about twice the step cost." }));
@@ -1192,14 +1249,15 @@ app.registerExtension({
                     if (W("pass2_sla_sparsity")) wrap.appendChild(uiRow("pass 2 SLA sparsity (0 = same)", bindNumber("pass2_sla_sparsity"), { indent: true,
                         hint: "Sparsity for the refine pass only (sla / vsa methods). 0.95 keeps 5% of key blocks in pass 2 while pass 1 keeps the sparsity above." }));
                     wrap.appendChild(uiRow("method", bindSelect("sparse_method"), { indent: true }));
-                    if (getW("sparse_method", "sla") === "sol-attn") wrap.appendChild(uiRow("tau", bindNumber("sparse_tau"), { indent: true, hint: "sol-attn threshold in score sigmas. Higher = sparser." }));
-                    const autoNote = "auto = default";
+                    if (getW("sparse_method", "sla") === "sol-attn") wrap.appendChild(uiRow("tau", bindNumber("sparse_tau"), { indent: true, hint: isHyperflow() ? "HyperFlow's validated recipe is tau 1.0." : "sol-attn threshold in score sigmas. Higher = sparser." }));
+                    const recipe = isHyperflow() && getW("sparse_method", "sla") === "sol-attn";
+                    const autoNote = recipe ? "auto = HyperFlow sol-attn recipe" : "auto = default";
                     wrap.appendChild(uiRow("sparse start %", bindNumber("sparse_start_percent"), { indent: true,
-                        hint: `-1 = auto (${autoNote}: 0.20). Steps before this fraction of the schedule run dense.` }));
+                        hint: `-1 = auto (${autoNote}: ${recipe ? "0.16" : "0.20"}). Steps before this fraction of the schedule run dense.` }));
                     wrap.appendChild(uiRow("dense blocks", uiText(getW("sparse_dense_blocks", "auto"), (v) => setW("sparse_dense_blocks", v)), { indent: true,
-                        hint: `Transformer blocks that always run dense, e.g. 0,1. auto (${autoNote}: none); empty = none.` }));
+                        hint: `Transformer blocks that always run dense, e.g. 0,1. auto (${autoNote}: ${recipe ? "0,1" : "none"}); empty = none.` }));
                     wrap.appendChild(uiRow("sink", bindSelect("sparse_sink"), { indent: true,
-                        hint: `Keep text/audio/reference rows exact. auto (${autoNote}: exact_kv_and_rows).` }));
+                        hint: `Keep text/audio/reference rows exact. auto (${autoNote}: ${recipe ? "off" : "exact_kv_and_rows"}).` }));
                 }
                 const chunkOn = Number(getW("pass2_chunk_frames", 0)) > 0;
                 wrap.appendChild(uiRow("chunked refine pass", uiToggle(chunkOn, (on) => {
@@ -1595,7 +1653,7 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : "Turbo"} · ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps · 2-pass</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow \u00b7 dual sampling (legacy)" : isHyperflow() ? "HyperFlow 8-step (legacy)" : `${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : "Turbo"} \u00b7 ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps`} · 2-pass</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">

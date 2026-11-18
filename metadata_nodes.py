@@ -183,7 +183,9 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
             lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1"
                          + (f" · Flash LoRA {inputs.get('hyperflow_flash_lora')} x{inputs.get('hyperflow_flash_lora_strength', 1.0)}" if inputs.get('hyperflow_flash_lora') not in (None, '', 'none') else ""))
         else:
-            lines.append(f"Engine: {accel} {inputs.get('hyperflow_file', '')} (retired mode, saved before 2026-11-17)".replace("  ", " "))
+            refit = "curve refit on" if inputs.get("hyperflow_curve_refit", True) else "curve refit off"
+            label = "HyperFlow · dual sampling" if "dual sampling" in str(accel) else "HyperFlow 8-step"
+            lines.append(f"Engine: {label} {inputs.get('hyperflow_file', '')} x{inputs.get('hyperflow_strength', 1.0)} · {refit} · {inputs.get('hyperflow_lora_mode', 'bypass')} · euler{' · pass 1 stops at step ' + str(inputs.get('pass1_steps')) + ' of 8' if int(inputs.get('pass1_steps', 0) or 0) > 0 and 'dual sampling' not in str(accel) else ''}")
         lines.append(f"Quality: draft {inputs.get('pass1_resolution', '?')} → refine {inputs.get('pass2_resolution', '?')} · denoise {inputs.get('pass2_denoise', '?')}{' · pass 2 scheduler ' + str(inputs.get('pass2_scheduler')) if inputs.get('pass2_scheduler') not in (None, '', 'same as pass 1') else ''}{' · pass-1 audio' if inputs.get('pass2_audio') == 'pass 1' else ''} · upscaler {inputs.get('upscaler_model', '?')}")
         lines.append(f"Continuity: motion {inputs.get('context_length', '?')} f · audio {inputs.get('audio_context_length', '?')} f · identity {inputs.get('identity_continuity', '?')}")
         sla = inputs.get("sla_enabled", False)

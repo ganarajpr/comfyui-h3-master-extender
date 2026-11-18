@@ -36,71 +36,119 @@ export function normalizeReasoningBudget(value) {
     return String(best);
 }
 
+// Legacy HyperFlow 8-step (retired as a choice 2026-11-17, kept so workflows saved before re-render as saved). The eight
+// widgets hyperflow_file ... pass1_steps are now APPENDED after tst_tau (so every workflow saved since keeps its widget
+// order); an older workflow carries them in the middle of the array, which shifts every widget between.
+export const HYPERFLOW_WIDGETS = ["hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength", "hyperflow_lora_mode"];
+export const DUAL_WIDGETS = ["dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps"];
+export const LEGACY_HYPERFLOW_WIDGETS = [...HYPERFLOW_WIDGETS, ...DUAL_WIDGETS];
+
 // The four hyperflow_* widgets (file, curve refit, strength, LoRA mode) sat between rewrite_previous_clips and
-// audio_refine_steps and were removed with HyperFlow 8-step (2026-11-17). A workflow saved before that carries four
-// extra values there, shifting every later widget. The old block is recognised by its types (string, boolean, number,
-// "bypass" / "merge") where the current layout has audio_refine_steps (an integer).
-// Returns the corrected values, or null when the array is already in the current layout.
-export function dropHyperflowValues(names, values) {
+// audio_refine_steps. A workflow saved before 2026-11-17 carries four extra values there, shifting every later widget.
+// The old block is recognised by its types (string, boolean, number, "bypass" / "merge") where the current layout has
+// audio_refine_steps (an integer).
+// Returns {values, legacy}: the array with the block removed and the removed values by widget name, or null when the
+// array has no such block.
+export function takeHyperflowValues(names, values) {
     if (!Array.isArray(values)) return null;
     const anchor = names.indexOf("rewrite_previous_clips");
     if (anchor < 0 || names[anchor + 1] !== "audio_refine_steps") return null;
-    const [file, refit, strength, mode] = values.slice(anchor + 1, anchor + 5);
+    const block = values.slice(anchor + 1, anchor + 5);
+    const [file, refit, strength, mode] = block;
     if (typeof file !== "string" || typeof refit !== "boolean" || typeof strength !== "number") return null;
     if (mode !== "bypass" && mode !== "merge") return null;
-    return values.filter((_, i) => i < anchor + 1 || i > anchor + 4);
+    return {
+        values: values.filter((_, i) => i < anchor + 1 || i > anchor + 4),
+        legacy: Object.fromEntries(HYPERFLOW_WIDGETS.map((name, i) => [name, block[i]])),
+    };
+}
+export function dropHyperflowValues(names, values) {
+    return takeHyperflowValues(names, values)?.values ?? null;
 }
 
-// dual_sampling, dual_split_step, pass1_early_stop and pass1_steps sat between sparse_sink and pass2_chunk_when and were
-// removed with HyperFlow 8-step. Saved arrays carry (boolean, integer, boolean) there, plus an integer pass1_steps in
-// workflows saved after that was added; the current layout has pass2_chunk_when's string (or master_ui's "") in that slot.
-// Returns the corrected values, or null when the array is already in the current layout.
-export function dropDualSamplingValues(names, values) {
+// dual_sampling, dual_split_step, pass1_early_stop and pass1_steps sat between sparse_sink and pass2_chunk_when. Saved
+// arrays carry (boolean, integer, boolean) there, plus an integer pass1_steps in workflows saved after that was added;
+// the current layout has pass2_chunk_when's string (or master_ui's "") in that slot. A 3-value block means pass1_steps = 0.
+// Returns {values, legacy} like takeHyperflowValues, or null when the array has no such block.
+export function takeDualSamplingValues(names, values) {
     if (!Array.isArray(values)) return null;
     const anchor = names.indexOf("sparse_sink");
     if (anchor < 0 || names[anchor + 1] !== "pass2_chunk_when") return null;
     if (typeof values[anchor + 1] !== "boolean" || !Number.isInteger(values[anchor + 2]) || typeof values[anchor + 3] !== "boolean") return null;
     const count = Number.isInteger(values[anchor + 4]) ? 4 : 3;
-    return values.filter((_, i) => i < anchor + 1 || i > anchor + count);
+    const block = values.slice(anchor + 1, anchor + 1 + count);
+    return {
+        values: values.filter((_, i) => i < anchor + 1 || i > anchor + count),
+        legacy: { dual_sampling: block[0], dual_split_step: block[1], pass1_early_stop: block[2], pass1_steps: count === 4 ? block[3] : 0 },
+    };
+}
+export function dropDualSamplingValues(names, values) {
+    return takeDualSamplingValues(names, values)?.values ?? null;
 }
 
-// The Pika + DMAD recipe: the founder's default engine since 2026-11-17 (HyperFlow 8-step lost to it on speed and quality).
-// Keep in step with master_node.PIKA_LORA / migrate_legacy_accel.
-export const PIKA_LORA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors";
-export const DMAD_LORA = "h3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors";
-export const TURBO_MODE = "Turbo LoRA";
-export const isLegacyAccelMode = (value) => {
-    const text = String(value ?? "").toLowerCase();
-    return text.startsWith("pdd") || text.startsWith("hyperflow 8-step");
-};
+export const HYPERFLOW_MODE = "HyperFlow 8-step";
+export const DUAL_MODE = "HyperFlow 8-step \u00b7 dual sampling";
+export const isHyperflowMode = (value) => String(value ?? "") === HYPERFLOW_MODE || String(value ?? "") === DUAL_MODE;
+export const isLegacyAccelMode = (value) => String(value ?? "").toLowerCase().startsWith("pdd");
 
-// accel_mode lost its "PDD 8-step" and "HyperFlow 8-step" (plain and dual sampling) options; a saved workflow that still
-// has one runs the Pika + DMAD recipe: Turbo LoRA, and only what the old workflow left unset is filled (the "none"
-// turbo LoRA with its 6 steps / euler / simple, the "none" pass-2 LoRA with DMAD, replace mode and 4 steps).
+// accel_mode lost its "PDD 8-step" option; a saved workflow that still has it runs HyperFlow 8-step. HyperFlow 8-step
+// (plain and dual sampling) is kept as a legacy engine and is not touched.
 // Returns the corrected values, or null when there is nothing to change.
 export function migrateAccelMode(names, values) {
     if (!Array.isArray(values)) return null;
-    const accel = names.indexOf("accel_mode");
-    if (accel < 0 || !isLegacyAccelMode(values[accel])) return null;
+    const i = names.indexOf("accel_mode");
+    if (i < 0 || !isLegacyAccelMode(values[i])) return null;
     const out = [...values];
-    const get = (name) => out[names.indexOf(name)];
-    const set = (name, value) => { const i = names.indexOf(name); if (i >= 0) out[i] = value; };
-    const unset = (name) => { const v = get(name); return v === undefined || v === "" || v === "none"; };
-    out[accel] = TURBO_MODE;
-    if (unset("turbo_lora")) {
-        set("turbo_lora", PIKA_LORA);
-        set("turbo_lora_strength", 1.0);
-        set("pdd_nfe", "6");
-        set("turbo_sampler", "euler");
-        set("turbo_scheduler", "simple");
-    }
-    if (unset("pass2_lora")) {
-        set("pass2_lora", DMAD_LORA);
-        set("pass2_lora_strength", 1.0);
-        set("pass2_lora_mode", "replace engine LoRA");
-        if (!Number(get("pass2_steps"))) set("pass2_steps", 4);
-    }
+    out[i] = HYPERFLOW_MODE;
     return out;
+}
+
+// All the positional re-seating of a saved UI workflow's widgets_values, earliest slot first (each step reads the array the
+// earlier ones left behind): the merged caption model, the legacy HyperFlow block, single_text_encode, the dual sampling block,
+// then accel_mode. The legacy HyperFlow / dual values leave the array and come back by widget name in `legacy`: those
+// widgets are appended after tst_tau now. Returns {values, legacy}, or null when the array is already in the current layout.
+export function migrateSavedValues(names, values) {
+    const legacy = {};
+    let migrated = dropCaptionModelValue(names, values);
+    const steps = [
+        (n, v) => { const t = takeHyperflowValues(n, v); if (t) Object.assign(legacy, t.legacy); return t?.values ?? null; },
+        dropSingleTextEncodeValue,
+        (n, v) => { const t = takeDualSamplingValues(n, v); if (t) Object.assign(legacy, t.legacy); return t?.values ?? null; },
+        migrateAccelMode,
+    ];
+    for (const step of steps) migrated = step(names, migrated ?? values) ?? migrated;
+    return migrated ? { values: migrated, legacy } : null;
+}
+
+// A workflow saved before TST existed has no value for tst_tau: its values stop at or before the tst_enabled slot (which holds
+// master_ui's "" or nothing). It rendered without TST, so it loads with TST off. `values` is the array AFTER migrateSavedValues
+// (the legacy HyperFlow values are not in it), so an old HyperFlow workflow is still recognised as shorter than tst_tau's slot.
+export function tstOffForSavedValues(names, values) {
+    const idx = names.indexOf("tst_tau");
+    return Array.isArray(values) && idx >= 0 && values.length <= idx;
+}
+
+// The eight legacy widgets are appended after tst_tau: a workflow saved since 2026-11-17 has master_ui's "" (or nothing) in
+// their slots, which means the defaults. Same as the old repair, so a Turbo / Flash workflow carries the default values.
+export const DUAL_DEFAULTS = { dual_sampling: false, dual_split_step: 2, pass1_early_stop: false, pass1_steps: 0 };
+export function dualWidgetValue(name, value) {
+    const fallback = DUAL_DEFAULTS[name];
+    if (typeof fallback === "boolean") return typeof value === "boolean" ? value : fallback;
+    if (name === "pass1_steps") return Number.isInteger(value) && value >= 0 && value <= 8 ? value : fallback;
+    return Number.isInteger(value) && value >= 1 && value <= 7 ? value : fallback;
+}
+export function pass1StepsValue(value) {
+    return dualWidgetValue("pass1_steps", value);
+}
+// hyperflow_file keeps any non-empty string (a build that is not installed must fail loudly on the server, not be swapped
+// silently); "" / non-string = the default build. The other three: a wrong type = the default.
+export const HYPERFLOW_DEFAULTS = { hyperflow_curve_refit: true, hyperflow_strength: 1.0, hyperflow_lora_mode: "bypass" };
+export function hyperflowWidgetValue(name, value, fallbackFile) {
+    if (name === "hyperflow_file") return typeof value === "string" && value !== "" ? value : fallbackFile;
+    const fallback = HYPERFLOW_DEFAULTS[name];
+    if (typeof fallback === "boolean") return typeof value === "boolean" ? value : fallback;
+    if (name === "hyperflow_lora_mode") return value === "merge" ? "merge" : "bypass";
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 // pass2_chunk_when is the first widget after sparse_sink: a workflow saved before it has master_ui's "" there. Anything else invalid = default.

@@ -15,7 +15,7 @@ def _load():
             wanted.append(node)
         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in node.targets):
             wanted.append(node)
-    ns = {"_LOG": logging.getLogger("test_remove_pdd")}
+    ns = {"_LOG": logging.getLogger("test_remove_pdd"), "HYPERFLOW_ACCEL_MODE": "HyperFlow 8-step"}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(SOURCE), "exec"), ns)
     return ns
 
@@ -23,16 +23,19 @@ def _load():
 class RemovePDDTests(unittest.TestCase):
     ns = _load()
 
-    def test_old_pdd_mode_runs_the_pika_recipe(self):
+    def test_old_pdd_mode_runs_hyperflow(self):
         norm = self.ns["normalize_accel_mode"]
         with self.assertLogs("test_remove_pdd", level="WARNING"):
-            self.assertEqual(norm("PDD 8-step"), "Turbo LoRA")
+            self.assertEqual(norm("PDD 8-step"), "HyperFlow 8-step")
 
     def test_current_modes_are_untouched(self):
         norm = self.ns["normalize_accel_mode"]
+        self.assertEqual(norm("HyperFlow 8-step"), "HyperFlow 8-step")
         self.assertEqual(norm("Turbo LoRA"), "Turbo LoRA")
         self.assertEqual(norm("HyperFlow Flash (GGUF)"), "HyperFlow Flash (GGUF)")
-        self.assertEqual(self.ns["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off"])
+        self.assertEqual(norm("HyperFlow 8-step \u00b7 dual sampling"), "HyperFlow 8-step \u00b7 dual sampling")
+        self.assertEqual(self.ns["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off",
+                                                  "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"])
 
     def test_pdd_file_keeps_its_slot_and_accepts_any_string(self):
         text = SOURCE.read_text(encoding="utf-8")

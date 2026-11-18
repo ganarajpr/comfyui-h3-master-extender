@@ -42,7 +42,8 @@ class Modes(unittest.TestCase):
         node = next(n for n in tree.body if isinstance(n, ast.Assign)
                     and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
         self.assertEqual(ast.literal_eval(node.value),
-                         ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", CFG_MODE, HANDOFF_MODE])
+                         ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", CFG_MODE, HANDOFF_MODE,
+                          "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"])
         self.assertEqual(NS["CFG_ACCEL_MODE"], CFG_MODE)
         self.assertEqual(NS["CFG_HANDOFF_ACCEL_MODE"], HANDOFF_MODE)
 
@@ -54,7 +55,7 @@ class Modes(unittest.TestCase):
 
 class Inputs(unittest.TestCase):
     def test_appended_after_handoff_step_before_clips_in(self):
-        names = [n for n, _ in _input_types()]
+        names = [n for n, _ in _input_types() if n not in ("tst_enabled", "tst_tau", "hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength", "hyperflow_lora_mode", "dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps")]  # appended later
         self.assertEqual(names[-6:], ["handoff_step", "pass1_cfg", "cfg_steps", "negative_prompt", "cfg_handoff_steps", "clips_in"])
 
     def test_defaults(self):
