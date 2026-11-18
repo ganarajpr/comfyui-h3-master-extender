@@ -545,6 +545,9 @@ class MiniMaxH3MasterExtender:
                 "cfg_steps": ("INT", {"default": CFG_STEPS_DEFAULT, "min": 2, "max": 100, "step": 1, "tooltip": "Base + CFG and CFG \u2192 Pika hand-off only: number of steps of the undistilled schedule (turbo_sampler / turbo_scheduler, no turbo LoRA). In the hand-off mode this is the length of the schedule whose first cfg_handoff_steps steps run."}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "Base + CFG and CFG \u2192 Pika hand-off only, and only with pass1_cfg above 1: the text of the unconditional branch. It is encoded with the same reference pictures / videos / audio and the same motion context as the positive prompt (so the two branches have the same layout and CFG amplifies only the text difference); it is not rewritten and not bridged. Empty = unconditional on the references alone. Describe what to avoid as plain things (\"blurry, flat lighting, extra fingers\"), not as \"no X\"."}),
                 "cfg_handoff_steps": ("INT", {"default": CFG_HANDOFF_STEPS_DEFAULT, "min": 1, "max": 99, "step": 1, "tooltip": "CFG \u2192 Pika hand-off only: how many of the cfg_steps steps run with CFG before Pika takes over (clamped to cfg_steps - 1). Pika then continues on its own pdd_nfe-step grid from the noise level the CFG segment stopped at, with no added noise. Fewer = more of the clip is Pika; more = more undistilled variety and prompt response."}),
+                # --- YoYo H3 Temporal State Transport (appended after cfg_handoff_steps, before the clips_in socket) ---
+                "tst_enabled": ("BOOLEAN", {"default": True, "tooltip": "YoYo H3 Temporal State Transport (TST, arXiv:2609.08505; needs the ComfyUI-YoYo-H3-TST node): a training-free per-head correction of the frame-to-frame attention, aimed at flicker, identity / outfit drift and implausible motion. Pass 1 only, strongest in the early steps. With SLA on it acts on the dense steps (core's sparse H3 path bypasses it), which are the early ones. Costs a little per attention call. Off = the model is untouched."}),
+                "tst_tau": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "TST correction strength. 0.2 is the paper setting; 0.5 is usually too strong. 0 = off."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -999,6 +1002,12 @@ class MiniMaxH3MasterExtender:
             kwargs.get("semantic_bridge_alpha", 0.12),
             kwargs.get("semantic_bridge_match", "per_token"),
         )
+        # TST: default on. A workflow saved before the input has its trailing master_ui "" (or nothing) here: on.
+        tst_flag = kwargs.get("tst_enabled", True)
+        tst_on = tst_flag if isinstance(tst_flag, bool) else True
+        tst_tau_raw = kwargs.get("tst_tau", 0.2)
+        tst_tau = float(tst_tau_raw) if isinstance(tst_tau_raw, (int, float)) and not isinstance(tst_tau_raw, bool) else 0.2
+        engine.configure_tst(tst_on, tst_tau)
 
         p1_settings = {
             # pdd_file and "hyperflow" are inert now but stay in the fingerprint (the hyperflow entry at the removed inputs
@@ -1014,6 +1023,9 @@ class MiniMaxH3MasterExtender:
             "single_te": bool(single_te),
             "refs": _media_digest([refs, ref_videos, ref_video_audios, ref_audios]),
         }
+        if engine._tst_active():
+            # Only when on, so pass-1 caches written with TST off (and before it existed) keep their fingerprint.
+            p1_settings["tst"] = [round(engine.tst_tau, 4)]
 
         if accel_mode == FLASH_ACCEL_MODE:
             # Only in Flash mode, so pass-1 caches of every other mode keep their fingerprint.

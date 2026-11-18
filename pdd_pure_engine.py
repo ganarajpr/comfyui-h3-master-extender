@@ -485,7 +485,7 @@ class MasterEngine:
         else:
             accelerated, sigmas_p1 = self._prepare_flash_base(shifted_model)
         self.accel_model = accelerated
-        accelerated = self._finish_model(accelerated)
+        accelerated = self._finish_model(accelerated, tst=True)
 
         self.prepared_model = accelerated
         self.pass1_sigmas = sigmas_p1
@@ -514,7 +514,7 @@ class MasterEngine:
         """Hand-off mode: the un-LoRA'd base model for the CFG segment (the Pika model is the engine's pass-1 model)."""
         if self.cfg_model is None:
             self.initialize_model()
-            self.cfg_model = self._finish_model(self.shifted_model)
+            self.cfg_model = self._finish_model(self.shifted_model, tst=True)
         return self.cfg_model
 
     def _prepare_flash_base(self, model):
@@ -571,7 +571,7 @@ class MasterEngine:
                       "weights. Turn sla_enabled off for a dense reference.", self.sparse_method)
         _LOG.info("HyperFlow Flash: grid %s, sampler euler, cfg 1; feed-forward chunking is skipped for this pass "
                   "(it assumes the dense fused fc1/fc2)", [round(float(x), 4) for x in sigmas])
-        self.flash_model = self._finish_model(self._apply_sigma_shift(patcher))
+        self.flash_model = self._finish_model(self._apply_sigma_shift(patcher), tst=True)
         return self.flash_model
 
     def _unload_flash(self):
@@ -593,9 +593,9 @@ class MasterEngine:
         except Exception as exc:
             _LOG.warning("HyperFlow Flash: could not offload the transformer explicitly (%s); pass 2's VRAM reclaim evicts it", exc)
 
-    def _finish_model(self, model, sparse=True, sparsity=None):
-        """Dense attention backend, then optional block-sparse attention on top
-        (SLA wraps the dense backend as its fall-through, so order matters)."""
+    def _finish_model(self, model, sparse=True, sparsity=None, tst=False):
+        """Dense attention backend, then TST (pass-1 models only, when on), then optional block-sparse
+        attention on top (SLA wraps the override below it as its fall-through, so order matters)."""
         attention_name = {
             "comfy kitchen attention": "comfy_kitchen_int8",
             "sage attention 2.2": "sage",
@@ -612,7 +612,40 @@ class MasterEngine:
         model = model.clone()
         model.set_model_optimized_attention(attention_function)
         _LOG.info("Sampling attention: %s", self.attention_backend)
+        if tst:
+            model = self._apply_tst(model)
         return self._apply_sla(model, sparsity) if sparse else model
+
+    # ------------------------------------------------------------------
+    # YoYo H3 Temporal State Transport (ComfyUI-YoYo-H3-TST), pass 1 only
+    # ------------------------------------------------------------------
+    def configure_tst(self, enabled=True, tau=0.2):
+        """TST (arXiv:2609.08505): per-head spectral-tension diagnosis of the frame-level attention operator,
+        corrected by a scheduled query temperature (strong in early steps, ~0 at the last). Applied to the pass-1
+        models only: pass 2 is a low-noise tail, where the paper's step schedule is already ~0, but the node would
+        see it as a 1-step schedule and run it at full strength."""
+        self.tst_tau = float(tau if tau is not None else 0.2)
+        self.tst_enabled = bool(enabled) and self.tst_tau > 0.0
+
+    def _tst_active(self):
+        return bool(getattr(self, "tst_enabled", False))
+
+    def _apply_tst(self, model):
+        if not self._tst_active():
+            return model
+        node = nodes.NODE_CLASS_MAPPINGS.get("YoYo_H3TemporalStateTransport")
+        if node is None:
+            _LOG.warning("TST is on but the ComfyUI-YoYo-H3-TST node is not installed; continuing without it")
+            return model
+        try:
+            out = node().patch(model, self.tst_tau, True)[0]
+        except Exception as exc:
+            _LOG.warning("TST could not be applied (%s); continuing without it", exc)
+            return model
+        _LOG.info("TST (YoYo H3 Temporal State Transport): tau %.2f on pass 1%s", self.tst_tau,
+                  "; with SLA on it acts on the dense steps only (core's sparse H3 block path bypasses attention "
+                  "overrides)" if self.sla_enabled else "")
+        return out
 
     # ------------------------------------------------------------------
     # Pass-2 (refine) LoRA: a different LoRA for the high-res tail only
@@ -725,7 +758,7 @@ class MasterEngine:
         prepared, _ = self.initialize_model()
         p2_sparsity = self._pass2_sla_override()
         if not self._pass2_lora_active():
-            if p2_sparsity is None:
+            if p2_sparsity is None and not self._tst_active():
                 return prepared
             if self.pass2_sla_model is None:
                 self.pass2_sla_model = self._finish_model(self.accel_model, sparsity=p2_sparsity)

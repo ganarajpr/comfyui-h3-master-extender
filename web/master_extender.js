@@ -326,6 +326,11 @@ function repairDualWidgets(node) {
     if (negative) negative.value = negativePromptValue(negative.value);
     const cfgHandoff = node.widgets?.find(x => x.name === "cfg_handoff_steps");
     if (cfgHandoff) cfgHandoff.value = cfgHandoffStepsValue(cfgHandoff.value);
+    // TST (appended after cfg_handoff_steps): a workflow saved before it carries master_ui's "" here. Default on, tau 0.2.
+    const tst = node.widgets?.find(x => x.name === "tst_enabled");
+    if (tst && typeof tst.value !== "boolean") tst.value = true;
+    const tstTau = node.widgets?.find(x => x.name === "tst_tau");
+    if (tstTau && (typeof tstTau.value !== "number" || !Number.isFinite(tstTau.value))) tstTau.value = 0.2;
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -1108,6 +1113,13 @@ app.registerExtension({
                             { indent: true, hint: "Residual strength. 0.10-0.15 recommended; higher is not better." }));
                         if (expert()) wrap.appendChild(uiRow("magnitude match", bindSelect("semantic_bridge_match"), { indent: true }));
                     }
+                }
+                // YoYo H3 Temporal State Transport (ComfyUI-YoYo-H3-TST): pass 1 only, default on.
+                if (W("tst_enabled")) {
+                    wrap.appendChild(uiRow("temporal state transport (TST)", bindToggle("tst_enabled"),
+                        { hint: "Training-free attention correction for flicker, identity / outfit drift and implausible motion. Pass 1 only; with SLA on it acts on the dense early steps." }));
+                    if (getW("tst_enabled", true)) wrap.appendChild(uiRow("TST tau", bindNumber("tst_tau"),
+                        { indent: true, hint: "Correction strength. 0.2 = paper setting; 0.5 is usually too strong." }));
                 }
             }
 
