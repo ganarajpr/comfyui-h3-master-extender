@@ -326,9 +326,10 @@ function repairDualWidgets(node) {
     if (negative) negative.value = negativePromptValue(negative.value);
     const cfgHandoff = node.widgets?.find(x => x.name === "cfg_handoff_steps");
     if (cfgHandoff) cfgHandoff.value = cfgHandoffStepsValue(cfgHandoff.value);
-    // TST (appended after cfg_handoff_steps): a workflow saved before it carries master_ui's "" here. Default on, tau 0.2.
+    // TST (appended after cfg_handoff_steps): a workflow saved before it carries master_ui's "" (or nothing) here. It was
+    // rendered without TST, so it loads with TST OFF and re-renders as it did. Only a new node defaults to on.
     const tst = node.widgets?.find(x => x.name === "tst_enabled");
-    if (tst && typeof tst.value !== "boolean") tst.value = true;
+    if (tst && typeof tst.value !== "boolean") tst.value = false;
     const tstTau = node.widgets?.find(x => x.name === "tst_tau");
     if (tstTau && (typeof tstTau.value !== "number" || !Number.isFinite(tstTau.value))) tstTau.value = 0.2;
 }
@@ -755,6 +756,13 @@ app.registerExtension({
             const clipsCallback = clipsWidget.callback;
             clipsWidget.callback = function (value) {
                 const result = clipsCallback?.apply(this, arguments);
+                // API-format load (only path that calls this callback; the panel writes clips_json directly): a prompt from before
+                // TST has no tst_enabled, so turn it off here; a newer prompt sets tst_enabled after clips_json and wins.
+                if (!node._tstApiLoadSeen) {
+                    node._tstApiLoadSeen = true;
+                    const tstW = node.widgets?.find(x => x.name === "tst_enabled");
+                    if (tstW) tstW.value = false;
+                }
                 try {
                     const restored = JSON.parse(value || "[]");
                     if (Array.isArray(restored)) {
