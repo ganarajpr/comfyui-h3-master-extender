@@ -546,7 +546,7 @@ class MiniMaxH3MasterExtender:
                 "negative_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "Base + CFG and CFG \u2192 Pika hand-off only, and only with pass1_cfg above 1: the text of the unconditional branch. It is encoded with the same reference pictures / videos / audio and the same motion context as the positive prompt (so the two branches have the same layout and CFG amplifies only the text difference); it is not rewritten and not bridged. Empty = unconditional on the references alone. Describe what to avoid as plain things (\"blurry, flat lighting, extra fingers\"), not as \"no X\"."}),
                 "cfg_handoff_steps": ("INT", {"default": CFG_HANDOFF_STEPS_DEFAULT, "min": 1, "max": 99, "step": 1, "tooltip": "CFG \u2192 Pika hand-off only: how many of the cfg_steps steps run with CFG before Pika takes over (clamped to cfg_steps - 1). Pika then continues on its own pdd_nfe-step grid from the noise level the CFG segment stopped at, with no added noise. Fewer = more of the clip is Pika; more = more undistilled variety and prompt response."}),
                 # --- YoYo H3 Temporal State Transport (appended after cfg_handoff_steps, before the clips_in socket) ---
-                "tst_enabled": ("BOOLEAN", {"default": True, "tooltip": "YoYo H3 Temporal State Transport (TST, arXiv:2609.08505; needs the ComfyUI-YoYo-H3-TST node): a training-free per-head correction of the frame-to-frame attention, aimed at flicker, identity / outfit drift and implausible motion. Pass 1 only, strongest in the early steps. With SLA on it acts on the dense steps (core's sparse H3 path bypasses it), which are the early ones. Costs a little per attention call. Off = the model is untouched."}),
+                "tst_enabled": ("BOOLEAN", {"default": True, "tooltip": "YoYo H3 Temporal State Transport (TST, arXiv:2609.08505; needs the ComfyUI-YoYo-H3-TST node): a training-free per-head correction of the frame-to-frame attention, aimed at flicker, identity / outfit drift and implausible motion. Pass 1 only, strongest in the early steps. With SLA on it acts on the dense steps (core's sparse H3 path bypasses it), which are the early ones. Costs a little per attention call. Off = the model is untouched. Workflows and videos made before TST existed load with it off, so they re-render as before."}),
                 "tst_tau": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "TST correction strength. 0.2 is the paper setting; 0.5 is usually too strong. 0 = off."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -1002,9 +1002,9 @@ class MiniMaxH3MasterExtender:
             kwargs.get("semantic_bridge_alpha", 0.12),
             kwargs.get("semantic_bridge_match", "per_token"),
         )
-        # TST: default on. A workflow saved before the input has its trailing master_ui "" (or nothing) here: on.
-        tst_flag = kwargs.get("tst_enabled", True)
-        tst_on = tst_flag if isinstance(tst_flag, bool) else True
+        # TST: a new node defaults it on in the UI. A graph made before the input existed renders exactly as it did: a missing
+        # tst_enabled (old API prompt) or a non-bool one (old workflow's trailing master_ui "") is OFF.
+        tst_on = kwargs.get("tst_enabled", False) is True
         tst_tau_raw = kwargs.get("tst_tau", 0.2)
         tst_tau = float(tst_tau_raw) if isinstance(tst_tau_raw, (int, float)) and not isinstance(tst_tau_raw, bool) else 0.2
         engine.configure_tst(tst_on, tst_tau)

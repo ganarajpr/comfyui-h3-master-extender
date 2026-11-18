@@ -333,6 +333,15 @@ function repairDualWidgets(node) {
     if (tstTau && (typeof tstTau.value !== "number" || !Number.isFinite(tstTau.value))) tstTau.value = 0.2;
 }
 
+// A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
+// or nothing). It was rendered without TST, so it loads with TST off whatever lands in the slot.
+function repairTstForOldWorkflow(node, info) {
+    const values = info?.widgets_values;
+    const idx = node.widgets?.findIndex(x => x.name === "tst_tau") ?? -1;
+    const tst = node.widgets?.find(x => x.name === "tst_enabled");
+    if (tst && Array.isArray(values) && idx >= 0 && values.length <= idx) tst.value = false;
+}
+
 function repairHyperflowWidgets(node, defaults) {
     repairDualWidgets(node);
     repairFinalDecode(node);
@@ -765,6 +774,7 @@ app.registerExtension({
                 repairHyperflowWidgets(node, hyperflowDefaults);
                 repairSemanticBridge(node);
                 repairSparseWidgets(node);
+                repairTstForOldWorkflow(node, info);
                 // Older workflows stored the empty master_ui value in this slot.
                 const attentionWidget = node.widgets?.find(w => w.name === "attention_backend");
                 if (attentionWidget && attentionWidget.value === "") {
