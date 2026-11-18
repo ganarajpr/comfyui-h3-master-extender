@@ -54,6 +54,40 @@ async function copyText(text) {
     area.remove();
 }
 
+// Copy all clips / Paste clips: one Extender's whole clip list moves to another in one go.
+// The payload goes to the system clipboard AND localStorage: ComfyUI on the box is served over plain http,
+// where navigator.clipboard.readText() does not exist, so paste reads localStorage first-hand there.
+const CLIPS_CLIPBOARD_KEY = "minimax_h3_master.clips_clipboard";
+const CLIPS_CLIPBOARD_FORMAT = "minimax-h3-master-clips";
+
+function packClips(clips) {
+    return JSON.stringify({ format: CLIPS_CLIPBOARD_FORMAT, version: 1, copied_at: new Date().toISOString(), clips }, null, 2);
+}
+
+// Accepts our envelope, a bare clips array (a clips_json value), or an object with a clips array. Returns null otherwise.
+function unpackClips(text) {
+    if (typeof text !== "string" || !text.trim()) return null;
+    let data;
+    try { data = JSON.parse(text); } catch (e) { return null; }
+    const clips = Array.isArray(data) ? data : (data && Array.isArray(data.clips) ? data.clips : null);
+    if (!clips || !clips.length || !clips.every((c) => c && typeof c === "object" && !Array.isArray(c))) return null;
+    return clips;
+}
+
+async function readClipsClipboard() {
+    if (navigator.clipboard?.readText && window.isSecureContext) {
+        try {
+            const clips = unpackClips(await navigator.clipboard.readText());
+            if (clips) return clips;
+        } catch (e) { /* permission denied: fall through */ }
+    }
+    try {
+        const clips = unpackClips(localStorage.getItem(CLIPS_CLIPBOARD_KEY));
+        if (clips) return clips;
+    } catch (e) { /* storage blocked */ }
+    return null;
+}
+
 function escapeHtml(text) {
     return text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -698,6 +732,49 @@ app.registerExtension({
                 video.onmouseenter = () => video.play().catch(() => {});
                 video.onmouseleave = () => video.pause();
                 return video;
+            }
+
+            // Paste a copied clip list. Pasted clips get fresh ids and are un-validated: char refs and engine
+            // settings are not in a clip's cache fingerprint, so a validated clip pasted into a workflow with a
+            // different recipe would silently hand back the source workflow's render.
+            function pasteClips(incoming) {
+                const isBlank = (c) => !String(c.prompt || "").trim() && !String(c.prompt_raw || "").trim();
+                const onlyBlank = clipsState.every(isBlank);
+                let replace = onlyBlank;
+                if (!onlyBlank) {
+                    const answer = prompt(
+                        `Paste ${incoming.length} clip${incoming.length === 1 ? "" : "s"}.\n\n` +
+                        `Type A to APPEND after the ${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} here, ` +
+                        `or R to REPLACE them.`, "A");
+                    if (answer == null) return;
+                    const choice = answer.trim().toUpperCase()[0];
+                    if (choice !== "A" && choice !== "R") return;
+                    replace = choice === "R";
+                }
+                const copies = JSON.parse(JSON.stringify(incoming)).map((c) => {
+                    delete c.id;
+                    c.validated = false;
+                    if (!Number(c.duration)) c.duration = DUR_DEFAULT;
+                    if (!Array.isArray(c.loras)) c.loras = [];
+                    if (!c.seed_mode) c.seed_mode = "randomize";
+                    if (typeof c.seed !== "number") c.seed = Math.floor(Math.random() * 1000000000);
+                    return c;
+                });
+                if (replace) {
+                    closePromptPanel();
+                    liveRewrite.clear();
+                    expandedValidated.clear();
+                    cacheStates = [];
+                    cacheVideos = [];
+                    clipsState.length = 0;
+                }
+                copies.forEach((c) => {
+                    c.id = nextClipId(clipsState);
+                    if (!c.title) c.title = `Clip ${clipsState.length + 1}`;
+                    clipsState.push(c);
+                });
+                saveState();
+                renderUI();
             }
 
             function copyButton(clip) {
@@ -1641,7 +1718,36 @@ app.registerExtension({
                     clearRewritesBtn.title = "Drop the rewritten prompt of every clip and put its raw prompt back, so the next run rewrites them all. Raw prompts are not touched.";
                     clearRewritesBtn.style.cssText = bulkStyle.replace("#2e6a45", "#6b5416").replace("#4ade80", "#fcd34d");
                     clearRewritesBtn.onclick = (e) => { e.stopPropagation(); clearAllRewrites(); };
-                    actions.append(clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
+                    // Copy every clip to the clipboard; paste them into another Extender (append or replace).
+                    const copyAllBtn = document.createElement("button");
+                    copyAllBtn.textContent = "⧉ Copy all";
+                    copyAllBtn.title = "Copy every clip (prompts, raw + rewritten text, durations, seeds, LoRAs) so another Master Extender can paste them with Paste clips";
+                    copyAllBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3f3f58").replace("#4ade80", "#ddd");
+                    copyAllBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        const text = packClips(clipsState);
+                        let ok = false;
+                        try { localStorage.setItem(CLIPS_CLIPBOARD_KEY, text); ok = true; } catch (error) { /* storage blocked */ }
+                        try { await copyText(text); ok = true; } catch (error) { /* clipboard blocked */ }
+                        copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy failed";
+                        setTimeout(() => { copyAllBtn.textContent = "⧉ Copy all"; }, 1500);
+                    };
+                    const pasteBtn = document.createElement("button");
+                    pasteBtn.textContent = "Paste clips";
+                    pasteBtn.title = "Paste the clips copied with Copy all (from any Master Extender, this workflow or another). Asks whether to append or replace.";
+                    pasteBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3c5480").replace("#4ade80", "#8fb0e6");
+                    pasteBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        let incoming = await readClipsClipboard();
+                        if (!incoming) {
+                            const typed = prompt("No copied clips found in this browser. Paste the copied clips text (from Copy all) here:");
+                            if (typed == null) return;
+                            incoming = unpackClips(typed);
+                            if (!incoming) { alert("That is not a copied clip list. Use Copy all on the source Master Extender first."); return; }
+                        }
+                        pasteClips(incoming);
+                    };
+                    actions.append(copyAllBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
                 container.appendChild(projectControls.references());
