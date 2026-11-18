@@ -179,12 +179,13 @@ class NodeWiring(unittest.TestCase):
         tree = ast.parse(self.text)
         modes = next(ast.literal_eval(n.value) for n in tree.body
                      if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
-        self.assertEqual(modes, ["Turbo LoRA", MODE, "Pika \u2192 Flash hand-off"])
+        self.assertEqual(modes, ["Turbo LoRA", MODE, "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off"])
         self.assertRegex(self.text, r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
 
     def test_new_inputs_are_last_before_the_clips_in_socket(self):
         import re
         names = re.findall(r'^\s{16}"(\w+)": \(', self.text[self.text.index("def INPUT_TYPES"):], re.M)
+        names = [n for n in names if n not in ("pass1_cfg", "cfg_steps", "negative_prompt", "cfg_handoff_steps")]  # appended later, see test_cfg_pass1
         self.assertEqual(names[-6:], ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora",
                                       "hyperflow_flash_lora_strength", "handoff_step", "clips_in"])
         self.assertRegex(self.text, r'"hyperflow_flash_lora": \(\["none"\] \+ folder_paths\.get_filename_list\("loras"\), \{"default": "none"')

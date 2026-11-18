@@ -61,12 +61,14 @@ class Inputs(unittest.TestCase):
         modes = next(ast.literal_eval(n.value) for n in tree.body
                      if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
         self.assertEqual(modes[:2], ["Turbo LoRA", "HyperFlow Flash (GGUF)"])
-        self.assertEqual(modes[-1], MODE)
+        self.assertEqual(modes[2], MODE)
         self.assertEqual(NS["HANDOFF_ACCEL_MODE"], MODE)
 
     def test_handoff_step_is_appended_after_the_flash_widgets(self):
         names = re.findall(r'^\s{16}"(\w+)": \(', NODE_TEXT[NODE_TEXT.index("def INPUT_TYPES"):], re.M)
-        self.assertEqual(names[-3:], ["hyperflow_flash_lora_strength", "handoff_step", "clips_in"])
+        i = names.index("handoff_step")
+        self.assertEqual(names[i - 1:i + 1], ["hyperflow_flash_lora_strength", "handoff_step"])
+        self.assertEqual(names[-1], "clips_in")
         self.assertRegex(NODE_TEXT, r'"handoff_step": \(HANDOFF_STEP_OPTIONS, \{"default": HANDOFF_STEP_DEFAULT_LABEL')
         self.assertEqual(NS["HANDOFF_STEP_DEFAULT"], 3)
         self.assertEqual(NS["HANDOFF_STEP_OPTIONS"], ["1 \u00b7 Pika to 0.98", "2 \u00b7 Pika to 0.96", "3 \u00b7 Pika to 0.92", "4 \u00b7 Pika to 0.86", "5 \u00b7 Pika to 0.71"])

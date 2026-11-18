@@ -171,6 +171,12 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
         steps = inputs.get("pdd_nfe", "?")
         if str(accel).lower().startswith("turbo"):
             lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
+        elif str(accel).startswith("Base + CFG"):
+            lines.append(f"Engine: Base + CFG {inputs.get('pass1_cfg', 4.5)} (undistilled) · {inputs.get('cfg_steps', 24)} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}"
+                         + (" · negative prompt" if str(inputs.get('negative_prompt') or "").strip() else ""))
+        elif str(accel).startswith("CFG"):
+            lines.append(f"Engine: CFG {inputs.get('pass1_cfg', 4.5)} \u2192 Pika hand-off: {inputs.get('cfg_handoff_steps', 8)} of {inputs.get('cfg_steps', 24)} CFG steps, then {inputs.get('turbo_lora', '')} · {steps} steps"
+                         + (" · negative prompt" if str(inputs.get('negative_prompt') or "").strip() else ""))
         elif str(accel).startswith("Pika"):
             lines.append(f"Engine: Pika\u2192Flash hand-off @{_handoff_k(inputs.get('handoff_step'))}: {inputs.get('turbo_lora', '')} \u2192 {inputs.get('hyperflow_flash_file', '')}")
         elif str(accel).startswith("HyperFlow Flash"):

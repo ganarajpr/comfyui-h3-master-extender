@@ -166,3 +166,18 @@ console.log("widget migration ok");
     assert.equal(pass2AudioValue("LoRA refine"), "pass 2 (refined)");
     assert.equal(pass2AudioValue("PTD last hop"), "pass 2 (refined)");
 }
+
+// pass1_cfg / cfg_steps / negative_prompt / cfg_handoff_steps are appended after handoff_step: master_ui's "" and bad values fall back
+import { pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "../web/widget_migration.js";
+assert.equal(pass1CfgValue(""), 4.5);
+assert.equal(pass1CfgValue(0.5), 4.5);
+assert.equal(pass1CfgValue(1), 1);
+assert.equal(pass1CfgValue(6.5), 6.5);
+assert.equal(cfgStepsValue(""), 24);
+assert.equal(cfgStepsValue(1), 24);
+assert.equal(cfgStepsValue(30), 30);
+assert.equal(cfgHandoffStepsValue(undefined), 8);
+assert.equal(cfgHandoffStepsValue(5), 5);
+assert.equal(negativePromptValue(undefined), "");
+assert.equal(negativePromptValue("blurry"), "blurry");
+console.log("cfg widget migration ok");

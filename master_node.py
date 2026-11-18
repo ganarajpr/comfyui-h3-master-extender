@@ -60,6 +60,13 @@ from .pdd_pure_engine import (
     HANDOFF_ACCEL_MODE,
     HANDOFF_STEP_DEFAULT,
     clamp_handoff_step,
+    CFG_ACCEL_MODE,
+    CFG_HANDOFF_ACCEL_MODE,
+    CFG_STEPS_DEFAULT,
+    PASS1_CFG_DEFAULT,
+    CFG_HANDOFF_STEPS_DEFAULT,
+    cfg_pass1_settings,
+    clamp_cfg_handoff_steps,
     parse_handoff_step,
     HANDOFF_STEP_OPTIONS,
     HANDOFF_STEP_DEFAULT_LABEL,
@@ -339,7 +346,7 @@ PIKA_LORA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors"
 
 # Options are restored by name, so new ones are only ever appended. The HyperFlow 8-step options (plain and
 # dual sampling) were removed on 2026-11-17: they still load, and run as the Pika + DMAD recipe.
-ACCEL_MODES = ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off"]
+ACCEL_MODES = ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off"]
 
 
 def is_legacy_accel_mode(accel_mode):
@@ -454,7 +461,7 @@ class MiniMaxH3MasterExtender:
                 "sparse_method": (["sla", "sol-attn", "vsa"], {"default": "sla", "tooltip": "Selection method for core BlockSparseAttention when sla_enabled is on. sla: keep a fixed top-k percent of key blocks (1 - sla_sparsity). sol-attn: training-free adaptive threshold per head/query block (tau). vsa: FastVideo cube attention, only with FastH3-VSA weights."}),
                 "sparse_tau": ("FLOAT", {"default": 1.3, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "sol-attn threshold in score sigmas. Higher = sparser: 1.0 keeps ~16% of key blocks, 1.5 ~7%, 2.0 ~2.7%."}),
                 # --- Acceleration: Turbo LoRA (default: Pika) or HyperFlow Flash ---
-                "accel_mode": (ACCEL_MODES, {"default": "Turbo LoRA", "tooltip": "Turbo LoRA (default): a plain step-distilled LoRA (Pika, turbo, lightning, lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count. HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (needs ComfyUI-HyperFlow-Flash). Pika \u2192 Flash hand-off: Pika (turbo_lora) runs the first handoff_step steps of pass 1, then Flash finishes from that noise level (needs a turbo_lora and the Flash inputs). The HyperFlow 8-step options were removed 2026-11-17; saved workflows with them run Pika + DMAD."}),
+                "accel_mode": (ACCEL_MODES, {"default": "Turbo LoRA", "tooltip": "Turbo LoRA (default): a plain step-distilled LoRA (Pika, turbo, lightning, lightx2v) with a regular scheduler; 'Turbo LoRA steps' becomes the turbo step count. HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (needs ComfyUI-HyperFlow-Flash). Pika \u2192 Flash hand-off: Pika (turbo_lora) runs the first handoff_step steps of pass 1, then Flash finishes from that noise level (needs a turbo_lora and the Flash inputs). Base + CFG (undistilled): pass 1 runs the base model with no turbo LoRA, a regular scheduler, cfg_steps steps and real classifier-free guidance (pass1_cfg, negative_prompt); pass 2 is unchanged. CFG \u2192 Pika hand-off: the first cfg_handoff_steps of those cfg_steps run with CFG, then the turbo_lora (Pika) finishes from that noise level. The HyperFlow 8-step options were removed 2026-11-17; saved workflows with them run Pika + DMAD."}),
                 "turbo_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": PIKA_LORA if PIKA_LORA in folder_paths.get_filename_list("loras") else "none", "tooltip": "Turbo LoRA file (models/loras). Used only in Turbo LoRA mode. Default: the Pika H3 flex ref2va LoRA."}),
                 "turbo_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "Turbo LoRA strength."}),
                 "turbo_sampler": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler", "tooltip": "Sampler for Turbo LoRA mode (HyperFlow Flash always uses euler)."}),
@@ -533,6 +540,11 @@ class MiniMaxH3MasterExtender:
                 "hyperflow_flash_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "HyperFlow Flash (GGUF) mode only: a LoRA applied to the Flash pass-1 model (e.g. the Pika-for-Flash companion of a pikafold checkpoint, h3\\pika_h3_flex_ref2va_for_flash.safetensors). The normal LoRA stack only reaches pass 2."}),
                 "hyperflow_flash_lora_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05, "tooltip": "HyperFlow Flash (GGUF) mode only: strength of hyperflow_flash_lora on the Flash pass-1 model."}),
                 "handoff_step": (HANDOFF_STEP_OPTIONS, {"default": HANDOFF_STEP_DEFAULT_LABEL, "tooltip": "Pika \u2192 Flash hand-off only: how many of Pika's 6 pass-1 steps run before Flash takes over; the decimal is the noise level left at the hand-off (measured for pdd_nfe 6, simple scheduler, shift 12). With other pdd_nfe values the decimal is approximate, and the step is clamped to pdd_nfe - 1."}),
+                # --- Undistilled pass 1 with real CFG (appended after handoff_step, before the clips_in socket) ---
+                "pass1_cfg": ("FLOAT", {"default": PASS1_CFG_DEFAULT, "min": 1.0, "max": 20.0, "step": 0.1, "tooltip": "Base + CFG and CFG \u2192 Pika hand-off only: classifier-free guidance scale of the undistilled pass 1. 1.0 = no guidance (the plain positive-only path, no negative encode, no second forward pass). Above 1 every CFG step runs the prompt and the negative_prompt branch, about twice the cost of a step at CFG 1. Pass 2 always runs at CFG 1."}),
+                "cfg_steps": ("INT", {"default": CFG_STEPS_DEFAULT, "min": 2, "max": 100, "step": 1, "tooltip": "Base + CFG and CFG \u2192 Pika hand-off only: number of steps of the undistilled schedule (turbo_sampler / turbo_scheduler, no turbo LoRA). In the hand-off mode this is the length of the schedule whose first cfg_handoff_steps steps run."}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "Base + CFG and CFG \u2192 Pika hand-off only, and only with pass1_cfg above 1: the text of the unconditional branch. It is encoded with the same reference pictures / videos / audio and the same motion context as the positive prompt (so the two branches have the same layout and CFG amplifies only the text difference); it is not rewritten and not bridged. Empty = unconditional on the references alone. Describe what to avoid as plain things (\"blurry, flat lighting, extra fingers\"), not as \"no X\"."}),
+                "cfg_handoff_steps": ("INT", {"default": CFG_HANDOFF_STEPS_DEFAULT, "min": 1, "max": 99, "step": 1, "tooltip": "CFG \u2192 Pika hand-off only: how many of the cfg_steps steps run with CFG before Pika takes over (clamped to cfg_steps - 1). Pika then continues on its own pdd_nfe-step grid from the noise level the CFG segment stopped at, with no added noise. Fewer = more of the clip is Pika; more = more undistilled variety and prompt response."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -572,6 +584,8 @@ class MiniMaxH3MasterExtender:
             return f"turbo_lora: '{turbo_lora}' not in loras"
         if normalize_accel_mode(accel_mode) == HANDOFF_ACCEL_MODE and turbo_lora in ("", "none"):
             return "accel_mode: Pika \u2192 Flash hand-off needs a turbo_lora (the Pika LoRA), not none"
+        if normalize_accel_mode(accel_mode) == CFG_HANDOFF_ACCEL_MODE and turbo_lora in ("", "none"):
+            return "accel_mode: CFG \u2192 Pika hand-off needs a turbo_lora (the Pika LoRA), not none"
         if normalize_accel_mode(accel_mode) in (FLASH_ACCEL_MODE, HANDOFF_ACCEL_MODE):
             if hyperflow_flash_file and hyperflow_flash_file not in _flash_files():
                 return f"hyperflow_flash_file: '{hyperflow_flash_file}' not in {_flash_files()}"
@@ -668,6 +682,14 @@ class MiniMaxH3MasterExtender:
             if turbo_lora in (None, "", "none"):
                 raise ValueError("Pika \u2192 Flash hand-off needs a turbo_lora (the Pika LoRA); it is none")
             handoff_step = clamp_handoff_step(parse_handoff_step(kwargs.get("handoff_step")), int(pdd_nfe))
+        pass1_cfg = float(kwargs.get("pass1_cfg", PASS1_CFG_DEFAULT) or PASS1_CFG_DEFAULT)
+        cfg_steps = int(kwargs.get("cfg_steps") or CFG_STEPS_DEFAULT)
+        negative_prompt = str(kwargs.get("negative_prompt") or "")
+        cfg_handoff_steps = int(kwargs.get("cfg_handoff_steps") or CFG_HANDOFF_STEPS_DEFAULT)
+        if accel_mode == CFG_HANDOFF_ACCEL_MODE:
+            if turbo_lora in (None, "", "none"):
+                raise ValueError("CFG \u2192 Pika hand-off needs a turbo_lora (the Pika LoRA); it is none")
+            cfg_handoff_steps = clamp_cfg_handoff_steps(cfg_handoff_steps, cfg_steps)
         owner = str(unique_id if unique_id is not None else "master_extender")
         export_profile = None
         for config in (prompt or {}).values():
@@ -938,6 +960,10 @@ class MiniMaxH3MasterExtender:
             hyperflow_flash_lora=flash_lora,
             hyperflow_flash_lora_strength=flash_lora_strength,
             handoff_step=handoff_step,
+            pass1_cfg=pass1_cfg,
+            cfg_steps=cfg_steps,
+            negative_prompt=negative_prompt,
+            cfg_handoff_steps=cfg_handoff_steps,
             background_busy=lambda: background["worker"] is not None and background["worker"].busy(),
             wait_background=lambda: _finish_background(),
         )
@@ -999,6 +1025,12 @@ class MiniMaxH3MasterExtender:
             # Only in hand-off mode (the Pika parts are already in the base keys): a different Flash file / steps /
             # LoRA or hand-off step never shares a cached pass 1.
             p1_settings["handoff"] = [flash_file, flash_steps, flash_lora, flash_lora_strength, handoff_step]
+
+        cfg_entry = cfg_pass1_settings(accel_mode, pass1_cfg, cfg_steps, negative_prompt, cfg_handoff_steps)
+        if cfg_entry is not None:
+            # Only in the undistilled modes, so every other mode keeps its fingerprint. accel_mode is already a base key, so a
+            # CFG clip never matches a CFG-1 one; these separate two CFG renders that differ in guidance, steps, negative or hand-off.
+            p1_settings["cfg"] = cfg_entry
 
         clip_pictures = [clip_picture_keys(c, refs, n + 1) for n, c in enumerate(clips)]
         if any(p is not None for p in clip_pictures):

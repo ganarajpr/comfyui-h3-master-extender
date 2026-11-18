@@ -154,6 +154,11 @@ HANDOFF_STEP_OPTIONS = [
 ]
 HANDOFF_STEP_DEFAULT = 3
 HANDOFF_STEP_DEFAULT_LABEL = HANDOFF_STEP_OPTIONS[2]
+CFG_ACCEL_MODE = "Base + CFG (undistilled)"
+CFG_HANDOFF_ACCEL_MODE = "CFG \u2192 Pika hand-off"
+CFG_STEPS_DEFAULT = 24
+PASS1_CFG_DEFAULT = 4.5
+CFG_HANDOFF_STEPS_DEFAULT = 8
 FLASH_STEPS = (4, 6, 8)
 FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
 FLASH_FALLBACK_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
@@ -297,6 +302,27 @@ def split_handoff_sigmas(pika_sigmas, k, flash_grid):
     return pika[:k + 1], flash, sigma
 
 
+def is_cfg_accel_mode(accel_mode):
+    return str(accel_mode) in (CFG_ACCEL_MODE, CFG_HANDOFF_ACCEL_MODE)
+
+
+def clamp_cfg_handoff_steps(k, steps):
+    """CFG steps that run before Pika takes over: 1..steps-1 of the cfg_steps schedule."""
+    return max(1, min(int(k), int(steps) - 1))
+
+
+def cfg_pass1_settings(accel_mode, pass1_cfg, cfg_steps, negative_prompt, cfg_handoff_steps):
+    """Pass-1 fingerprint entry of the undistilled modes (None in every other mode, so their caches keep their fingerprint).
+    Everything that changes what the base model samples is in it: the guidance, the schedule length, the negative text and,
+    for the hand-off, where Pika takes over."""
+    if not is_cfg_accel_mode(accel_mode):
+        return None
+    entry = [float(pass1_cfg), int(cfg_steps), str(negative_prompt or "")]
+    if str(accel_mode) == CFG_HANDOFF_ACCEL_MODE:
+        entry.append(int(cfg_handoff_steps))
+    return entry
+
+
 PASS2_CHUNK_WHEN = ("above 720p", "always")
 PASS2_CHUNK_MIN_SHORT_SIDE = 800
 
@@ -366,14 +392,30 @@ class MasterEngine:
         hyperflow_flash_lora="none",
         hyperflow_flash_lora_strength=1.0,
         handoff_step=HANDOFF_STEP_DEFAULT,
+        pass1_cfg=PASS1_CFG_DEFAULT,
+        cfg_steps=CFG_STEPS_DEFAULT,
+        negative_prompt="",
+        cfg_handoff_steps=CFG_HANDOFF_STEPS_DEFAULT,
     ):
         self.raw_model = model
         self.accel_mode = str(accel_mode)
         self.handoff_mode = self.accel_mode == HANDOFF_ACCEL_MODE
+        self.cfg_mode = self.accel_mode == CFG_ACCEL_MODE
+        self.cfg_handoff_mode = self.accel_mode == CFG_HANDOFF_ACCEL_MODE
+        self.pass1_cfg = float(pass1_cfg if pass1_cfg is not None else PASS1_CFG_DEFAULT)
+        self.cfg_steps = max(2, int(cfg_steps or CFG_STEPS_DEFAULT))
+        self.negative_prompt = str(negative_prompt or "")
+        self.cfg_handoff_steps = clamp_cfg_handoff_steps(cfg_handoff_steps or CFG_HANDOFF_STEPS_DEFAULT, self.cfg_steps)
+        # CFG 1.0 is "no guidance": the plain positive-only path, no negative encode and no second forward pass.
+        self.cfg_active = (self.cfg_mode or self.cfg_handoff_mode) and self.pass1_cfg > 1.0 + 1e-6
+        self.cfg_model = None
         self.handoff_step = int(handoff_step or HANDOFF_STEP_DEFAULT)
         self.flash_grid = None
         # Hand-off pass 1 is Pika (Turbo LoRA) up to the hand-off step, so everything keyed on turbo (sampler, pass-2 tail) applies.
-        self.turbo_mode = self.accel_mode.lower().startswith("turbo") or self.handoff_mode
+        # The undistilled modes count as turbo for everything after pass 1: pass 2 keeps its turbo-keyed schedule
+        # (pdd_nfe steps, round(steps x denoise) tail) and the user's sampler.
+        self.turbo_mode = (self.accel_mode.lower().startswith("turbo") or self.handoff_mode
+                           or self.cfg_mode or self.cfg_handoff_mode)
         self.flash_mode = self.accel_mode == FLASH_ACCEL_MODE
         self.flash_file = str(hyperflow_flash_file or FLASH_DEFAULT_FILE)
         self.flash_steps = int(hyperflow_flash_steps or 6)
@@ -420,7 +462,12 @@ class MasterEngine:
         if self.prepared_model is not None:
             return self.prepared_model, self.pass1_sigmas
 
-        if self.turbo_mode:
+        if self.cfg_mode:
+            accel_desc = f"Base + CFG {self.pass1_cfg:g}, {self.cfg_steps} steps, no turbo LoRA"
+        elif self.cfg_handoff_mode:
+            accel_desc = (f"CFG {self.pass1_cfg:g} for {self.cfg_handoff_steps}/{self.cfg_steps} steps, then Turbo LoRA "
+                          f"{self.turbo_lora or 'none'} ({self.turbo_steps} steps)")
+        elif self.turbo_mode:
             accel_desc = f"Turbo LoRA: {self.turbo_lora or 'none'} ({self.turbo_steps} steps)"
         else:
             accel_desc = f"HyperFlow Flash (GGUF): {self.flash_file}, {self.flash_steps} steps"
@@ -431,7 +478,9 @@ class MasterEngine:
         self.shifted_model = shifted_model
 
         # 2. Acceleration: a plain turbo / lightning LoRA, or HyperFlow Flash
-        if self.turbo_mode:
+        if self.cfg_mode:
+            accelerated, sigmas_p1 = self._prepare_cfg_base(shifted_model)
+        elif self.turbo_mode:
             accelerated, sigmas_p1 = self._prepare_turbo_model(shifted_model)
         else:
             accelerated, sigmas_p1 = self._prepare_flash_base(shifted_model)
@@ -453,6 +502,20 @@ class MasterEngine:
         except Exception as e:
             _LOG.warning(f"Error applying MiniMaxH3SigmaShift: {e}")
             return model
+
+    def _prepare_cfg_base(self, model):
+        """Undistilled pass 1: the base model (SigmaShift only, no turbo LoRA) on a regular cfg_steps schedule."""
+        sigmas = self._basic_sigmas(model, self.cfg_steps, 1.0)
+        _LOG.info("Base + CFG: %d steps, %s / %s, guidance %g%s", self.cfg_steps, self.sampler_name, self.scheduler_name,
+                  self.pass1_cfg, "" if self.cfg_active else " (no guidance: positive-only path)")
+        return model, sigmas
+
+    def initialize_cfg_model(self):
+        """Hand-off mode: the un-LoRA'd base model for the CFG segment (the Pika model is the engine's pass-1 model)."""
+        if self.cfg_model is None:
+            self.initialize_model()
+            self.cfg_model = self._finish_model(self.shifted_model)
+        return self.cfg_model
 
     def _prepare_flash_base(self, model):
         """Flash mode: the base model (SigmaShift) is the pass-2 / audio-refine model; pass 1 is the Flash transformer,
@@ -1067,7 +1130,22 @@ class MasterEngine:
         return self._sample_euler(flash_model, positive, mid, torch.tensor(flash_seg, dtype=torch.float32), seed,
                                   ff_chunk=False, sampler_name="euler", add_noise=False)
 
-    def _sample_euler(self, model, positive, latent_image, sigmas, seed, ff_chunk=True, sampler_name=None, add_noise=True):
+    def _sample_cfg_handoff(self, cfg_model, pika_model, pika_grid, positive, negative, latent, seed):
+        """Pass 1 as CFG -> Pika: the undistilled base model with real CFG samples the first k steps of a cfg_steps schedule
+        (composition, pose, the negative prompt's work), then Pika finishes from that noise level on its own grid at CFG 1
+        (the same split and continuation as the Pika -> Flash hand-off, with Pika in the finishing role)."""
+        cfg_sigmas = self._basic_sigmas(cfg_model, self.cfg_steps, 1.0)
+        k = clamp_cfg_handoff_steps(self.cfg_handoff_steps, self.cfg_steps)
+        cfg_seg, pika_seg, sigma = split_handoff_sigmas(cfg_sigmas, k, pika_grid)
+        _LOG.info("CFG -> Pika hand-off: CFG %g steps 1..%d of %d (sigma 1.0->%.4f), Pika %d steps (%.4f->0)",
+                  self.pass1_cfg, k, self.cfg_steps, sigma, len(pika_seg) - 1, sigma)
+        mid = self._sample_euler(cfg_model, positive, latent, torch.tensor(cfg_seg, dtype=torch.float32), seed,
+                                 cfg=self.pass1_cfg, negative=negative)
+        return self._sample_euler(pika_model, positive, mid, torch.tensor(pika_seg, dtype=torch.float32), seed,
+                                  add_noise=False)
+
+    def _sample_euler(self, model, positive, latent_image, sigmas, seed, ff_chunk=True, sampler_name=None, add_noise=True,
+                      cfg=1.0, negative=None):
         """Standard Euler sampling using ComfyUI core sampler internals directly.
 
         NOTE: Do NOT place any bare 'import comfy' statements inside this function.
@@ -1092,16 +1170,23 @@ class MasterEngine:
         noise_obj = Noise_RandomNoise(seed) if add_noise else Noise_EmptyNoise()
 
         # Size the feed-forward chunking to this pass's packed token count.
+        # CFG > 1 with a negative runs the conditional and unconditional branches (a batch of 2): size for both.
+        use_cfg = negative is not None and float(cfg) > 1.0 + 1e-6
+        tokens = self._packed_tokens(latent_image["samples"]) * (2 if use_cfg else 1)
         if ff_chunk:
-            model = self._with_ff_chunking(model, self._packed_tokens(latent_image["samples"]))
+            model = self._with_ff_chunking(model, tokens)
 
         # Build guider directly — bypass ComfyUI v3 node wrapper (NodeOutput issue)
         # MiniMax H3 is a pure flow model: no negative conditioning needed.
         # CFGGuider.set_conds(positive, negative) — pass positive for both.
         # With set_cfg(1.0): output = neg + 1.0*(pos-neg) = pos, so negative is never used.
         guider = comfy.samplers.CFGGuider(model)
-        guider.set_conds(positive, positive)
-        guider.set_cfg(1.0)
+        if use_cfg:
+            guider.set_conds(positive, negative)
+            guider.set_cfg(float(cfg))
+        else:
+            guider.set_conds(positive, positive)
+            guider.set_cfg(1.0)
 
         # Build sampler object: HyperFlow Flash was distilled for plain Euler; turbo mode
         # uses the user's sampler (res_multistep by default).
@@ -1130,7 +1215,10 @@ class MasterEngine:
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        self._reclaim_vram(guider.model_patcher, latent["samples"])
+        if use_cfg:
+            self._reclaim_vram(guider.model_patcher, tokens=tokens)
+        else:
+            self._reclaim_vram(guider.model_patcher, latent["samples"])
 
         samples = guider.sample(
             noise_obj.generate_noise(latent),
@@ -1332,6 +1420,31 @@ class MasterEngine:
             pos_p1 = self._bridge(_safe_get_output(out_p1, 0, "positive"), "pass 1")
             latent_p1 = _safe_get_output(out_p1, 1, "latent")
 
+        # Negative branch of the undistilled modes. It is the same encode as the positive (same reference pictures / videos /
+        # audio, same size) with the negative text as the prompt, so both branches have the same packed layout (H3's reference
+        # latents ride in the sequence, and a batched CFG forward needs equal lengths) and CFG amplifies only the text
+        # difference, not the references. Not bridged: the semantic bridge is tuned to a real prompt.
+        neg_p1 = None
+        if not cached and self.cfg_active:
+            out_neg = MiniMaxH3ReferenceToVideo.execute(
+                clip=self.clip,
+                vae=self.vae,
+                audio_vae=self.audio_vae,
+                prompt=self.negative_prompt,
+                width=w1,
+                height=h1,
+                length=frame_count,
+                ref_image_size="match",
+                ref_images=ref_images,
+                ref_videos=ref_videos or None,
+                ref_video_audios=ref_video_audios or None,
+                ref_audios=ref_audios or None,
+            )
+            neg_p1 = _safe_get_output(out_neg, 0, "positive")
+            del out_neg
+            _LOG.info("Clip %d: CFG %g with %s negative prompt (same references, %dx%d)", clip_index + 1, self.pass1_cfg,
+                      "a" if self.negative_prompt.strip() else "an empty", w1, h1)
+
         # If extending (clip_index > 0) and previous latent available: attach motion context
         self.last_trim_frames = 0
         self.last_draft = None
@@ -1344,6 +1457,15 @@ class MasterEngine:
                 str(context_length),
                 int(audio_context_length),
             )
+            if neg_p1 is not None:
+                # Same continuation guides on the negative so the two branches keep the same layout.
+                neg_p1 = self.motion_ram.apply(
+                    neg_p1,
+                    latent_p1,
+                    previous_draft,
+                    str(context_length),
+                    int(audio_context_length),
+                )[0]
 
         # Pass 2 conditioning is encoded NOW, while the text encoder is still
         # resident, instead of between the passes. It only depends on the
@@ -1393,6 +1515,9 @@ class MasterEngine:
             # Sample Pass 1 with the pass-1 sigmas
             if self.handoff_mode:
                 sampled_p1 = self._sample_handoff(model, sigmas_p1, pos_p1, latent_p1, seed)
+            elif self.cfg_handoff_mode:
+                sampled_p1 = self._sample_cfg_handoff(self.initialize_cfg_model(), model, sigmas_p1, pos_p1, neg_p1,
+                                                      latent_p1, seed)
             else:
                 sampled_p1 = self._sample_euler(
                     model=model,
@@ -1401,6 +1526,8 @@ class MasterEngine:
                     sigmas=sigmas_p1,
                     seed=seed,
                     ff_chunk=not self.flash_mode,
+                    cfg=self.pass1_cfg if self.cfg_mode else 1.0,
+                    negative=neg_p1,
                 )
             if (self.flash_mode or self.handoff_mode) and pass2_enabled:
                 self._unload_flash()
