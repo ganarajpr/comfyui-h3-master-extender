@@ -160,3 +160,21 @@ export const HANDOFF_STEP_DEFAULT = HANDOFF_STEP_OPTIONS[2];
 export function handoffStepValue(value) {
     return HANDOFF_STEP_OPTIONS.includes(value) ? value : HANDOFF_STEP_DEFAULT;
 }
+
+// pass1_cfg, cfg_steps, negative_prompt and cfg_handoff_steps are appended after handoff_step: a workflow saved before them carries
+// master_ui's "" (or nothing) in those slots. A non-number falls back to the default; the text reads an empty value as empty.
+export const PASS1_CFG_DEFAULT = 4.5;
+export const CFG_STEPS_DEFAULT = 24;
+export const CFG_HANDOFF_STEPS_DEFAULT = 8;
+export function pass1CfgValue(value) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 1 ? value : PASS1_CFG_DEFAULT;
+}
+export function cfgStepsValue(value) {
+    return Number.isInteger(value) && value >= 2 ? value : CFG_STEPS_DEFAULT;
+}
+export function cfgHandoffStepsValue(value) {
+    return Number.isInteger(value) && value >= 1 ? value : CFG_HANDOFF_STEPS_DEFAULT;
+}
+export function negativePromptValue(value) {
+    return typeof value === "string" ? value : "";
+}

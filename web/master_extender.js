@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue } from "./widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -202,6 +202,12 @@ const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
 // Pika \u2192 Flash hand-off: Pika (the turbo widgets) runs the first handoff_step steps, Flash (its widgets) the rest.
 const HANDOFF_MODE = "Pika \u2192 Flash hand-off";
 const isHandoffMode = (value) => String(value ?? "") === HANDOFF_MODE;
+// Undistilled pass 1 with real CFG: the base model, no turbo LoRA (Base + CFG), or CFG for the first cfg_handoff_steps then Pika (CFG \u2192 Pika hand-off).
+const CFG_MODE = "Base + CFG (undistilled)";
+const CFG_HANDOFF_MODE = "CFG \u2192 Pika hand-off";
+const isCfgMode = (value) => String(value ?? "") === CFG_MODE;
+const isCfgHandoffMode = (value) => String(value ?? "") === CFG_HANDOFF_MODE;
+const CFG_WIDGETS = ["pass1_cfg", "cfg_steps", "negative_prompt"];
 const SLA_ONLY_WIDGETS = ["sla_sparsity", "pass2_sla_sparsity"];
 // Widgets appended after master_ui-less workflows were saved: a missing/invalid value is put back to the default.
 const AUDIO_REFINE_WIDGETS = ["audio_refine_steps", "audio_refine_denoise", "audio_refine_cache"];
@@ -312,6 +318,14 @@ function repairDualWidgets(node) {
     if (flashLoraStrength) flashLoraStrength.value = flashLoraStrengthValue(flashLoraStrength.value);
     const handoffStep = node.widgets?.find(x => x.name === "handoff_step");
     if (handoffStep) handoffStep.value = handoffStepValue(handoffStep.value);
+    const cfgScale = node.widgets?.find(x => x.name === "pass1_cfg");
+    if (cfgScale) cfgScale.value = pass1CfgValue(cfgScale.value);
+    const cfgSteps = node.widgets?.find(x => x.name === "cfg_steps");
+    if (cfgSteps) cfgSteps.value = cfgStepsValue(cfgSteps.value);
+    const negative = node.widgets?.find(x => x.name === "negative_prompt");
+    if (negative) negative.value = negativePromptValue(negative.value);
+    const cfgHandoff = node.widgets?.find(x => x.name === "cfg_handoff_steps");
+    if (cfgHandoff) cfgHandoff.value = cfgHandoffStepsValue(cfgHandoff.value);
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -340,12 +354,16 @@ function setupModeWidgets(node) {
     const apply = () => {
         const mode = String(accel?.value ?? "").toLowerCase();
         const handoff = isHandoffMode(accel?.value);
-        const turbo = mode.startsWith("turbo") || handoff;
+        const cfgOnly = isCfgMode(accel?.value);
+        const cfgHandoff = isCfgHandoffMode(accel?.value);
+        const turbo = mode.startsWith("turbo") || handoff || cfgHandoff;
         const flash = isFlashMode(accel?.value) || handoff;
         const slaOn = sla ? !!sla.value : false;
         TURBO_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
         setWidgetVisible(byName("handoff_step"), handoff);
+        CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
+        setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
         TURBO_STEPS_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         SLA_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), slaOn));
@@ -802,6 +820,8 @@ app.registerExtension({
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
             const isHandoff = () => isHandoffMode(getW("accel_mode", ""));
             const isFlash = () => isFlashMode(getW("accel_mode", ""));
+            const isCfg = () => isCfgMode(getW("accel_mode", ""));
+            const isCfgHandoff = () => isCfgHandoffMode(getW("accel_mode", ""));
 
             function bindSelect(name, opts = {}) {
                 const w = W(name);
@@ -849,6 +869,8 @@ app.registerExtension({
                 const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
+                if (isCfg()) return `Base + CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} · ${getW("cfg_steps", 24)} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
+                if (isCfgHandoff()) return `CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} \u2192 Pika @${getW("cfg_handoff_steps", 8)}/${getW("cfg_steps", 24)} · ${shortModelName(getW("turbo_lora"))} · ${steps} steps${p2note}${bridgeNote}`;
                 if (isHandoff()) return `Pika \u2192 Flash hand-off @${parseInt(getW("handoff_step", 3), 10) || 3} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
                 if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
@@ -1012,11 +1034,28 @@ app.registerExtension({
                 const accelW = W("accel_mode");
                 const accelSel = uiSelect(comboValues(accelW), accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
-                    setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) ? "6" : "8", { rerender: false });
+                    setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) || isCfgMode(v) || isCfgHandoffMode(v) ? "6" : "8", { rerender: false });
                     renderUI();
                 });
                 wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." }));
-                if (isHandoff()) {
+                if (isCfg() || isCfgHandoff()) {
+                    wrap.appendChild(uiRow("cfg scale", bindNumber("pass1_cfg"),
+                        { hint: "Guidance of the undistilled pass 1. 1.0 = no guidance (plain positive-only path). Above 1 each CFG step also runs the negative branch, about twice the step cost." }));
+                    wrap.appendChild(uiRow("cfg steps", bindNumber("cfg_steps"),
+                        { hint: "Steps of the undistilled schedule (sampler / scheduler below, no turbo LoRA)." }));
+                    if (isCfgHandoff()) {
+                        wrap.appendChild(uiRow("cfg \u2192 pika at", bindNumber("cfg_handoff_steps"),
+                            { hint: "CFG runs this many of the cfg steps, then Pika finishes from that noise level on its own grid. Clamped to cfg steps - 1." }));
+                        wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName }),
+                            { hint: "The Pika LoRA that finishes pass 1 after the CFG segment." }));
+                    }
+                    wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe"), { hint: "Turbo schedule length: Pika's step count in the hand-off, and the base of pass 2's refine tail." }));
+                    wrap.appendChild(uiRow("sampler", bindSelect("turbo_sampler"), { indent: true }));
+                    wrap.appendChild(uiRow("scheduler", bindSelect("turbo_scheduler"), { indent: true }));
+                    wrap.appendChild(uiRow("negative prompt", uiTextarea(getW("negative_prompt", ""), (v) => setW("negative_prompt", v, { rerender: false }), { rows: 2, placeholder: "blurry, flat lighting, extra fingers (plain things to avoid, not 'no X'). Used only with cfg scale above 1." }),
+                        { hint: "Encoded with the same references and motion context as the prompt, so CFG amplifies only the text difference." }));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD), at CFG 1."));
+                } else if (isHandoff()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName }),
                         { hint: "The Pika LoRA: runs pass-1 steps 1..N (composition, pose, anatomy)." }));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
