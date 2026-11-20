@@ -1067,7 +1067,9 @@ app.registerExtension({
                 return `${att} · ${sla} · ${chunk}${getW("smart_offload", true) ? "" : " · offload off"}${getW("async_decode", "off") !== "off" ? ` · async ${getW("async_decode")}` : ""}`;
             }
             function continuitySummary() {
-                return `motion ${getW("context_length", "22")} f · audio ${getW("audio_context_length", 0)} f · identity ${getW("identity_continuity", true) ? "on" : "off"}`;
+                const memory = W("chain_memory") ? `memory ${getW("chain_memory", "off")}` : "";
+                if (!expert()) return memory;
+                return `motion ${getW("context_length", "22")} f · audio ${getW("audio_context_length", 0)} f · identity ${getW("identity_continuity", true) ? "on" : "off"}` + (memory ? ` · ${memory}` : "");
             }
 
             function rewriterSummary() {
@@ -1360,6 +1362,10 @@ app.registerExtension({
             }
 
             function buildContinuity(wrap) {
+                if (!expert()) {
+                    if (W("chain_memory")) wrap.appendChild(uiRow("chain memory", bindSelect("chain_memory"), { hint: "Carries positions, contact, clothing and marks across a cut-away between chained clips. picture + context by default; off turns it off." }));
+                    return;
+                }
                 wrap.appendChild(uiRow("motion context frames", bindSelect("context_length"), { hint: "Video frames from the previous clip fed into the next one." }));
                 wrap.appendChild(uiRow("audio context frames", bindNumber("audio_context_length")));
                 wrap.appendChild(uiRow("identity continuity", bindToggle("identity_continuity"), { hint: "Use an empty picture slot for the previous clip's last frame." }));
@@ -1817,7 +1823,8 @@ app.registerExtension({
 
                 // 3. Continuity (expert only) + Performance sit above the clips, so the
                 // clip cards are the last thing before the run bar.
-                if (expert()) container.appendChild(section("continuity", "Continuity", continuitySummary, buildContinuity));
+                // Continuity shows in Simple mode too, but then holds only the chain memory row (the rest stays Expert-only).
+                if (expert() || W("chain_memory")) container.appendChild(section("continuity", "Continuity", continuitySummary, buildContinuity));
                 container.appendChild(section("performance", "Performance", performanceSummary, buildPerformance));
                 container.appendChild(section("rewriter", "Prompt Rewriter", rewriterSummary, buildRewriter));
 
