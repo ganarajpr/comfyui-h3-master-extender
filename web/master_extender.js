@@ -54,6 +54,81 @@ async function copyText(text) {
     area.remove();
 }
 
+// Copy all clips / Paste clips: one Extender's whole clip list moves to another in one go.
+// Copy all puts the list on the clipboard; Paste clips takes it from a text box you paste into (askForClipsText).
+const CLIPS_CLIPBOARD_FORMAT = "minimax-h3-master-clips";
+
+function packClips(clips) {
+    return JSON.stringify({ format: CLIPS_CLIPBOARD_FORMAT, version: 1, copied_at: new Date().toISOString(), clips }, null, 2);
+}
+
+// Accepts our envelope, a bare clips array (a clips_json value), or an object with a clips array. Returns null otherwise.
+function unpackClips(text) {
+    if (typeof text !== "string" || !text.trim()) return null;
+    // Tolerate a BOM and a ```json fence around text copied from a chat or an editor.
+    text = text.replace(/^﻿/, "").trim().replace(/^```[a-zA-Z]*\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+    let data;
+    try { data = JSON.parse(text); } catch (e) { return null; }
+    const clips = Array.isArray(data) ? data : (data && Array.isArray(data.clips) ? data.clips : null);
+    if (!clips || !clips.length || !clips.every((c) => c && typeof c === "object" && !Array.isArray(c))) return null;
+    return clips;
+}
+
+// Paste clips opens its own text box and reads ONLY what is pasted into it. It never reads the system clipboard
+// (needs https or localhost, and a permission) or localStorage (that held a stale list from this browser's last
+// Copy all and got pasted instead of text copied on another machine, e.g. on the Mac over Parsec).
+// Resolves to the clips, or null when cancelled.
+function askForClipsText() {
+    return new Promise((resolve) => {
+        const overlay = document.createElement("div");
+        overlay.style.cssText = "position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center;";
+        const box = document.createElement("div");
+        box.style.cssText = "background: #1e1e2a; border: 1px solid #3c5480; border-radius: 8px; padding: 14px; width: min(760px, 92vw); display: flex; flex-direction: column; gap: 8px; font: 12px sans-serif; color: #ddd;";
+        const title = document.createElement("div");
+        title.textContent = "Paste clips: paste the clips JSON below (Ctrl+V), then Paste. Copy all output, a [ {...}, ... ] clips array, or a clips.json file's contents.";
+        const area = document.createElement("textarea");
+        area.spellcheck = false;
+        area.style.cssText = "width: 100%; height: 50vh; box-sizing: border-box; background: #111118; color: #ddd; border: 1px solid #444; border-radius: 5px; font: 11px monospace; padding: 8px; resize: vertical;";
+        const status = document.createElement("div");
+        status.style.cssText = "min-height: 14px; color: #8fb0e6;";
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+        const btnStyle = "padding: 4px 14px; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px;";
+        const cancel = document.createElement("button");
+        cancel.textContent = "Cancel";
+        cancel.style.cssText = btnStyle + "background: transparent; border: 1px solid #555; color: #ccc;";
+        const ok = document.createElement("button");
+        ok.textContent = "Paste";
+        ok.disabled = true;
+        ok.style.cssText = btnStyle + "background: #3c5480; border: 1px solid #8fb0e6; color: #fff;";
+        row.append(cancel, ok);
+        box.append(title, area, status, row);
+        overlay.appendChild(box);
+        // Keep ComfyUI's canvas shortcuts (Ctrl+V pastes nodes, Delete removes them) out of the text box.
+        for (const type of ["keydown", "keyup", "keypress", "paste", "copy", "cut"]) {
+            overlay.addEventListener(type, (e) => e.stopPropagation());
+        }
+        let clips = null;
+        const check = () => {
+            clips = unpackClips(area.value);
+            ok.disabled = !clips;
+            status.style.color = clips ? "#8fb0e6" : "#f87171";
+            status.textContent = !area.value.trim() ? "" : clips ? `${clips.length} clip${clips.length === 1 ? "" : "s"} ready to paste` : "Not a clip list yet (expected the JSON from Copy all or a clips array)";
+        };
+        area.addEventListener("input", check);
+        const close = (result) => { overlay.remove(); resolve(result); };
+        cancel.onclick = () => close(null);
+        ok.onclick = () => { if (clips) close(clips); };
+        overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(null); });
+        area.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") close(null);
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && clips) close(clips);
+        });
+        document.body.appendChild(overlay);
+        area.focus();
+    });
+}
+
 function escapeHtml(text) {
     return text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -754,6 +829,49 @@ app.registerExtension({
                 video.onmouseenter = () => video.play().catch(() => {});
                 video.onmouseleave = () => video.pause();
                 return video;
+            }
+
+            // Paste a copied clip list. Pasted clips get fresh ids and are un-validated: char refs and engine
+            // settings are not in a clip's cache fingerprint, so a validated clip pasted into a workflow with a
+            // different recipe would silently hand back the source workflow's render.
+            function pasteClips(incoming) {
+                const isBlank = (c) => !String(c.prompt || "").trim() && !String(c.prompt_raw || "").trim();
+                const onlyBlank = clipsState.every(isBlank);
+                let replace = onlyBlank;
+                if (!onlyBlank) {
+                    const answer = prompt(
+                        `Paste ${incoming.length} clip${incoming.length === 1 ? "" : "s"}.\n\n` +
+                        `Type A to APPEND after the ${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} here, ` +
+                        `or R to REPLACE them.`, "A");
+                    if (answer == null) return;
+                    const choice = answer.trim().toUpperCase()[0];
+                    if (choice !== "A" && choice !== "R") return;
+                    replace = choice === "R";
+                }
+                const copies = JSON.parse(JSON.stringify(incoming)).map((c) => {
+                    delete c.id;
+                    c.validated = false;
+                    if (!Number(c.duration)) c.duration = DUR_DEFAULT;
+                    if (!Array.isArray(c.loras)) c.loras = [];
+                    if (!c.seed_mode) c.seed_mode = "randomize";
+                    if (typeof c.seed !== "number") c.seed = Math.floor(Math.random() * 1000000000);
+                    return c;
+                });
+                if (replace) {
+                    closePromptPanel();
+                    liveRewrite.clear();
+                    expandedValidated.clear();
+                    cacheStates = [];
+                    cacheVideos = [];
+                    clipsState.length = 0;
+                }
+                copies.forEach((c) => {
+                    c.id = nextClipId(clipsState);
+                    if (!c.title) c.title = `Clip ${clipsState.length + 1}`;
+                    clipsState.push(c);
+                });
+                saveState();
+                renderUI();
             }
 
             function copyButton(clip) {
@@ -1773,7 +1891,29 @@ app.registerExtension({
                     clearRewritesBtn.title = "Drop the rewritten prompt of every clip and put its raw prompt back, so the next run rewrites them all. Raw prompts are not touched.";
                     clearRewritesBtn.style.cssText = bulkStyle.replace("#2e6a45", "#6b5416").replace("#4ade80", "#fcd34d");
                     clearRewritesBtn.onclick = (e) => { e.stopPropagation(); clearAllRewrites(); };
-                    actions.append(clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
+                    // Copy every clip to the clipboard; paste them into another Extender (append or replace).
+                    const copyAllBtn = document.createElement("button");
+                    copyAllBtn.textContent = "⧉ Copy all";
+                    copyAllBtn.title = "Copy every clip (prompts, raw + rewritten text, durations, seeds, LoRAs) so another Master Extender can paste them with Paste clips";
+                    copyAllBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3f3f58").replace("#4ade80", "#ddd");
+                    copyAllBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        const text = packClips(clipsState);
+                        let ok = false;
+                        try { await copyText(text); ok = true; } catch (error) { /* clipboard blocked */ }
+                        copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy failed";
+                        setTimeout(() => { copyAllBtn.textContent = "⧉ Copy all"; }, 1500);
+                    };
+                    const pasteBtn = document.createElement("button");
+                    pasteBtn.textContent = "Paste clips";
+                    pasteBtn.title = "Paste the clips copied with Copy all (from any Master Extender, this workflow or another). Asks whether to append or replace.";
+                    pasteBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3c5480").replace("#4ade80", "#8fb0e6");
+                    pasteBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        const incoming = await askForClipsText();
+                        if (incoming) pasteClips(incoming);
+                    };
+                    actions.append(copyAllBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
                 container.appendChild(projectControls.references());

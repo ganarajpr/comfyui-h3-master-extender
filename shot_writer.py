@@ -691,9 +691,8 @@ def import_clips(text) -> list:
 
 # --------------------------------------------------------------------------- fill mode: write the Extender's empty clips from the clips around them
 
-CONTINUE_ENDING = ("The last empty clip is the last clip of the film, so it ends the story: end on the high point and let that same moment start the next danger. "
-                   "No wind-down. The open question is about the main characters, and it is a concrete fact (someone has seen, decided or started something), shown through an "
-                   "object planted earlier. It presses on a secret without answering it. This is the only clip that may end open.")
+CONTINUE_ENDING = ("Do not end the story, do not wind it down and do not set up a cliffhanger, even when the last empty clip is the last clip of the list: the founder adds a few "
+                   "clips at a time and decides himself where it goes and when it ends. The last empty clip ends like a middle clip, mid-scene on a held moment.")
 FILL_FLAG = "fill_empty"    # set by the panel on the empty clips for the one queued run that fills them; never saved
 FILL_CONTEXT_CHARS = 1200   # a context clip is shown by its first 1,200 characters (its raw ask: a rewritten Ref2VA prompt is long and is never sent)
 FILL_SHOTS_CHARS = 700      # ... and by 700 in every shots call's "story so far" block
@@ -1047,8 +1046,6 @@ class ShotEngine:
         merged = None
         if self.fill:
             merged = self._plan_fill()
-            if merged["minor"]:
-                raise MinorContentError("the brief puts a minor in a sexual context; nothing was written", work_dir=str(self.work))
             parts = []
         for index, (first, last) in enumerate(parts):
             out = self._plan_part(first, last, total, merged, index + 1, len(parts))
@@ -1122,7 +1119,7 @@ class ShotEngine:
 
     def _plan_fill(self) -> dict:
         """The plan of a fill job: one call (``prompts/shot_writer_continue_plan.md``) that reads the story so far (the raw prompts of the context clips) and plans only the
-        empty clips. The ending belongs to the last empty clip only when it is the last clip of the list."""
+        empty clips. It only continues the scene in progress: never an ending, a twist or a new element (founder 2026-11-05)."""
         fill = self.fill
         targets = {t["clip"]: t for t in fill["targets"]}
         context = {c["clip"]: c for c in fill["context"]}
@@ -1138,8 +1135,7 @@ class ShotEngine:
         first = fill["targets"][0]
         values = dict(self._lang(), story="\n\n".join(lines), empty=", ".join(str(t["clip"]) for t in fill["targets"]), count=len(fill["targets"]),
                       max_cast=sw.max_cast(fill["total"]), first_number=first["clip"], first_seconds=first["seconds"],
-                      ending=(CONTINUE_ENDING if top == max(targets) and top == fill["total"] else
-                              "More of the story follows these clips: do not end it, and do not wind it down. Each scene you write still ends on a conclusion, the last clip included."),
+                      ending=CONTINUE_ENDING,
                       follows=(f"Clip {max(context)} follows the empty clips: the last empty clip must lead straight into it (it opens from where your clip ends)." if max(context) > max(targets) else ""))
         values["pictures_note"] = pictures_note(self.pictures or ([{"label": x} for x in self.labels]), self.sees)
         messages = [message(fill_prompt(**values), self.pictures)]
@@ -1203,7 +1199,7 @@ class ShotEngine:
                 return "is already written by the founder and is fixed. " + (f"Its text: {text}" if after else f"Its text (the start may be cut): {text}" + (f" The state it ends in:\n{c['end_state']}" if c["end_state"] else ""))
             return "has no text yet."
         previous = f"The clip before it ({number - 1}) {describe(number - 1, False)}" if number > 1 else "Nothing comes before it: this clip opens the film."
-        following = f"The clip after it ({number + 1}) {describe(number + 1, True)}" if number < self.film_total else "Nothing comes after it: this clip ends the film."
+        following = f"The clip after it ({number + 1}) {describe(number + 1, True)}" if number < self.film_total else "Nothing is written after it yet: the founder will add more clips, so it ends mid-scene, never as an ending."
         return previous, following
 
     def _write_clip(self, plan: dict, index: int, complaints=(), before: str = "", kind: str = "shots") -> dict:

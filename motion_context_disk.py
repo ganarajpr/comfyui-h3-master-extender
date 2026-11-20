@@ -344,6 +344,7 @@ class _FinalDecodeNativeProgress:
 
 CACHE_TYPE = "H3_MOTION_DISK_CACHE"
 _LOG = logging.getLogger("minimax_h3_tail_from_latent.motion_context_disk")
+log = _LOG  # the 2K temporal-window decode path logs through log
 
 _NODE_DIR = Path(__file__).resolve().parent
 _LEGACY_CACHE_ROOT = _NODE_DIR / "cache"
@@ -1230,7 +1231,7 @@ def decode_video_latent(vae, latent):
             tile_t = -(-tile_t // 2)
         log.info("H3 decode: %.1f GB needed vs %.1f GB free -> temporal tiles of %d latent frames",
                  needed / 1024 ** 3, free / 1024 ** 3, tile_t)
-        out = vae.decode_tiled_3d(latent, tile_t=tile_t, tile_x=w, tile_y=h, overlap=(1, 0, 0))
+        out = vae.decode_tiled_3d(latent, tile_t=tile_t, tile_x=w, tile_y=h, overlap=(int(os.environ.get("H3_DECODE_TILE_OVERLAP", "4")), 0, 0))  # 1-frame overlap left black/noise seams at 1440p (CHOODI ep5 c18, 2026-10-29)
         return out.to(vae.output_device).movedim(1, -1)
 
     return vae.decode(latent)
