@@ -128,6 +128,13 @@ export function tstOffForSavedValues(names, values) {
     return Array.isArray(values) && idx >= 0 && values.length <= idx;
 }
 
+// chain_memory (after pass1_steps) defaults to "picture + context" on a NEW node. A workflow saved before it existed has no value in
+// its slot (or master_ui's ""); it was rendered without chain memory, so it loads with it off and its cached clips stay valid.
+export function chainMemoryOffForSavedValues(names, values) {
+    const idx = names.indexOf("chain_memory");
+    return Array.isArray(values) && idx >= 0 && values.length <= idx;
+}
+
 // The eight legacy widgets are appended after tst_tau: a workflow saved since 2026-11-17 has master_ui's "" (or nothing) in
 // their slots, which means the defaults. Same as the old repair, so a Turbo / Flash workflow carries the default values.
 export const DUAL_DEFAULTS = { dual_sampling: false, dual_split_step: 2, pass1_early_stop: false, pass1_steps: 0 };
