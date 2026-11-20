@@ -1556,6 +1556,65 @@ class MasterEngine:
 
         return upscaled
 
+    def _preview_decoder(self):
+        """The tiny H3 preview decoder (taeh3) when this ComfyUI can load it, else None (cached after the first try)."""
+        if getattr(self, "_preview_vae_tried", False):
+            return getattr(self, "_preview_vae", None)
+        self._preview_vae_tried = True
+        self._preview_vae = None
+        try:
+            import comfy.sd
+            import comfy.utils
+            import folder_paths
+
+            for folder in ("vae_approx", "vae"):
+                for name in folder_paths.get_filename_list(folder):
+                    if "taeh3" in name.lower():
+                        path = folder_paths.get_full_path(folder, name)
+                        self._preview_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(path))
+                        _LOG.info("Chain memory: preview decoder %s/%s loaded", folder, name)
+                        return self._preview_vae
+        except Exception as exc:  # noqa: BLE001 -- no preview decoder means the normal VAE is used
+            _LOG.info("Chain memory: no preview decoder (%s); the pass-1 draft is decoded with the video VAE", exc)
+        return None
+
+    @torch.no_grad()
+    def _start_memory_pick(self, sampled_p1, trim_frames, clip_index):
+        """Decode the pass-1 draft before pass 2 and start the CPU pick of the chain-memory frame on it.
+
+        Returns an EarlyPick, or None when anything fails (the final decode then picks the frame as before).
+        """
+        import time as _time
+
+        started = _time.time()
+        try:
+            video_p1 = _streams_from_latent(sampled_p1, "samples")[0]
+            expected = sum((1, 4, 4, 4, 4)[k % 5] for k in range(int(video_p1.shape[2])))
+            frames = None
+            decoder = "video VAE"
+            tiny = self._preview_decoder()
+            if tiny is not None:
+                try:
+                    out = tiny.decode(video_p1)
+                    if out.ndim == 5:
+                        out = out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
+                    if int(out.shape[0]) == expected:
+                        frames, decoder = out, "taeh3"
+                    else:
+                        _LOG.info("Chain memory: preview decoder gave %d frames, expected %d; using the video VAE", int(out.shape[0]), expected)
+                except Exception as exc:  # noqa: BLE001
+                    _LOG.info("Chain memory: preview decode failed (%s); using the video VAE", exc)
+            if frames is None:
+                out = self.vae.decode(video_p1)
+                if out.ndim == 5:
+                    out = out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
+                frames = out
+            frames = frames[int(trim_frames):].to(device="cpu", dtype=torch.float32)
+            return chain_memory.EarlyPick(decoder, round(_time.time() - started, 2)).start(frames)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("Chain memory: clip %d early pick not started (%s); the final decode will pick the frame", clip_index + 1, exc)
+            return None
+
     def render_clip(
         self,
         clip_index: int,
@@ -1715,6 +1774,7 @@ class MasterEngine:
         # If extending (clip_index > 0) and previous latent available: attach motion context
         self.last_trim_frames = 0
         self.last_draft = None
+        self.memory_pick = None
         if not cached and clip_index > 0 and previous_draft is not None:
             _LOG.info(f"Clip {clip_index + 1}: Applying Pass 1 motion context ({context_length}f video)")
             pos_p1, trim_p1, _, _, _ = self.motion_ram.apply(
@@ -1817,6 +1877,9 @@ class MasterEngine:
         if not pass2_enabled:
             self.last_draft = None if cached else sampled_p1
             return sampled_p1, None
+
+        if getattr(self, "chain_memory_pick", False):
+            self.memory_pick = self._start_memory_pick(sampled_p1, self.last_trim_frames, clip_index)
 
         # =====================================================================
         # LATENT 3D UPSCALE & ALIGNMENT

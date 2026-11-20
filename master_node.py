@@ -1287,6 +1287,8 @@ class MiniMaxH3MasterExtender:
             elif chain_memory_on and i > 0:
                 _LOG.info("Clip %d: chain memory %s", i + 1, cm_mode)
 
+            engine.chain_memory_pick = chain_memory_on and i < len(clips) - 1
+            motion_context_disk.EARLY_MEMORY_PICK = None
             # Render clip through Master Engine
             sampled_latent, _ = engine.render_clip(
                 clip_index=i,
@@ -1313,6 +1315,8 @@ class MiniMaxH3MasterExtender:
                 p1_text_size=_nominal_final_size(w1, h1),
             )
 
+            motion_context_disk.EARLY_MEMORY_PICK = getattr(engine, "memory_pick", None) if engine.chain_memory_pick else None
+            engine.memory_pick = None
             # Save clip to disk cache (the manifest is shared with a running
             # background decode, so that must be finished first).
             _finish_background()
@@ -1388,6 +1392,7 @@ class MiniMaxH3MasterExtender:
                     memory_frame_tensor = _load_memory_frame(data_path, state["segments"][i])
                     memory_tail_frames = _load_memory_tail(state["segments"][i]) or 0
                 progress_hook("done", f"Clip {i + 1} completed!", 1.0)
+            motion_context_disk.EARLY_MEMORY_PICK = None
             rendered_count += 1
 
             # In clip_by_clip mode: stop after rendering the first pending clip so user can validate!

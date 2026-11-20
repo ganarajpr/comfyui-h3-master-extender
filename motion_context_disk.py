@@ -1190,6 +1190,8 @@ def _build_pair_video(data_path, prev_desc, curr_desc):
 DECODE_ALLOW_RECLAIM = True
 # Set by the Master node per render: also cache, per clip, the last frame that shows the people (chain memory).
 CHAIN_MEMORY = False
+# Set by the Master node per clip: the EarlyPick made on the pass-1 draft while pass 2 sampled (or None).
+EARLY_MEMORY_PICK = None
 _DECODE_RECLAIM_MARGIN = 2 * 1024 ** 3
 
 
@@ -3769,10 +3771,23 @@ def _load_memory_tail(desc):
     return int(value) if value is not None else None
 
 
-def _cache_memory_frame(data_path, manifest_path, manifest, index, video):
+def _cache_memory_frame(data_path, manifest_path, manifest, index, video, seam_shift=0):
     from . import chain_memory
 
-    frame, info = chain_memory.select_memory_frame(video)
+    early = EARLY_MEMORY_PICK
+    early_info = early.result() if early is not None else None
+    if early_info is not None:
+        pick_index, tail = chain_memory.map_early_pick(early_info, seam_shift, int(video.shape[0]))
+        frame = chain_memory._shrink(video[pick_index:pick_index + 1].to(device="cpu"))
+        info = {"tail_after_shot": tail}
+        log.info("Chain memory clip %d: early pick on, decoder %s (draft decode %.2f s), pick %.2f s, draft frame %d -> final frame %d of %d, "
+                 "tail %d frames, seam shift %d; the final step used it (no full-video pick)",
+                 int(index) + 1, early.decoder, early.decode_seconds, early_info.get("seconds", 0.0), early_info["index"], pick_index,
+                 int(video.shape[0]), tail, int(seam_shift))
+    else:
+        frame, info = chain_memory.select_memory_frame(video)
+        log.info("Chain memory clip %d: early pick %s; the final step picked on the full clip (%.2f s), frame %d, tail %d frames",
+                 int(index) + 1, "failed or unfinished" if early is not None else "off", info.get("seconds", 0.0), info["index"], info["tail_after_shot"])
     path = _memory_frame_path(data_path, index)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
@@ -3872,7 +3887,7 @@ def cache_full_batch_ref2va_segment(
             )
             if CHAIN_MEMORY:
                 manifest = _cache_memory_frame(
-                    data_path, manifest_path, manifest, idx, rendered_video
+                    data_path, manifest_path, manifest, idx, rendered_video, seam_shift
                 )
             rendered_mp4 = None
             video_profile = None
