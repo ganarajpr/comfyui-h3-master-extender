@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -435,6 +435,9 @@ function repairTstForOldWorkflow(node, info) {
     const names = (node.widgets || []).map(w => w.name);
     const tst = node.widgets?.find(x => x.name === "tst_enabled");
     if (tst && tstOffForSavedValues(names, info?.widgets_values)) tst.value = false;
+    // chain_memory defaults on for a new node; a workflow saved before it existed loads with it off (see widget_migration.js).
+    const chainMemory = node.widgets?.find(x => x.name === "chain_memory");
+    if (chainMemory && chainMemoryOffForSavedValues(names, info?.widgets_values)) chainMemory.value = "off";
 }
 
 function repairHyperflowWidgets(node, defaults) {
@@ -1360,7 +1363,7 @@ app.registerExtension({
                 wrap.appendChild(uiRow("motion context frames", bindSelect("context_length"), { hint: "Video frames from the previous clip fed into the next one." }));
                 wrap.appendChild(uiRow("audio context frames", bindNumber("audio_context_length")));
                 wrap.appendChild(uiRow("identity continuity", bindToggle("identity_continuity"), { hint: "Use an empty picture slot for the previous clip's last frame." }));
-                if (W("chain_memory")) wrap.appendChild(uiRow("chain memory", bindSelect("chain_memory"), { hint: "picture: pass the previous clip's last frame that shows the people as a labelled weak reference. context: take the motion context from the latest shot that shows the people, skipping a trailing insert. Carries positions, contact, clothing and marks across a cut-away. Off by default." }));
+                if (W("chain_memory")) wrap.appendChild(uiRow("chain memory", bindSelect("chain_memory"), { hint: "picture: pass the previous clip's last frame that shows the people as a labelled weak reference. context: take the motion context from the latest shot that shows the people, skipping a trailing insert. Carries positions, contact, clothing and marks across a cut-away. picture + context by default; off turns it off." }));
             }
 
             function buildPerformance(wrap) {

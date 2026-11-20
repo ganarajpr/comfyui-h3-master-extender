@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -333,3 +333,12 @@ assert.equal(hyperflowWidgetValue("hyperflow_strength", 0.5, "d"), 0.5);
 assert.equal(hyperflowWidgetValue("hyperflow_lora_mode", "", "d"), "bypass");
 assert.equal(hyperflowWidgetValue("hyperflow_lora_mode", "merge", "d"), "merge");
 console.log("legacy HyperFlow layout migration ok");
+
+// chain_memory defaults to "picture + context" on a new node; a workflow saved before the input existed loads with it off.
+{
+    const names = ["a", "pass1_steps", "chain_memory", "time_gate_json"];
+    assert.equal(chainMemoryOffForSavedValues(names, ["x", 0]), true, "saved values stop before chain_memory: off");
+    assert.equal(chainMemoryOffForSavedValues(names, ["x", 0, "picture + context"]), false, "a saved chain_memory value is kept");
+    assert.equal(chainMemoryOffForSavedValues(names, undefined), false, "no saved values (a new node): keep the default");
+    assert.equal(chainMemoryOffForSavedValues(["a"], ["x"]), false, "a node without the input");
+}
