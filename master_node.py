@@ -1353,6 +1353,9 @@ class MiniMaxH3MasterExtender:
                 progress_hook("done", f"Clip {i + 1} sampled; decoding in background", 1.0)
             else:
                 motion_context_disk.DECODE_ALLOW_RECLAIM = True
+                # Pick the memory frame only when a later clip in this job will use it (the reuse path builds it on demand
+                # if the chain is extended later), so the last clip pays no face-detection pass.
+                motion_context_disk.CHAIN_MEMORY = chain_memory_on and i < len(clips) - 1
                 state, _ = cache_full_batch_ref2va_segment(
                     data_path, manifest_path, i, vae, audio_vae, FPS,
                     export_profile=export_profile,
