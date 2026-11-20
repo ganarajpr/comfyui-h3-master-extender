@@ -110,7 +110,7 @@ def _clip_fingerprint(previous, clip, seed, audio_refine=None, single_te=False, 
     if pass2_audio_p1:
         parts.append("pass2_audio_pass1")
     if chain_memory:
-        parts.append("chain_memory_v1")
+        parts.append("chain_memory_v1" if chain_memory is True else f"chain_memory_v1:{chain_memory}")
     blob = json.dumps(parts, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 

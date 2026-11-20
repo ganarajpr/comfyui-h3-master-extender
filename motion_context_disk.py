@@ -3763,10 +3763,16 @@ def _load_memory_frame(data_path, desc):
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
+def _load_memory_tail(desc):
+    """Frames after the chosen shot in the clip (the trailing insert), or None when not cached."""
+    value = desc.get("memory_tail_frames")
+    return int(value) if value is not None else None
+
+
 def _cache_memory_frame(data_path, manifest_path, manifest, index, video):
     from . import chain_memory
 
-    frame, _ = chain_memory.select_memory_frame(video)
+    frame, info = chain_memory.select_memory_frame(video)
     path = _memory_frame_path(data_path, index)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
@@ -3778,6 +3784,7 @@ def _cache_memory_frame(data_path, manifest_path, manifest, index, video):
     manifest = dict(manifest)
     segments = [dict(x) for x in manifest["segments"]]
     segments[index]["memory_frame_cached"] = True
+    segments[index]["memory_tail_frames"] = int(info["tail_after_shot"])
     manifest["segments"] = segments
     _write_json_atomic(manifest_path, manifest)
     return manifest

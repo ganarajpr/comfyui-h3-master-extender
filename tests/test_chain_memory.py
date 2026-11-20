@@ -139,5 +139,71 @@ class Select(unittest.TestCase):
         self.assertTrue(torch.equal(frame, video[-1:]))
 
 
+class Modes(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(cm.parse_mode(None), "off")
+        self.assertEqual(cm.parse_mode(False), "off")
+        self.assertEqual(cm.parse_mode(True), "picture")
+        self.assertEqual(cm.parse_mode(""), "off")
+        self.assertEqual(cm.parse_mode("junk"), "off")
+        self.assertEqual(cm.parse_mode(1), "off")
+        for m in cm.MODES:
+            self.assertEqual(cm.parse_mode(m), m)
+        self.assertTrue(cm.uses_context("context") and cm.uses_context("picture + context") and not cm.uses_context("picture"))
+        self.assertTrue(cm.uses_picture("picture") and cm.uses_picture("picture + context") and not cm.uses_picture("context"))
+
+
+def make_latent(t, nested=False):
+    video = torch.arange(t, dtype=torch.float32).reshape(1, 1, t, 1, 1).expand(1, 2, t, 3, 3).clone()
+    audio_t = int(round(cm._FRAME_RESCALE * cm._pixel_frames(t)))
+    audio = torch.arange(audio_t, dtype=torch.float32).reshape(1, 1, 1, audio_t).expand(1, 2, 2, audio_t).clone()
+    return {"samples": [video, audio], "other": "keep"}
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class Truncate(unittest.TestCase):
+    T = 27  # 2 mod 5, 90 frames
+
+    def check(self, drop, steps):
+        lat = make_latent(self.T)
+        out, info = cm.truncate_context_latent_info(lat, drop)
+        v, a = out["samples"]
+        self.assertEqual(int(v.shape[2]), self.T - steps)
+        self.assertEqual(int(v.shape[2]) % 5, 2)
+        self.assertEqual(int(a.shape[-1]), int(round(5 / 3 * cm._pixel_frames(self.T - steps))))
+        self.assertEqual(out["other"], "keep")
+        self.assertEqual(int(v[0, 0, -1, 0, 0]), self.T - steps - 1)
+        self.assertEqual(int(a[0, 0, 0, -1]), a.shape[-1] - 1)
+        self.assertEqual(info["dropped_steps"], steps)
+        self.assertEqual(info["dropped_frames"], 17 * (steps // 5))
+        self.assertEqual(len(lat["samples"]), 2)
+        self.assertEqual(lat["samples"][0].shape[2], self.T)
+
+    def test_drop_0_unchanged(self):
+        lat = make_latent(self.T)
+        out, info = cm.truncate_context_latent_info(lat, 0)
+        self.assertIs(out, lat)
+        self.assertFalse(info["applied"])
+
+    def test_drop_10(self):
+        self.check(10, 5)
+
+    def test_drop_17(self):
+        self.check(17, 5)
+
+    def test_drop_30(self):
+        self.check(30, 10)
+
+    def test_not_enough_frames(self):
+        lat = make_latent(self.T)
+        # T=27 is 90 frames; dropping 4 cycles (68 frames) leaves 22 < 22 + 17
+        out, info = cm.truncate_context_latent_info(lat, 68)
+        self.assertIs(out, lat)
+        self.assertFalse(info["applied"])
+        self.assertIn("would remain", info["reason"])
+        out, _ = cm.truncate_context_latent_info(lat, 34, context_length=56)
+        self.assertIs(out, lat)
+
+
 if __name__ == "__main__":
     unittest.main()

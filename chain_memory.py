@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from pathlib import Path
 
 _LOG = logging.getLogger("minimax_h3_master_extender.chain_memory")
+
+MODES = ("off", "picture", "context", "picture + context")
 
 MIN_SHOT_FRAMES = 6
 CUT_FLOOR = 0.06
@@ -30,6 +33,23 @@ SECTION_NAMES = ("subject_definitions", "summary", "retention_analysis", "detail
 _HASH_HEADER = re.compile(r"^##\s+(\S.*?)\s*$")
 _BARE_HEADER = re.compile(r"^(%s)\s*:\s*$" % "|".join(SECTION_NAMES))
 _SUBJECT = re.compile(r"<Subject\s+(\d+)>")
+
+
+def parse_mode(value):
+    """The chain_memory input as one of MODES. A missing value, a non-listed value and False are "off"; a literal True is "picture"."""
+    if value is True:
+        return "picture"
+    if isinstance(value, str) and value in MODES:
+        return value
+    return "off"
+
+
+def uses_picture(mode):
+    return mode in ("picture", "picture + context")
+
+
+def uses_context(mode):
+    return mode in ("context", "picture + context")
 
 
 def _header_at(line):
@@ -172,7 +192,7 @@ def select_memory_frame(video):
     """
     total = int(video.shape[0])
     last = total - 1
-    info = {"index": last, "shots": [], "faces": [], "fallback": True}
+    info = {"index": last, "shots": [], "faces": [], "fallback": True, "shot_end": total, "tail_after_shot": 0}
     detector = _get_detector()
     if detector is not None:
         shots = _shot_ranges(video)
@@ -183,10 +203,80 @@ def select_memory_frame(video):
             info["faces"].append({str(k): v for k, v in counts.items()})
             top = max(counts.values())
             if top > 0 and (best is None or top >= best[0]):
-                best = (top, max(i for i, c in counts.items() if c == top))
+                best = (top, max(i for i, c in counts.items() if c == top), b)
         if best is not None:
             info["index"] = best[1]
             info["fallback"] = False
+            info["shot_end"] = best[2]
+            info["tail_after_shot"] = total - best[2]
     _LOG.info("Chain memory: frame %d of %d (shots %s, faces per sampled frame %s%s)", info["index"], total, info["shots"], info["faces"],
               ", fallback to the last frame" if info["fallback"] else "")
     return video[info["index"]:info["index"] + 1].to(device="cpu").clone(), info
+
+
+# Same constants as motion_context_ram (kept here so this module imports without ComfyUI).
+_FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+_FRAME_RESCALE = 5.0 / 3.0
+_STEPS_PER_CYCLE = 5
+_FRAMES_PER_CYCLE = 17
+
+
+def _pixel_frames(latent_t):
+    return sum(_FRAME_PER_TOKEN[k % 5] for k in range(int(latent_t)))
+
+
+def truncate_context_latent_info(latent, drop_frames, context_length=22):
+    """(latent, info): ``latent`` without its trailing ``ceil(drop_frames / 17)`` cycles of 5 video latent steps.
+
+    Whole cycles keep the clip on the 17k+5 grid and the tail phase the motion-context tail needs. The audio keeps
+    round(5/3 x kept frames) steps. The original latent is returned unchanged when there is nothing to drop or the
+    result would be shorter than ``context_length`` + 17 frames; ``info["applied"]`` says which.
+    """
+    video, audio = _streams_from_latent(latent)
+    total_t = int(video.shape[2])
+    total_frames = _pixel_frames(total_t)
+    info = {"applied": False, "requested": int(drop_frames), "dropped_frames": 0, "dropped_steps": 0,
+            "context_end_frame": total_frames, "reason": ""}
+    if int(drop_frames) <= 0:
+        info["reason"] = "nothing to drop"
+        return latent, info
+    n = math.ceil(int(drop_frames) / _FRAMES_PER_CYCLE)
+    keep_t = total_t - n * _STEPS_PER_CYCLE
+    kept_frames = _pixel_frames(keep_t) if keep_t > 0 else 0
+    if keep_t < 2 or kept_frames < int(context_length) + _FRAMES_PER_CYCLE:
+        info["reason"] = f"only {kept_frames} frames would remain (need {int(context_length) + _FRAMES_PER_CYCLE})"
+        return latent, info
+    keep_audio = int(round(_FRAME_RESCALE * kept_frames))
+    new_video = video[:, :, :keep_t]
+    new_audio = audio[..., :keep_audio]
+    samples = latent["samples"]
+    if getattr(samples, "is_nested", False):
+        import comfy.nested_tensor
+
+        parts = list(samples.unbind())
+        parts[0], parts[1] = new_video, new_audio
+        new_samples = comfy.nested_tensor.NestedTensor(tuple(parts))
+    else:
+        parts = list(samples)
+        parts[0], parts[1] = new_video, new_audio
+        new_samples = type(samples)(parts)
+    out = {k: latent[k] for k in latent.keys() if k != "samples"}
+    out["samples"] = new_samples
+    info.update(applied=True, dropped_frames=total_frames - kept_frames, dropped_steps=n * _STEPS_PER_CYCLE,
+                context_end_frame=kept_frames)
+    return out, info
+
+
+def truncate_context_latent(latent, drop_frames, context_length=22):
+    return truncate_context_latent_info(latent, drop_frames, context_length)[0]
+
+
+def _streams_from_latent(latent):
+    samples = latent["samples"]
+    parts = list(samples.unbind()) if getattr(samples, "is_nested", False) else list(samples)
+    video, audio = parts[0], parts[1]
+    if video.ndim == 4:
+        video = video.unsqueeze(0)
+    if audio.ndim == 3:
+        audio = audio.unsqueeze(0)
+    return video, audio
