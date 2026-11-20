@@ -424,6 +424,9 @@ function repairDualWidgets(node, defaults) {
     if (tst && typeof tst.value !== "boolean") tst.value = false;
     const tstTau = node.widgets?.find(x => x.name === "tst_tau");
     if (tstTau && (typeof tstTau.value !== "number" || !Number.isFinite(tstTau.value))) tstTau.value = 0.2;
+    // Chain memory (after pass1_steps): a workflow saved before it carries a non-boolean here, and it renders with it OFF.
+    const chainMemory = node.widgets?.find(x => x.name === "chain_memory");
+    if (chainMemory && typeof chainMemory.value !== "boolean") chainMemory.value = false;
 }
 
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
@@ -1357,6 +1360,7 @@ app.registerExtension({
                 wrap.appendChild(uiRow("motion context frames", bindSelect("context_length"), { hint: "Video frames from the previous clip fed into the next one." }));
                 wrap.appendChild(uiRow("audio context frames", bindNumber("audio_context_length")));
                 wrap.appendChild(uiRow("identity continuity", bindToggle("identity_continuity"), { hint: "Use an empty picture slot for the previous clip's last frame." }));
+                if (W("chain_memory")) wrap.appendChild(uiRow("chain memory", bindToggle("chain_memory"), { hint: "Pass the previous clip's last frame that shows the people as a labelled weak reference, so positions, contact, clothing and marks carry across a cut-away. Off by default." }));
             }
 
             function buildPerformance(wrap) {

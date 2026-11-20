@@ -34,6 +34,7 @@ from .motion_context_ram import (
     MiniMaxH3MotionContextRAM,
     _streams_from_latent,
 )
+from . import chain_memory
 from . import x0_debug
 from . import time_gate_lora
 
@@ -1578,6 +1579,7 @@ class MasterEngine:
         cached_pass1: dict = None,
         cached_trim: int = 0,
         p1_text_size: tuple = None,
+        memory_frame: torch.Tensor = None,
     ):
         """Execute the complete 2-Stage 2-Pass Pipeline for a single clip.
 
@@ -1599,6 +1601,22 @@ class MasterEngine:
         w1, h1 = pass1_res
         w2, h2 = pass2_res
         ref_images = dict(ref_images or {})
+
+        # Chain memory: the previous clip's last frame that shows the people, one free picture slot, labelled in the prompt.
+        # Every later encode below uses this prompt (the CFG negative keeps its own text).
+        if memory_frame is not None:
+            if len(ref_images) >= 9:
+                _LOG.warning("Clip %d: chain memory skipped, all nine picture slots are in use", clip_index + 1)
+            else:
+                for index in range(9):
+                    key = f"ref_image_{index}"
+                    if key not in ref_images:
+                        ref_images[key] = memory_frame
+                        break
+                picture_number = list(ref_images).index(key) + 1
+                subject_number = chain_memory.next_subject_number(prompt)
+                prompt = chain_memory.append_memory_text(prompt, picture_number)
+                _LOG.info("Clip %d: chain memory is <Picture %d>, <Subject %d>", clip_index + 1, picture_number, subject_number)
 
         # Explicit pictures keep their numbered slots; continuity uses a free slot.
         if last_frame_guide is not None:

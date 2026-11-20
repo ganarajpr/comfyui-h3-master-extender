@@ -1188,6 +1188,8 @@ def _build_pair_video(data_path, prev_desc, curr_desc):
 # Set to False by the Master node while a decode runs in a background thread
 # alongside sampling: evicting the UNet from that thread would stall the pass.
 DECODE_ALLOW_RECLAIM = True
+# Set by the Master node per render: also cache, per clip, the last frame that shows the people (chain memory).
+CHAIN_MEMORY = False
 _DECODE_RECLAIM_MARGIN = 2 * 1024 ** 3
 
 
@@ -3750,6 +3752,37 @@ def _cache_guide_frame(data_path, manifest_path, manifest, index, video):
     return manifest
 
 
+def _memory_frame_path(data_path, index):
+    return Path(data_path).with_suffix(".final.video") / f"ref2va_{int(index)}.memory.pt"
+
+
+def _load_memory_frame(data_path, desc):
+    path = _memory_frame_path(data_path, desc["index"])
+    if not desc.get("memory_frame_cached") or not path.exists():
+        return None
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _cache_memory_frame(data_path, manifest_path, manifest, index, video):
+    from . import chain_memory
+
+    frame, _ = chain_memory.select_memory_frame(video)
+    path = _memory_frame_path(data_path, index)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    try:
+        torch.save(frame, temp)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+    manifest = dict(manifest)
+    segments = [dict(x) for x in manifest["segments"]]
+    segments[index]["memory_frame_cached"] = True
+    manifest["segments"] = segments
+    _write_json_atomic(manifest_path, manifest)
+    return manifest
+
+
 def cache_full_batch_ref2va_segment(
     data_path,
     manifest_path,
@@ -3830,6 +3863,10 @@ def cache_full_batch_ref2va_segment(
             manifest = _cache_guide_frame(
                 data_path, manifest_path, manifest, idx, rendered_video
             )
+            if CHAIN_MEMORY:
+                manifest = _cache_memory_frame(
+                    data_path, manifest_path, manifest, idx, rendered_video
+                )
             rendered_mp4 = None
             video_profile = None
             if not video_ready:

@@ -41,6 +41,8 @@ from .motion_context_disk import (
     _write_json_atomic,
     _load_guide_frame,
     _cache_guide_frame,
+    _cache_memory_frame,
+    _load_memory_frame,
     _render_one_final_video_segment,
     cache_full_batch_ref2va_segment,
     decode_guide_frame,
@@ -576,6 +578,7 @@ class MiniMaxH3MasterExtender:
                 "dual_split_step": ("INT", {"default": 2, "min": 1, "max": 7, "step": 1, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). Dual sampling: the grid index where pass 2 takes over, so pass 2 runs 8 minus this many steps (2 -> 6 steps, 6 -> 2 steps). Higher = pass 2 changes less of pass 1's image."}),
                 "pass1_early_stop": ("BOOLEAN", {"default": False, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). EXPERIMENTAL, dual sampling only. Pass 1 runs only the first dual_split_step steps instead of all 8; its clean estimate is upscaled and pass 2 re-noises it to the split sigma and continues. Saves most of pass 1, but the 3D latent upscaler was trained on clean latents, so quality is not validated. Off keeps the full 8-step pass 1."}),
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
+                "chain_memory": ("BOOLEAN", {"default": False, "tooltip": "Pass the previous clip's last frame that shows the people as one extra reference picture, with a generic continuity line in the prompt, so positions, contact, clothing and marks carry across a cut-away. Costs one picture slot and a face-detection pass per clip. Off by default."}),
                 "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -1042,6 +1045,9 @@ class MiniMaxH3MasterExtender:
         # TST: a new node defaults it on in the UI. A graph made before the input existed renders exactly as it did: a missing
         # tst_enabled (old API prompt) or a non-bool one (old workflow's trailing master_ui "") is OFF.
         tst_on = kwargs.get("tst_enabled", False) is True
+        # Chain memory: a missing key (old API prompt) or a non-bool (old workflow's trailing value) is OFF.
+        chain_memory_on = kwargs.get("chain_memory", False) is True
+        motion_context_disk.CHAIN_MEMORY = chain_memory_on
         tst_tau_raw = kwargs.get("tst_tau", 0.2)
         tst_tau = float(tst_tau_raw) if isinstance(tst_tau_raw, (int, float)) and not isinstance(tst_tau_raw, bool) else 0.2
         engine.configure_tst(tst_on, tst_tau)
@@ -1092,6 +1098,11 @@ class MiniMaxH3MasterExtender:
             p1_settings, dual_active and pass2_enabled, dual_split, bool(kwargs.get("pass1_early_stop", False)))
         p1_settings = with_pass1_steps_p1_settings(p1_settings, engine.pass1_steps)
 
+        def clip_p1_settings(index):
+            if chain_memory_on and index > 0:
+                return {**p1_settings, "chain_memory": "v1"}
+            return p1_settings
+
         clip_pictures = [clip_picture_keys(c, refs, n + 1) for n, c in enumerate(clips)]
         if any(p is not None for p in clip_pictures):
             if str(kwargs.get("rewrite_mode", "off")) != "off":
@@ -1106,6 +1117,7 @@ class MiniMaxH3MasterExtender:
         draft_handle = None
         previous_draft = None
         last_frame_tensor = torch.zeros([1, h2, w2, 3], dtype=torch.float32)
+        memory_frame_tensor = None
         rendered_count = 0
         validated_count = 0
 
@@ -1132,7 +1144,8 @@ class MiniMaxH3MasterExtender:
             reuse = False
             if is_on_disk and (is_validated or not rerolls):
                 try:
-                    expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te, pass2_audio_p1)
+                    expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te, pass2_audio_p1,
+                                                    chain_memory=chain_memory_on and i > 0)
                 except (TypeError, ValueError):
                     expected_fp = None
                 stored = _stored_fingerprints(data_path, manifest_path)
@@ -1157,7 +1170,7 @@ class MiniMaxH3MasterExtender:
             # 1. Reuse the cached clip
             if reuse:
                 _finish_background()
-                expected_p1 = _pass1_fingerprint(previous_p1_fp, clip_cfg, clip_cfg.get("seed", 42), p1_settings)
+                expected_p1 = _pass1_fingerprint(previous_p1_fp, clip_cfg, clip_cfg.get("seed", 42), clip_p1_settings(i))
                 stored_p1 = _stored_fingerprints(draft_path, draft_manifest_path)
                 if i < len(stored_p1) and stored_p1[i] == expected_p1:
                     p1_fingerprints[i] = expected_p1
@@ -1192,6 +1205,17 @@ class MiniMaxH3MasterExtender:
                         _cache_guide_frame(data_path, manifest_path, state, i, decoded)
                         last_frame_tensor = decoded[-1:].clone()
                         del decoded
+                if chain_memory_on:
+                    state = _load_manifest_from_paths(data_path, manifest_path)
+                    memory_frame_tensor = _load_memory_frame(data_path, state["segments"][i])
+                    if memory_frame_tensor is None:
+                        # One-time upgrade for clips saved before memory-frame caching.
+                        decoded, _ = _render_one_final_video_segment(
+                            data_path, state["segments"], i, vae,
+                        )
+                        state = _cache_memory_frame(data_path, manifest_path, state, i, decoded)
+                        memory_frame_tensor = _load_memory_frame(data_path, state["segments"][i])
+                        del decoded
                 validated_count += 1
                 continue
 
@@ -1218,8 +1242,9 @@ class MiniMaxH3MasterExtender:
             elif seed_mode == "decrement":
                 seed_val = max(0, seed_val - 1)
                 clip_cfg["seed"] = seed_val
-            clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te, pass2_audio_p1)
-            clip_p1_fp = _pass1_fingerprint(previous_p1_fp, clip_cfg, seed_val, p1_settings)
+            clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te, pass2_audio_p1,
+                                        chain_memory=chain_memory_on and i > 0)
+            clip_p1_fp = _pass1_fingerprint(previous_p1_fp, clip_cfg, seed_val, clip_p1_settings(i))
 
             # A pass-1 result rendered from exactly these pass-1 inputs is loaded instead of
             # re-sampled, whatever pass 2 / the final decode did or will do with it.
@@ -1254,6 +1279,7 @@ class MiniMaxH3MasterExtender:
                 context_length=str(context_length),
                 audio_context_length=int(audio_context_length),
                 last_frame_guide=last_frame_tensor if (identity_continuity and i > 0) else None,
+                memory_frame=memory_frame_tensor if (chain_memory_on and i > 0) else None,
                 progress_cb=progress_hook,
                 ref_videos=ref_videos,
                 ref_video_audios=ref_video_audios,
@@ -1307,6 +1333,7 @@ class MiniMaxH3MasterExtender:
             )
             go_async = (
                 str(run_mode) == "full_batch" and more_clips_pending
+                and not chain_memory_on
                 and _async_decode_allowed(async_decode, vae, sampled_latent)
             )
             if go_async:
@@ -1331,6 +1358,8 @@ class MiniMaxH3MasterExtender:
                     export_profile=export_profile,
                 )
                 last_frame_tensor = _load_guide_frame(data_path, state["segments"][i])
+                if chain_memory_on:
+                    memory_frame_tensor = _load_memory_frame(data_path, state["segments"][i])
                 progress_hook("done", f"Clip {i + 1} completed!", 1.0)
             rendered_count += 1
 
