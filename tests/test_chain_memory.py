@@ -173,7 +173,10 @@ class Truncate(unittest.TestCase):
         self.assertEqual(int(a.shape[-1]), int(round(5 / 3 * cm._pixel_frames(self.T - steps))))
         self.assertEqual(out["other"], "keep")
         self.assertEqual(int(v[0, 0, -1, 0, 0]), self.T - steps - 1)
-        self.assertEqual(int(a[0, 0, 0, -1]), a.shape[-1] - 1)
+        # audio comes from the clip's TRUE end: its last step is the original last step
+        full_audio = int(round(5 / 3 * cm._pixel_frames(self.T)))
+        self.assertEqual(int(a[0, 0, 0, -1]), full_audio - 1)
+        self.assertEqual(int(a[0, 0, 0, 0]), full_audio - a.shape[-1])
         self.assertEqual(info["dropped_steps"], steps)
         self.assertEqual(info["dropped_frames"], 17 * (steps // 5))
         self.assertEqual(len(lat["samples"]), 2)

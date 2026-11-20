@@ -229,7 +229,8 @@ def truncate_context_latent_info(latent, drop_frames, context_length=22):
     """(latent, info): ``latent`` without its trailing ``ceil(drop_frames / 17)`` cycles of 5 video latent steps.
 
     Whole cycles keep the clip on the 17k+5 grid and the tail phase the motion-context tail needs. The audio keeps
-    round(5/3 x kept frames) steps. The original latent is returned unchanged when there is nothing to drop or the
+    LAST round(5/3 x kept frames) steps of the clip's audio: the sound still comes from the clip's real end (so it continues
+    seamlessly across the join) while the picture comes from the earlier shot. The original latent is returned unchanged when there is nothing to drop or the
     result would be shorter than ``context_length`` + 17 frames; ``info["applied"]`` says which.
     """
     video, audio = _streams_from_latent(latent)
@@ -248,7 +249,8 @@ def truncate_context_latent_info(latent, drop_frames, context_length=22):
         return latent, info
     keep_audio = int(round(_FRAME_RESCALE * kept_frames))
     new_video = video[:, :, :keep_t]
-    new_audio = audio[..., :keep_audio]
+    # Audio from the TRUE tail (founder 2026-11-20): only the video jumps back to the shot with the people.
+    new_audio = audio[..., int(audio.shape[-1]) - keep_audio:]
     samples = latent["samples"]
     if getattr(samples, "is_nested", False):
         import comfy.nested_tensor
