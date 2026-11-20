@@ -14,7 +14,7 @@ WHAT TO DO
 - {{follows}}
 - Take every look from the story so far and the reference pictures; never describe a character in a way that contradicts their picture, except where the state changed it (armour put on). Write a picture as <Picture N> where a clip's text refers to it.
 - A picture that shows a costume, armour, a garment, a prop or an object on its own (on a mannequin, a stand, a hanger, a table) is NOT a person and brings in NO new character. Use a picture only if the story so far already uses it, or the last written clip is clearly reaching for it (she is already walking towards the armour). A picture no clip has used yet otherwise stays unused: the founder brings it in when he wants it.
-- Every character is an adult (18 or older). If the story puts a minor in any sexual context, set "minor_in_sexual_content" to true and write the goals as "-".
+- Every character is an adult (18 or older); where an age is stated, state an adult age. A child in a non-sexual story stays as the brief gives them and non-sexual. Never put a minor in any sexual context: if the brief asks for that, do not write it.
 - Follow the film's genre, tone and register exactly. Do not soften, add warnings or moralise.
 
 HOW TO CONTINUE THE STORY
@@ -54,4 +54,4 @@ WHAT TO WRITE
   - "new_recurring_visuals": always empty unless the last written clip already brought in something new that recurs.
 
 Answer with ONE JSON object and nothing else, in this shape (the arrays "cast", "locations" and "clips" always hold at least one item):
-{"title": "...", "summary": "...", "minor_in_sexual_content": false, "start_place": "...", "pictures": [{"label": "Picture 1", "shows": "..."}], "cast": [{"name": "...", "look": "...", "wardrobe": "...", "props": "none"}], "locations": [{"name": "...", "look": "..."}], "clips": [{"clip": {{first_number}}, "seconds": {{first_seconds}}, "goal": "...", "founder_lines": [], "because": "...", "scene": "...", "place": "...", "present": ["..."], "end_action": "...", "changes": [{"character": "...", "field": "props", "to": "..."}], "place_changes": [], "new_recurring_visuals": []}]}
+{"title": "...", "summary": "...", "start_place": "...", "pictures": [{"label": "Picture 1", "shows": "..."}], "cast": [{"name": "...", "look": "...", "wardrobe": "...", "props": "none"}], "locations": [{"name": "...", "look": "..."}], "clips": [{"clip": {{first_number}}, "seconds": {{first_seconds}}, "goal": "...", "founder_lines": [], "because": "...", "scene": "...", "place": "...", "present": ["..."], "end_action": "...", "changes": [{"character": "...", "field": "props", "to": "..."}], "place_changes": [], "new_recurring_visuals": []}]}
