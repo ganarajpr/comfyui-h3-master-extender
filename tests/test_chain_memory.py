@@ -208,9 +208,6 @@ class Truncate(unittest.TestCase):
         self.assertIs(out, lat)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 @unittest.skipIf(torch is None, "torch not installed")
 class Shrink(unittest.TestCase):
@@ -224,3 +221,7 @@ class Shrink(unittest.TestCase):
         out = cm._shrink(f)
         self.assertEqual(tuple(out.shape), tuple(f.shape))
         self.assertTrue(torch.equal(out, f))
+
+
+if __name__ == "__main__":
+    unittest.main()
