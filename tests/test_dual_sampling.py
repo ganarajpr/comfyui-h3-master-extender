@@ -11,7 +11,8 @@ NODE = ROOT / "master_node.py"
 
 GRID = [1.0, 0.9939, 0.9843, 0.9661, 0.9231, 0.8349, 0.6969, 0.4688, 0.0]
 
-# Every input name before dual sampling existed, in order (INPUT_TYPES required + optional).
+# Every input name up to sparse_sink, in order (INPUT_TYPES required + optional). The four hyperflow_* inputs used to sit after
+# rewrite_previous_clips; since the legacy restore they are appended after tst_tau with the dual sampling ones.
 OLD_INPUT_NAMES = [
     'model', 'clip', 'vae', 'audio_vae', 'pdd_file', 'upscaler_model', 'run_mode', 'pass1_resolution', 'pass2_resolution',
     'pass2_denoise', 'pdd_nfe', 'context_length', 'audio_context_length', 'identity_continuity', 'smart_offload', 'clips_json',
@@ -24,7 +25,7 @@ OLD_INPUT_NAMES = [
     'rewrite_max_new_tokens', 'rewrite_seed', 'rewrite_thinking', 'rewrite_reasoning_budget', 'rewrite_reasoning_budget_message',
     'rewrite_parallel', 'rewrite_system_prompt', 'rewrite_system_prompt_in', 'ref_video_1', 'ref_video_2', 'ref_video_3',
     'ref_video_audio_1', 'ref_video_audio_2', 'ref_video_audio_3', 'ref_audio_1', 'ref_audio_2', 'ref_audio_3',
-    'rewrite_previous_clips', 'hyperflow_file', 'hyperflow_curve_refit', 'hyperflow_strength', 'hyperflow_lora_mode',
+    'rewrite_previous_clips',
     'audio_refine_steps', 'audio_refine_denoise', 'audio_refine_cache', 'final_decode', 'rewrite_story', 'auto_clips',
     'planner_refs', 'auto_clip_seconds', 'story_engine', 'e4_language', 'e4_score', 'e4_decision_budget', 'e4_picture_notes',
     'sparse_start_percent', 'sparse_dense_blocks', 'sparse_sink',
@@ -69,8 +70,8 @@ def _node_namespace():
     wanted = [n for n in tree.body
               if (isinstance(n, ast.Assign) and any(getattr(t, "id", "") in ("DUAL_SAMPLING_ACCEL_MODE", "ACCEL_MODES")
                                                     for t in n.targets))
-              or (isinstance(n, ast.FunctionDef) and n.name in ("normalize_accel_mode", "resolve_accel_mode"))]
-    ns = {"_LOG": logging.getLogger("test_dual_sampling")}
+              or (isinstance(n, ast.FunctionDef) and n.name in ("is_legacy_accel_mode", "normalize_accel_mode", "resolve_accel_mode"))]
+    ns = {"_LOG": logging.getLogger("test_dual_sampling"), "HYPERFLOW_ACCEL_MODE": "HyperFlow 8-step"}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), str(NODE), "exec"), ns)
     return ns
 
@@ -83,8 +84,10 @@ Engine = _engine_methods("configure_dual_sampling", "configure_pass1_steps", "_p
 
 def make_engine(turbo=False, pass2_lora=None):
     e = Engine()
+    e.accel_mode = "Turbo LoRA" if turbo else "HyperFlow 8-step"
     e.turbo_mode = turbo
     e.hyperflow_mode = not turbo
+    e.flash_mode = False
     e.hyperflow_pruned_refit = False
     e.pass2_lora = pass2_lora
     e.pass2_model = object() if pass2_lora else None
@@ -129,11 +132,14 @@ class DefaultsAreUnchanged(unittest.TestCase):
         self.assertFalse(e.pass1_early_stop)
         self.assertEqual(e._pass2_sigmas(None, 0.25), GRID[-3:])
 
-    def test_old_input_names_are_a_prefix_of_the_new_ones(self):
+    def test_input_names_up_to_sparse_sink_are_unchanged(self):
         text = NODE.read_text(encoding="utf-8")
         names = re.findall(r'^\s{16}"(\w+)": \(', text[text.index("def INPUT_TYPES"):], re.M)
         self.assertEqual(names[:len(OLD_INPUT_NAMES)], OLD_INPUT_NAMES)
-        self.assertEqual(names[len(OLD_INPUT_NAMES):], ["dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps", "pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "clips_in"])
+        self.assertEqual(names[len(OLD_INPUT_NAMES):], ["pass2_chunk_when", "pass2_sla_sparsity", "pass2_scheduler", "pass2_audio", "hyperflow_flash_file", "hyperflow_flash_steps",
+                                                         "hyperflow_flash_lora", "hyperflow_flash_lora_strength", "handoff_step", "pass1_cfg", "cfg_steps", "negative_prompt",
+                                                         "cfg_handoff_steps", "tst_enabled", "tst_tau", "hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength",
+                                                         "hyperflow_lora_mode", "dual_sampling", "dual_split_step", "pass1_early_stop", "pass1_steps", "clips_in"])
 
     def test_new_inputs_default_off(self):
         text = NODE.read_text(encoding="utf-8")
@@ -295,9 +301,10 @@ class EarlyStopCapture(unittest.TestCase):
 class DualSamplingMode(unittest.TestCase):
     NEW = "HyperFlow 8-step \u00b7 dual sampling"
 
-    def test_the_new_value_is_appended_last_and_the_default_is_unchanged(self):
-        self.assertEqual(_NODE["ACCEL_MODES"], ["HyperFlow 8-step", "Turbo LoRA", self.NEW])
-        self.assertRegex(NODE.read_text(encoding="utf-8"), r'"accel_mode": \(ACCEL_MODES, \{"default": "HyperFlow 8-step"')
+    def test_the_dual_value_is_appended_last_and_the_default_is_turbo(self):
+        self.assertEqual(_NODE["ACCEL_MODES"][-2:], ["HyperFlow 8-step", self.NEW])
+        self.assertEqual(_NODE["DUAL_SAMPLING_ACCEL_MODE"], self.NEW)
+        self.assertRegex(NODE.read_text(encoding="utf-8"), r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
 
     def test_old_values_resolve_to_themselves(self):
         resolve = _NODE["resolve_accel_mode"]

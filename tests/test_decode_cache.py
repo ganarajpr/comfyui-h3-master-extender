@@ -29,6 +29,7 @@ class DecodeCacheTests(unittest.TestCase):
         self.ns = {
             "Path": Path, "os": os, "torch": torch, "uuid": uuid, "re": re, "time": time,
             "_LOG": logging.getLogger("test"),
+            "CHAIN_MEMORY": False,
             "FULL_BATCH_H264_CACHE_CRF": 17,
             "FULL_BATCH_H264_CACHE_PRESET": "fast",
             "FULL_BATCH_H264_CACHE_PROFILE": "preview",

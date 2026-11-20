@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from typing import Any
@@ -158,13 +159,29 @@ def _resolve_video_path(video: str, video_path: str) -> str:
     return folder_paths.get_annotated_filepath(video)
 
 
+def _handoff_k(value: Any) -> int:
+    m = re.match(r"\s*(\d+)", str(value))
+    return int(m.group(1)) if m else 3
+
+
 def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
     lines: list[str] = []
     if inputs:
-        accel = inputs.get("accel_mode", "HyperFlow 8-step")
+        accel = inputs.get("accel_mode", "Turbo LoRA")
         steps = inputs.get("pdd_nfe", "?")
         if str(accel).lower().startswith("turbo"):
             lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
+        elif str(accel).startswith("Base + CFG"):
+            lines.append(f"Engine: Base + CFG {inputs.get('pass1_cfg', 4.5)} (undistilled) · {inputs.get('cfg_steps', 24)} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}"
+                         + (" · negative prompt" if str(inputs.get('negative_prompt') or "").strip() else ""))
+        elif str(accel).startswith("CFG"):
+            lines.append(f"Engine: CFG {inputs.get('pass1_cfg', 4.5)} \u2192 Pika hand-off: {inputs.get('cfg_handoff_steps', 8)} of {inputs.get('cfg_steps', 24)} CFG steps, then {inputs.get('turbo_lora', '')} · {steps} steps"
+                         + (" · negative prompt" if str(inputs.get('negative_prompt') or "").strip() else ""))
+        elif str(accel).startswith("Pika"):
+            lines.append(f"Engine: Pika\u2192Flash hand-off @{_handoff_k(inputs.get('handoff_step'))}: {inputs.get('turbo_lora', '')} \u2192 {inputs.get('hyperflow_flash_file', '')}")
+        elif str(accel).startswith("HyperFlow Flash"):
+            lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1"
+                         + (f" · Flash LoRA {inputs.get('hyperflow_flash_lora')} x{inputs.get('hyperflow_flash_lora_strength', 1.0)}" if inputs.get('hyperflow_flash_lora') not in (None, '', 'none') else ""))
         else:
             refit = "curve refit on" if inputs.get("hyperflow_curve_refit", True) else "curve refit off"
             label = "HyperFlow · dual sampling" if "dual sampling" in str(accel) else "HyperFlow 8-step"

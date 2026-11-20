@@ -50,7 +50,8 @@ def shots_json(number, shots, seconds=15):
     return json.dumps({"clip": number, "seconds": seconds, "shots": shots}, ensure_ascii=False)
 
 
-GOOD = [shot(0, "Kael, in her grey cloak and silver plate armour, steps forward"), shot(5, "The monster turns", framing="close up, slow motion"), shot(10, "Kael raises her sword")]
+GOOD = [shot(0, "Kael, in her grey cloak and silver plate armour, steps forward"), shot(3, "The monster turns toward her", framing="close up, locked"), shot(6, "Kael raises her sword"),
+        shot(9, "The monster rears back from the blade", framing="medium shot, side 45 degrees, locked"), shot(12, "Kael holds the sword steady", framing="wide shot, locked")]
 
 
 class Script:
@@ -499,13 +500,43 @@ class TimingTests(unittest.TestCase):
 
     def test_check_shots_names_each_problem(self):
         self.assertEqual(sh.check_shots(GOOD, 15, "English"), [])
-        self.assertIn("must start at 0", sh.check_shots([shot(2), shot(8)], 15, "English")[0])
-        self.assertTrue(any("do not strictly increase" in p for p in sh.check_shots([shot(0), shot(8), shot(8)], 15, "English")))
-        self.assertTrue(any("at or after the end" in p for p in sh.check_shots([shot(0), shot(8), shot(15)], 15, "English")))
-        self.assertTrue(any("shot 1 lasts 1s" in p for p in sh.check_shots([shot(0), shot(1), shot(9)], 15, "English")))
-        self.assertTrue(any("shot 2 lasts 1s" in p for p in sh.check_shots([shot(0), shot(14)], 15, "English")))
+        self.assertTrue(any("must start at 0" in p for p in sh.check_shots([shot(2), shot(5), shot(8), shot(10), shot(12)], 15, "English")))
+        self.assertTrue(any("do not strictly increase" in p for p in sh.check_shots([shot(0), shot(3), shot(8), shot(8), shot(12)], 15, "English")))
+        self.assertTrue(any("at or after the end" in p for p in sh.check_shots([shot(0), shot(3), shot(6), shot(9), shot(15)], 15, "English")))
+        self.assertTrue(any("shot 1 lasts 1s" in p for p in sh.check_shots([shot(0), shot(1), shot(4), shot(7), shot(10)], 15, "English")))
+        self.assertTrue(any("shot 5 lasts 1s" in p for p in sh.check_shots([shot(0), shot(3), shot(6), shot(9), shot(14)], 15, "English")))
         self.assertTrue(any("no shots" in p for p in sh.check_shots([], 15, "English")))
-        self.assertTrue(any("7 shots" in p for p in sh.check_shots([shot(i * 2) for i in range(7)], 15, "English")))
+        self.assertTrue(any("7 shots; write 5 to 6" in p for p in sh.check_shots([shot(i * 2) for i in range(7)], 15, "English")))
+
+    def test_shot_count_range_follows_the_clip_length(self):
+        self.assertEqual([sh.shot_range(n) for n in (4, 6, 9, 10, 12, 15, 30)], [(2, 2), (2, 3), (3, 4), (4, 5), (4, 5), (5, 6), (6, 6)])
+        self.assertTrue(any("4 shots; write 5 to 6" in p for p in sh.check_shots([shot(0), shot(4), shot(8), shot(12)], 15, "English")))
+        self.assertEqual(sh.check_shots(GOOD[:4], 12, "English"), [])
+
+    def test_banned_words_are_a_complaint_in_framing_and_action_but_not_in_dialogue(self):
+        bad = [shot(0, "Kael nods, then glances at the well"), shot(3, "Her palm rests on the sword; sweat on her brow"), shot(6, "The pulse of the drums swells", framing="wide, on the beat"),
+               shot(9, "Kael, lips pressed, waves"), shot(12, "A clean pass", dialogue={"speaker": "Kael", "line": "nod and blink"})]
+        problems = sh.check_words(bad)
+        self.assertEqual(len(problems), 4)   # the banned words in the last shot are in its dialogue, which is not checked
+        self.assertIn("nods", problems[0])
+        self.assertIn("glances", problems[0])
+        self.assertIn("palm", problems[1])
+        self.assertIn("sweat", problems[1])
+        self.assertIn("word borrowed from music", problems[2])
+        self.assertNotIn("beat", problems[2].replace("beats", ""))   # the retry never hands the music word back
+        self.assertIn("lips pressed", problems[3])
+        self.assertEqual(sh.check_words([shot(0, "A beaten path leads off; the heartbeat of the drum is silent")]), [])   # not whole words
+        self.assertEqual(len(sh.check_words([shot(0, "waves of grain bend")])), 1)   # known false friend: a plain "wave" is banned in every sense
+        self.assertEqual(sh.check_words(GOOD), [])
+
+    def test_banned_words_ask_again_once_with_the_complaint(self):
+        bad = shots_json(1, [shot(0, "Kael nods"), *GOOD[1:]])
+        eng, chat, out = self.run_one([bad, shots_json(1, GOOD)])
+        calls = [c for c in chat.calls if c["kind"] == "shots_001"]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("shot 1 uses words that are not allowed (nods)", user(calls[1]))
+        self.assertNotIn("nods", out["clips"][0]["raw"])
+        self.assertEqual(eng.warnings, [])
 
     def test_timing_failure_retries_once_with_the_complaint(self):
         bad = shots_json(1, [shot(1), shot(2), shot(9)])
@@ -534,20 +565,21 @@ class TimingTests(unittest.TestCase):
 
     def test_unreadable_answer_is_retried(self):
         eng, chat, out = self.run_one(["not json at all", shots_json(1, GOOD)])
-        self.assertEqual(len(out["clips"][0]["shots"]), 3)
+        self.assertEqual(len(out["clips"][0]["shots"]), 5)
 
     def test_words_that_do_not_fit_the_shot_are_a_complaint(self):
         long_line = {"speaker": "Kael", "line": " ".join(["word"] * 12)}
-        problems = sh.check_shots([shot(0, dialogue=long_line), shot(5), shot(10)], 15, "English")
+        problems = sh.check_shots([shot(0, dialogue=long_line), shot(5), shot(7), shot(9), shot(12)], 15, "English")
         self.assertEqual(len(problems), 1)
-        self.assertIn("12 words but a 5-second shot fits at most 10", problems[0])
+        self.assertIn("12 words but a 5-second shot fits at most 8", problems[0])
+        self.assertEqual([sh.max_line_words(n, "English") for n in (1, 2, 3, 4, 5)], [2, 2, 4, 6, 8])
         self.assertLess(sh.max_line_words(5, "Hindi"), sh.max_line_words(5, "English"))
 
 
 class ScriptTests(unittest.TestCase):
     def test_english_line_in_a_hindi_clip_is_a_complaint_and_retried(self):
-        bad = shots_json(1, [shot(0), shot(5, dialogue={"speaker": "Kael", "line": "Not today."}), shot(10)])
-        good = shots_json(1, [shot(0), shot(5, dialogue={"speaker": "Kael", "line": "आज नहीं।"}), shot(10)])
+        bad = shots_json(1, [shot(0), shot(3), shot(6, dialogue={"speaker": "Kael", "line": "Not today."}), shot(9), shot(12)])
+        good = shots_json(1, [shot(0), shot(3), shot(6, dialogue={"speaker": "Kael", "line": "आज नहीं।"}), shot(9), shot(12)])
         replies = iter([bad, good])
         chat = Script(lambda kind, m, n: plan_json(1) if kind == "plan" else next(replies))
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,7 +588,7 @@ class ScriptTests(unittest.TestCase):
         retry = [c for c in chat.calls if c["kind"] == "shots_001"][1]
         self.assertIn("Not today.", user(retry))
         self.assertIn("not in Hindi's own script", user(retry))
-        self.assertEqual(out["clips"][0]["shots"][1]["dialogue"]["line"], "आज नहीं।")
+        self.assertEqual(out["clips"][0]["shots"][2]["dialogue"]["line"], "आज नहीं।")
         self.assertEqual(eng.warnings, [])
 
     def test_script_ranges(self):
@@ -578,8 +610,8 @@ class FounderLineTests(unittest.TestCase):
 
     def test_a_missing_founder_line_is_a_complaint_naming_it(self):
         plan = plan_json(2, lines={1: ["आज नहीं।"]})
-        no_line = shots_json(1, [shot(0), shot(5, dialogue={"speaker": "Kael", "line": "कभी नहीं।"}), shot(10)])
-        with_line = shots_json(1, [shot(0), shot(5, dialogue={"speaker": "Kael", "line": "आज  नहीं।"}), shot(10)])   # whitespace collapses
+        no_line = shots_json(1, [shot(0), shot(3), shot(6, dialogue={"speaker": "Kael", "line": "कभी नहीं।"}), shot(9), shot(12)])
+        with_line = shots_json(1, [shot(0), shot(3), shot(6, dialogue={"speaker": "Kael", "line": "आज  नहीं।"}), shot(9), shot(12)])   # whitespace collapses
         replies = iter([no_line, with_line])
         chat = Script(lambda kind, m, n: plan if kind == "plan" else (next(replies) if kind == "shots_001" else shots_json(2, GOOD)))
         with tempfile.TemporaryDirectory() as tmp:
@@ -588,7 +620,7 @@ class FounderLineTests(unittest.TestCase):
         calls = [c for c in chat.calls if c["kind"] == "shots_001"]
         self.assertIn("आज नहीं।", user(calls[0]))                           # the first ask already names the line the clip must keep
         self.assertIn("must appear word for word", user(calls[1]))
-        self.assertEqual(out["clips"][0]["shots"][1]["dialogue"]["line"], "आज नहीं।")   # stored NFC-normalised, one space
+        self.assertEqual(out["clips"][0]["shots"][2]["dialogue"]["line"], "आज नहीं।")   # stored NFC-normalised, one space
         self.assertEqual(eng.warnings, [])
 
     def test_only_lines_the_brief_really_has_are_required(self):
@@ -614,8 +646,15 @@ class PromptTests(unittest.TestCase):
                        "Devanagari", "per-character language instruction", "and so on", "founder_lines"):
             self.assertIn(phrase, plan)
         shots = " ".join(sh.load_prompt("shots").split())
-        for phrase in ("at least 2 seconds", "never forced into every shot", "2 words per second", "null", "starts exactly where the previous clip ended"):
+        for phrase in ("at least 2 seconds", "never forced into every", "2 x (shot seconds - 1) words", "null", "starts exactly where the previous clip ended", "HARD RULES", "{{brief_block}}",
+                       "wide side shot, 45 degrees, locked", "say only what differs from their reference picture"):
             self.assertIn(phrase, shots)
+        self.assertNotIn("slow motion", shots.replace("no slow motion", ""))
+        for name in ("shots", "continue_plan"):   # no word borrowed from music in anything the model reads
+            self.assertNotRegex(sh.load_prompt(name), r"(?i)\b(beats?|rhythm|tempo|pulse|swell)\b")
+        cont = " ".join(sh.load_prompt("continue_plan").split())
+        for phrase in ("HOW TO CONTINUE THE STORY", "Never replay", "Never reset", '"because"', '"scene"', "{{ending}}", "{{follows}}"):
+            self.assertIn(phrase, cont)
 
 
 class ChatWireTests(unittest.TestCase):
@@ -791,7 +830,8 @@ class JsPanelTests(unittest.TestCase):
         self.assertIn("incoming.from_writer === true", js)
 
 
-FIXED = [shot(0, "Kael, in her grey cloak and silver plate armour, sits upright behind the boulder"), shot(6, "She breathes, still", framing="close up")]
+FIXED = [shot(0, "Kael, in her grey cloak and silver plate armour, sits upright behind the boulder"), shot(3, "She breathes, still", framing="close up"), shot(6, "The boulder shades her", framing="wide shot"),
+         shot(9, "Her sword rests across her knees", framing="insert, locked"), shot(12, "She stays seated, facing the road", framing="medium shot, locked")]
 
 
 def seams_json(total, flagged=(), inside=()):
@@ -850,7 +890,7 @@ class SeamCheckTests(unittest.TestCase):
         text = user(retry)
         self.assertIn("SEAM CHECK (the cut from clip 1 to clip 2, posture): Clip 1's last shot has Kael standing with her sword raised", text)
         self.assertIn("Fix: End clip 1 with Kael seated upright behind the boulder.", text)
-        self.assertIn("Shot 3 – 10s – wide shot: Kael raises her sword.", text)   # the first shot list is shown to the rewrite
+        self.assertIn("Shot 3 – 6s – wide shot: Kael raises her sword.", text)   # the first shot list is shown to the rewrite
         first, second, third = out["clips"]
         self.assertTrue(first["seam_fixed"])
         self.assertIn("sits upright behind the boulder", first["raw"])
@@ -935,6 +975,191 @@ class SeamCheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine(chat, tmp, clips=1, seams=True).run()
         self.assertEqual(sorted(chat.kinds()), ["plan", "shots_001"])
+
+
+# --------------------------------------------------------------------------- fill empty clips ("Fill from story so far")
+
+REWRITTEN = "## summary\nREWRITTEN-REF2VA-TEXT that must never reach the writer"
+
+
+def typed(i, text=None, rewritten=False):
+    clip = {"id": i, "title": f"Clip {i + 1}", "prompt": text or f"Kael does thing {i + 1} by the well.", "duration": 15, "seed": 100 + i, "seed_mode": "randomize", "validated": False, "loras": []}
+    if rewritten:
+        clip.update(prompt_raw=clip["prompt"], prompt=REWRITTEN, prompt_rewritten=True, rewrite_text=REWRITTEN, rewrite_meta={"model": "m"})
+    return clip
+
+
+def empty(i, flagged=True, duration=12):
+    clip = {"id": i, "title": f"Clip {i + 1}", "prompt": "", "duration": duration, "seed": 500 + i, "seed_mode": "randomize", "validated": False, "loras": []}
+    if flagged:
+        clip[sh.FILL_FLAG] = True
+    return clip
+
+
+def fill_handler(total_targets, seam_answer=None):
+    def handler(kind, messages, n):
+        if kind == "plan":
+            return plan_json(total_targets)
+        if kind == "seams":
+            return seam_answer
+        number = int(kind.split("_")[1])
+        return shots_json(number, GOOD[:4], seconds=12)
+    return handler
+
+
+class FillEmptyClipsTests(unittest.TestCase):
+    def ten(self):
+        return [typed(i, rewritten=i % 2 == 0) for i in range(8)] + [empty(8), empty(9)]
+
+    def run_fill(self, clips, handler, **kw):
+        chat = Script(handler)
+        fill = sh.fill_request(clips)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = engine(chat, tmp, brief="", clips=0, fill=fill, **kw).run()
+        return chat, out
+
+    def test_only_the_empty_clips_are_written_from_the_raw_prompts_of_the_clips_before(self):
+        clips = self.ten()
+        chat, out = self.run_fill(clips, fill_handler(2))
+        self.assertEqual(chat.kinds(), ["plan", "shots_009", "shots_010"])
+        self.assertEqual([(c["index"], c["clip"], c["seconds"], c["fill"]) for c in out["clips"]], [(8, 9, 12, True), (9, 10, 12, True)])
+        plan_text = user(chat.calls[0])
+        for i in range(8):
+            self.assertIn(f"Clip {i + 1} (15 s):\nKael does thing {i + 1} by the well.", plan_text)
+        self.assertIn("Clip 9 (12 s): EMPTY", plan_text)
+        self.assertNotIn("REWRITTEN-REF2VA-TEXT", "\n".join(user(c) for c in chat.calls))
+        self.assertNotIn("{{", plan_text)
+        self.assertIn("THE STORY SO FAR", user(chat.calls[1]))
+        self.assertNotIn("THE FOUNDER'S BRIEF", user(chat.calls[1]))
+        self.assertIn("The clip before it (8) is already written by the founder", user(chat.calls[1]))
+        self.assertIn("The clip after it (10) is: ", user(chat.calls[1]))   # the other empty clip: its planned goal
+        self.assertIn("Nothing comes after it: this clip ends the film.", user(chat.calls[2]))
+        self.assertIn("so it ends the story: end on the high point", plan_text)
+
+    def test_the_seam_check_covers_only_the_cuts_that_touch_a_filled_clip_and_rewrites_only_filled_clips(self):
+        bad = {"from": 8, "to": 9, "aspect": "posture", "fix_clip": 8, "problem": "Clip 8 ends seated, clip 9 opens standing.", "fix": "Open clip 9 seated."}
+        chat, out = self.run_fill(self.ten(), fill_handler(2, seams_json(10, [bad])), seams=True)
+        seams = user(next(c for c in chat.calls if c["kind"] == "seams"))
+        self.assertIn("SEAM 8 -> 9", seams)
+        self.assertIn("SEAM 9 -> 10", seams)
+        self.assertNotIn("SEAM 7 -> 8", seams)
+        self.assertIn("the founder's clip, fixed", seams)
+        self.assertEqual(chat.kinds()[-1], "seamfix_009")   # fix_clip 8 is the founder's: the fix moves to the filled clip of the seam
+        self.assertEqual(sum(1 for k in chat.kinds() if k.startswith("seamfix")), 1)
+        self.assertTrue(out["clips"][0]["seam_fixed"])
+
+    def test_an_empty_clip_in_the_middle_sees_the_clip_after_it_but_not_the_ones_beyond(self):
+        clips = [typed(i) for i in range(8)]
+        clips[4] = empty(4)
+        clips[5]["prompt"] = "Kael finds the sword in the grass."
+        chat, out = self.run_fill(clips, fill_handler(1))
+        self.assertEqual(chat.kinds(), ["plan", "shots_005"])
+        plan_text = user(chat.calls[0])
+        self.assertIn("Clip 6 (15 s):\nKael finds the sword in the grass.", plan_text)
+        self.assertNotIn("Kael does thing 7", plan_text)
+        self.assertIn("Clip 6 follows the empty clips", plan_text)
+        self.assertIn("do not end it", plan_text)
+        shots = user(chat.calls[1])
+        self.assertIn("The clip before it (4) is already written", shots)
+        self.assertIn("The clip after it (6) is already written by the founder and is fixed. Its text: Kael finds the sword in the grass.", shots)
+        self.assertEqual([c["index"] for c in out["clips"]], [4])
+
+    def test_the_continue_plan_schema_requires_because_and_scene_and_the_normal_plan_is_unchanged(self):
+        item = sh.CONTINUE_PLAN_SCHEMA["properties"]["clips"]["items"]
+        self.assertIn("because", item["required"])
+        self.assertIn("scene", item["required"])
+        self.assertEqual(item["properties"]["scene"], {"type": "string"})
+        self.assertNotIn("because", sh.PLAN_SCHEMA["properties"]["clips"]["items"]["properties"])
+        plan = sh.coerce_plan({"clips": [{"clip": 9, "goal": "g", "because": "clip 8 ended on the shut ledger", "scene": "Meera's room, dusk"}]})
+        self.assertEqual((plan["clips"][0]["because"], plan["clips"][0]["scene"]), ("clip 8 ended on the shut ledger", "Meera's room, dusk"))
+        chat, _ = FillEmptyClipsTests().run_fill([typed(0), typed(1), empty(2)], fill_handler(1))
+        self.assertEqual(chat.calls[0]["response_format"]["json_schema"]["schema"], sh.CONTINUE_PLAN_SCHEMA)
+
+    def test_a_gap_is_bridged_and_each_empty_clip_keeps_its_own_duration(self):
+        clips = [typed(0), empty(1, duration=6), empty(2, duration=9), typed(3), typed(4)]
+        fill = sh.fill_request(clips)
+        self.assertEqual([(t["clip"], t["seconds"]) for t in fill["targets"]], [(2, 6), (3, 9)])
+        self.assertEqual([c["clip"] for c in fill["context"]], [1, 4])
+
+    def test_import_replaces_only_the_empty_clips_and_leaves_every_other_clip_byte_identical(self):
+        clips = self.ten()
+        clips[3]["seed_mode"] = "fixed"
+        before = [json.dumps(c, sort_keys=True) for c in clips[:8]]
+        _, out = self.run_fill(clips, fill_handler(2))
+        changed = sh.apply_fill(clips, out["clips"])
+        self.assertEqual(changed, [8, 9])
+        self.assertEqual([json.dumps(c, sort_keys=True) for c in clips[:8]], before)
+        for i in (8, 9):
+            c = clips[i]
+            self.assertEqual((c["id"], c["duration"], c["seed"], c["seed_mode"], c["validated"], c["prompt_rewritten"], c["from_writer"]), (i, 12, 500 + i, "fixed", False, False, True))
+            self.assertEqual(c["prompt"], c["prompt_raw"])
+            self.assertIn("Shot 1 \u2013 0s", c["prompt"])
+            self.assertIn("CONTINUITY", c["prompt"])   # the state block of the clip before
+            self.assertNotIn(sh.FILL_FLAG, c)
+            self.assertIn("shots", c["writer"])
+            self.assertIn("plan_end_state", c)
+
+    def test_apply_fill_never_touches_a_clip_that_has_text_or_is_not_flagged(self):
+        clips = [typed(0), empty(1, flagged=False), typed(2)]
+        clips[2][sh.FILL_FLAG] = True   # flagged but not empty
+        item = {"index": 1, "fill": True, "raw": "Shot 1 \u2013 0s: x.", "seconds": 15}
+        self.assertEqual(sh.apply_fill(clips, [item, dict(item, index=2), dict(item, index=0)]), [])
+        self.assertEqual(clips[1]["prompt"], "")
+
+    def test_no_empty_clip_or_nothing_to_continue_from_is_a_no_op(self):
+        self.assertIsNone(sh.fill_request([typed(0), typed(1)]))
+        self.assertIsNone(sh.fill_request([typed(0), empty(1, flagged=False)]))   # empty but not flagged for this run
+        self.assertIsNone(sh.fill_request([empty(0), empty(1)]))                  # no clip with text to continue from
+        with mock.patch.object(sh, "open_model", side_effect=AssertionError("the model must not start")):
+            clips = [typed(0), typed(1)]
+            self.assertEqual(sh.fill_empty_clips(clips, {}, writer_model="w"), [])
+
+    def test_job_key_changes_with_a_context_text_or_another_empty_clip(self):
+        a = sh.fill_key(sh.fill_request(self.ten()))
+        clips = self.ten()
+        clips[7]["prompt"] = "Something else happens."
+        self.assertNotEqual(a, sh.fill_key(sh.fill_request(clips)))
+        self.assertNotEqual(a, sh.fill_key(sh.fill_request(self.ten()[:9])))
+        self.assertEqual(a, sh.fill_key(sh.fill_request(self.ten())))
+
+    def test_fill_empty_clips_opens_the_server_writes_and_fills_in_place(self):
+        chat = Script(fill_handler(2))
+
+        @contextlib.contextmanager
+        def fake_open(label, budget, slot_ctx, concurrency, say, **kw):
+            yield {"url": "http://x", "model": "m", "style": "chat", "slots": 4}, mock.Mock(interrupted=lambda: False)
+
+        clips = self.ten()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sh, "open_model", fake_open), mock.patch.object(sh, "ServerChat", lambda *a, **k: chat), \
+                mock.patch.object(sh, "output_root", lambda base=None: Path(tmp) / "out"):
+            changed = sh.fill_empty_clips(clips, {}, writer_model="w", language="English")
+        self.assertEqual(changed, [8, 9])
+        self.assertIn("Shot 1", clips[9]["prompt"])
+        self.assertIn("CONTINUITY", clips[8]["prompt"])
+
+
+class FillWiringTests(unittest.TestCase):
+    def test_extend_fills_flagged_empty_clips_before_the_rewriter_and_returns_like_prompts_only(self):
+        text = master_source()
+        body = text[text.index("def extend("):]
+        start = body.index("shot_writer.FILL_FLAG")
+        block = body[start - 200:body.index("# Video / audio references")]
+        self.assertIn("shot_writer.fill_empty_clips(", block)
+        self.assertIn("_send_plan(owner, clips, filled, fill=True)", block)
+        self.assertIn("clips_metadata.embed_clips(unique_id, prompt, extra_pnginfo, clips)", block)
+        self.assertIn("return self._prompts_only(", block)
+        self.assertLess(start, body.index("prompt_rewriter.rewrite_clips("))
+        self.assertLess(start, body.index("_manifest_for_first(cache_owner"))
+
+    def test_panel_button_flags_only_for_the_queued_graph(self):
+        js = (ROOT / "web" / "master_extender.js").read_text(encoding="utf-8")
+        self.assertIn("Fill from story so far", js)
+        body = js[js.index("async function fillEmptyClips"):js.index("function writerLinked")]
+        self.assertIn("c.fill_empty = true", body)
+        self.assertIn("await app.queuePrompt(0, 1)", body)
+        self.assertIn("delete c.fill_empty", body)
+        self.assertLess(body.index("queuePrompt"), body.index("delete c.fill_empty"))
+        self.assertIn("clipIsEmpty(clip) && !externalPromptWired(index)", js)
 
 
 if __name__ == "__main__":

@@ -7,10 +7,12 @@ Stage 2: 3D Latent Upscaling (MinimaxH3LatentUpscaler3D) + Concat AV
 Stage 3: Pass 2 High-Res Refinement via the quality tail (denoise 0.25)
 """
 
+import contextlib
 import inspect
 import math
 import logging
 import os
+import re
 import sys
 import torch
 import comfy.model_management
@@ -32,7 +34,9 @@ from .motion_context_ram import (
     MiniMaxH3MotionContextRAM,
     _streams_from_latent,
 )
+from . import chain_memory
 from . import x0_debug
+from . import time_gate_lora
 
 _LOG = logging.getLogger("minimax_h3_master_extender.engine")
 
@@ -142,6 +146,131 @@ def _upscaler_precision(model_name, default="fp16"):
     return precision
 
 
+FLASH_ACCEL_MODE = "HyperFlow Flash (GGUF)"
+HYPERFLOW_ACCEL_MODE = "HyperFlow 8-step"
+HANDOFF_ACCEL_MODE = "Pika \u2192 Flash hand-off"
+HANDOFF_STEP_OPTIONS = [
+    "1 \u00b7 Pika to 0.98",
+    "2 \u00b7 Pika to 0.96",
+    "3 \u00b7 Pika to 0.92",
+    "4 \u00b7 Pika to 0.86",
+    "5 \u00b7 Pika to 0.71",
+]
+HANDOFF_STEP_DEFAULT = 3
+HANDOFF_STEP_DEFAULT_LABEL = HANDOFF_STEP_OPTIONS[2]
+CFG_ACCEL_MODE = "Base + CFG (undistilled)"
+CFG_HANDOFF_ACCEL_MODE = "CFG \u2192 Pika hand-off"
+CFG_STEPS_DEFAULT = 24
+PASS1_CFG_DEFAULT = 4.5
+CFG_HANDOFF_STEPS_DEFAULT = 8
+FLASH_STEPS = (4, 6, 8)
+FLASH_DEFAULT_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot.safetensors"
+FLASH_FALLBACK_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf"
+# The Pika x Flash merge baked into one file (founder 2026-11-17: "use baked"): preferred whenever it is installed.
+FLASH_MERGE_FILE = "minimax_h3_ref2va_hyperflow_flash_14b-int8_convrot_pikamerge.safetensors"
+_FLASH_CACHE = {}
+
+
+def flash_file_list(pack, scanned):
+    """Flash builds: .gguf names from `scanned` plus .safetensors names, all with 'hyperflow_flash' in the name. With the
+    pack loaded the safetensors come from its own safetensors_files() (only files carrying HyperFlow metadata; a v1.0.0
+    pack has none, so GGUF only); without it they come from `scanned`."""
+    def keep(n):
+        return "hyperflow_flash" in str(n).lower()
+    names = [n for n in scanned if str(n).lower().endswith(".gguf") and keep(n)]
+    if pack is None:
+        names += [n for n in scanned if str(n).lower().endswith(".safetensors") and keep(n)]
+    elif hasattr(pack, "safetensors_files"):
+        try:
+            names += [n for n in pack.safetensors_files() if keep(n)]
+        except Exception:
+            pass
+    return sorted(set(names))
+
+
+def default_flash_file(available):
+    """The baked Pika x Flash merge when installed, else the INT8 convrot ref2va build, else the Q8_0 GGUF, else any ref2va build."""
+    available = list(available or [])
+    for name in (FLASH_MERGE_FILE, FLASH_DEFAULT_FILE, FLASH_FALLBACK_FILE):
+        if name in available:
+            return name
+    return next((n for n in available if "ref2va" in n.lower()), FLASH_DEFAULT_FILE)
+
+
+def check_flash_file_supported(pack, name):
+    if str(name or "").lower().endswith(".safetensors") and not hasattr(pack, "load_hyperflow"):
+        raise RuntimeError(f"hyperflow_flash_file {name} is a safetensors build, which needs ComfyUI-HyperFlow-Flash >= 1.1.0 "
+                           "(the installed pack only loads GGUF). Update the node pack and restart ComfyUI.")
+
+
+def load_flash_model(pack, name):
+    check_flash_file_supported(pack, name)
+    if hasattr(pack, "load_hyperflow"):
+        return pack.load_hyperflow(pack.model_path(name), "auto")
+    return pack.load_hyperflow_gguf(pack.gguf_path(name), "auto")
+
+
+def resolve_flash_file(name, available):
+    """The extender always renders Ref2VA, so a Flash file must be the ref2va build. A fl2va pick is swapped for its
+    ref2va sibling (same quant and extension) when that is installed, otherwise it is an error. Returns (file, note or None)."""
+    available = list(available or [])
+    name = str(name or "") or default_flash_file(available)
+    if "fl2va" in name.lower():
+        sibling = name.replace("fl2va", "ref2va").replace("FL2VA", "REF2VA")
+        if sibling in available:
+            return sibling, f"{name} is the fl2va build but the extender renders Ref2VA; using {sibling}"
+        raise ValueError(f"hyperflow_flash_file {name} is the fl2va build and the extender renders Ref2VA; "
+                         f"install {sibling} in diffusion_models and select it.")
+    if available and name not in available:
+        raise ValueError(f"hyperflow_flash_file {name} not found; available: {available}")
+    return name, None
+
+
+def check_flash_steps(steps):
+    try:
+        steps = int(steps)
+    except (TypeError, ValueError):
+        steps = 6
+    if steps not in FLASH_STEPS:
+        raise ValueError(f"hyperflow_flash_steps must be one of {list(FLASH_STEPS)}, got {steps}")
+    return steps
+
+
+def warn_pikafold_without_lora(flash_file, lora):
+    if "pikafold" in str(flash_file).lower() and (not lora or lora == "none"):
+        _LOG.warning("HyperFlow Flash: %s is a pikafold checkpoint and needs its companion `_for_flash` LoRA "
+                     "(set hyperflow_flash_lora, e.g. h3\\pika_h3_flex_ref2va_for_flash.safetensors at 1.0); "
+                     "without it pass 1 is not the Pika x Flash merge", flash_file)
+
+
+def apply_flash_lora(model, lora, strength):
+    """Model-only LoRA on the Flash pass-1 ModelPatcher; returns the patched clone (the cached Flash patcher is untouched)."""
+    import comfy.sd
+    import folder_paths
+    lora_sd = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", lora), safe_load=True)
+    patched = comfy.sd.load_lora_for_models(model, None, lora_sd, float(strength), 0)[0]
+    count = len(getattr(patched, "patches", {}) or {})
+    _LOG.info("HyperFlow Flash: applied LoRA %s at strength %s to the pass-1 model (%d patched keys)", lora, strength, count)
+    return patched
+
+
+def flash_pack_module():
+    """The ComfyUI-HyperFlow-Flash module (loader, schedule and path helpers), found through its node class; None when
+    the pack is not installed. v1.1.0+ registers HyperFlowLoader, v1.0.0 only HyperFlowGGUFLoader."""
+    mappings = nodes.NODE_CLASS_MAPPINGS
+    cls = mappings.get("HyperFlowLoader") or mappings.get("HyperFlowGGUFLoader")
+    return sys.modules[cls.__module__] if cls is not None else None
+
+
+def _flash_pack():
+    pack = flash_pack_module()
+    if pack is None:
+        raise RuntimeError("HyperFlow Flash needs the ComfyUI-HyperFlow-Flash node pack "
+                           "(HyperFlowLoader or HyperFlowGGUFLoader), and ComfyUI-GGUF for GGUF builds, in custom_nodes. "
+                           "git clone https://github.com/Video-Rebirth/ComfyUI-HyperFlow-Flash, then restart ComfyUI.")
+    return pack
+
+
 def pass_sampler_name(turbo_mode, sampler_name):
     """HyperFlow was distilled for plain Euler; only Turbo LoRA mode uses the user's sampler."""
     return sampler_name if turbo_mode else "euler"
@@ -152,6 +281,50 @@ def hyperflow_tail_sigmas(grid, denoise):
     steps = len(grid) - 1
     tail = max(1, int(round(steps * float(denoise))))
     return grid[-(tail + 1):]
+
+
+def parse_handoff_step(value):
+    """Combo label ("3 \u00b7 Pika to 0.92") -> its leading integer; an unparseable value is the default."""
+    m = re.match(r"\s*(\d+)", str(value))
+    return int(m.group(1)) if m else HANDOFF_STEP_DEFAULT
+
+
+def clamp_handoff_step(step, nfe):
+    """Hand-off step k: Pika runs steps 1..k of its nfe-step schedule, so k is 1..nfe-1."""
+    k = max(1, min(int(step), int(nfe) - 1))
+    if k != int(step):
+        _LOG.info("Pika -> Flash hand-off: handoff_step %s clamped to %d (pdd_nfe %d)", step, k, int(nfe))
+    return k
+
+
+def split_handoff_sigmas(pika_sigmas, k, flash_grid):
+    """(pika_segment, flash_segment, sigma). Pika samples sigmas[0..k]; Flash continues from sigma = sigmas[k] on its own
+    grid: [sigma] + the grid points below sigma (the grid ends with 0)."""
+    pika = [float(x) for x in pika_sigmas]
+    sigma = pika[k]
+    flash = [sigma] + [float(g) for g in flash_grid if float(g) < sigma - 1e-6]
+    return pika[:k + 1], flash, sigma
+
+
+def is_cfg_accel_mode(accel_mode):
+    return str(accel_mode) in (CFG_ACCEL_MODE, CFG_HANDOFF_ACCEL_MODE)
+
+
+def clamp_cfg_handoff_steps(k, steps):
+    """CFG steps that run before Pika takes over: 1..steps-1 of the cfg_steps schedule."""
+    return max(1, min(int(k), int(steps) - 1))
+
+
+def cfg_pass1_settings(accel_mode, pass1_cfg, cfg_steps, negative_prompt, cfg_handoff_steps):
+    """Pass-1 fingerprint entry of the undistilled modes (None in every other mode, so their caches keep their fingerprint).
+    Everything that changes what the base model samples is in it: the guidance, the schedule length, the negative text and,
+    for the hand-off, where Pika takes over."""
+    if not is_cfg_accel_mode(accel_mode):
+        return None
+    entry = [float(pass1_cfg), int(cfg_steps), str(negative_prompt or "")]
+    if str(accel_mode) == CFG_HANDOFF_ACCEL_MODE:
+        entry.append(int(cfg_handoff_steps))
+    return entry
 
 
 def capture_x0_callback(base, store):
@@ -264,7 +437,7 @@ class MasterEngine:
         shift_audio=3.0,
         attention_backend="comfy kitchen attention",
         smart_offload=True,
-        accel_mode="HyperFlow 8-step",
+        accel_mode="Turbo LoRA",
         turbo_lora="none",
         turbo_lora_strength=1.0,
         sampler_name="res_multistep",
@@ -286,11 +459,43 @@ class MasterEngine:
         sparse_dense_blocks="auto",
         sparse_sink="auto",
         pass2_sla_sparsity=0.0,
+        hyperflow_flash_file=FLASH_DEFAULT_FILE,
+        hyperflow_flash_steps=6,
+        hyperflow_flash_lora="none",
+        hyperflow_flash_lora_strength=1.0,
+        handoff_step=HANDOFF_STEP_DEFAULT,
+        pass1_cfg=PASS1_CFG_DEFAULT,
+        cfg_steps=CFG_STEPS_DEFAULT,
+        negative_prompt="",
+        cfg_handoff_steps=CFG_HANDOFF_STEPS_DEFAULT,
     ):
         self.raw_model = model
         self.accel_mode = str(accel_mode)
-        self.turbo_mode = self.accel_mode.lower().startswith("turbo")
-        self.hyperflow_mode = not self.turbo_mode
+        self.handoff_mode = self.accel_mode == HANDOFF_ACCEL_MODE
+        self.cfg_mode = self.accel_mode == CFG_ACCEL_MODE
+        self.cfg_handoff_mode = self.accel_mode == CFG_HANDOFF_ACCEL_MODE
+        self.pass1_cfg = float(pass1_cfg if pass1_cfg is not None else PASS1_CFG_DEFAULT)
+        self.cfg_steps = max(2, int(cfg_steps or CFG_STEPS_DEFAULT))
+        self.negative_prompt = str(negative_prompt or "")
+        self.cfg_handoff_steps = clamp_cfg_handoff_steps(cfg_handoff_steps or CFG_HANDOFF_STEPS_DEFAULT, self.cfg_steps)
+        # CFG 1.0 is "no guidance": the plain positive-only path, no negative encode and no second forward pass.
+        self.cfg_active = (self.cfg_mode or self.cfg_handoff_mode) and self.pass1_cfg > 1.0 + 1e-6
+        self.cfg_model = None
+        self.handoff_step = int(handoff_step or HANDOFF_STEP_DEFAULT)
+        self.flash_grid = None
+        # Hand-off pass 1 is Pika (Turbo LoRA) up to the hand-off step, so everything keyed on turbo (sampler, pass-2 tail) applies.
+        # The undistilled modes count as turbo for everything after pass 1: pass 2 keeps its turbo-keyed schedule
+        # (pdd_nfe steps, round(steps x denoise) tail) and the user's sampler.
+        self.turbo_mode = (self.accel_mode.lower().startswith("turbo") or self.handoff_mode
+                           or self.cfg_mode or self.cfg_handoff_mode)
+        self.flash_mode = self.accel_mode == FLASH_ACCEL_MODE
+        self.hyperflow_mode = self.accel_mode == HYPERFLOW_ACCEL_MODE
+        self.flash_file = str(hyperflow_flash_file or FLASH_DEFAULT_FILE)
+        self.flash_steps = int(hyperflow_flash_steps or 6)
+        self.flash_lora = hyperflow_flash_lora if hyperflow_flash_lora and hyperflow_flash_lora != "none" else None
+        self.flash_lora_strength = float(hyperflow_flash_lora_strength if hyperflow_flash_lora_strength is not None else 1.0)
+        self.flash_model = None
+        self.flash_raw = None
         self.hyperflow_file = str(hyperflow_file)
         self.hyperflow_curve_refit = bool(hyperflow_curve_refit)
         self.hyperflow_strength = float(hyperflow_strength)
@@ -332,47 +537,152 @@ class MasterEngine:
         self.dual_active = False
         self.dual_split_step = 2
         self.pass1_early_stop = False
+        self.pass1_steps = 0
+        self.time_gate = None
 
     def initialize_model(self):
         """Prepare base model with SigmaShift, the acceleration (Turbo LoRA or HyperFlow) and the attention backend."""
         if self.prepared_model is not None:
             return self.prepared_model, self.pass1_sigmas
 
-        if self.turbo_mode:
+        if self.cfg_mode:
+            accel_desc = f"Base + CFG {self.pass1_cfg:g}, {self.cfg_steps} steps, no turbo LoRA"
+        elif self.cfg_handoff_mode:
+            accel_desc = (f"CFG {self.pass1_cfg:g} for {self.cfg_handoff_steps}/{self.cfg_steps} steps, then Turbo LoRA "
+                          f"{self.turbo_lora or 'none'} ({self.turbo_steps} steps)")
+        elif self.turbo_mode:
             accel_desc = f"Turbo LoRA: {self.turbo_lora or 'none'} ({self.turbo_steps} steps)"
+        elif self.flash_mode:
+            accel_desc = f"HyperFlow Flash (GGUF): {self.flash_file}, {self.flash_steps} steps"
         else:
             accel_desc = f"HyperFlow 8-step: {self.hyperflow_file}"
         _LOG.info(f"Initializing Master Engine: Shift ({self.shift_video}, {self.shift_audio}), {accel_desc}")
 
         # 1. Apply SigmaShift
-        try:
-            res_shift = MiniMaxH3SigmaShift.execute(
-                self.raw_model,
-                shift_video=self.shift_video,
-                shift_audio=self.shift_audio,
-            )
-            shifted_model = res_shift[0] if hasattr(res_shift, "__getitem__") else getattr(res_shift, "result", [self.raw_model])[0]
-        except Exception as e:
-            _LOG.warning(f"Error applying MiniMaxH3SigmaShift: {e}")
-            shifted_model = self.raw_model
-
+        shifted_model = self._apply_sigma_shift(self.raw_model)
         self.shifted_model = shifted_model
 
-        # 2. Acceleration: a plain turbo / lightning LoRA, or HyperFlow
-        if self.turbo_mode:
+        # 2. Acceleration: a plain turbo / lightning LoRA, or HyperFlow (legacy 8-step, Flash)
+        if self.cfg_mode:
+            accelerated, sigmas_p1 = self._prepare_cfg_base(shifted_model)
+        elif self.turbo_mode:
             accelerated, sigmas_p1 = self._prepare_turbo_model(shifted_model)
+        elif self.flash_mode:
+            accelerated, sigmas_p1 = self._prepare_flash_base(shifted_model)
         else:
             accelerated, sigmas_p1 = self._prepare_hyperflow_model(shifted_model)
         self.accel_model = accelerated
-        accelerated = self._finish_model(accelerated)
+        accelerated = self._finish_model(accelerated, tst=True)
 
         self.prepared_model = accelerated
         self.pass1_sigmas = sigmas_p1
         return self.prepared_model, self.pass1_sigmas
 
-    def _finish_model(self, model, sparse=True, sparsity=None):
-        """Dense attention backend, then optional block-sparse attention on top
-        (SLA wraps the dense backend as its fall-through, so order matters)."""
+    def _apply_sigma_shift(self, model):
+        try:
+            res_shift = MiniMaxH3SigmaShift.execute(
+                model,
+                shift_video=self.shift_video,
+                shift_audio=self.shift_audio,
+            )
+            return res_shift[0] if hasattr(res_shift, "__getitem__") else getattr(res_shift, "result", [model])[0]
+        except Exception as e:
+            _LOG.warning(f"Error applying MiniMaxH3SigmaShift: {e}")
+            return model
+
+    def _prepare_cfg_base(self, model):
+        """Undistilled pass 1: the base model (SigmaShift only, no turbo LoRA) on a regular cfg_steps schedule."""
+        sigmas = self._basic_sigmas(model, self.cfg_steps, 1.0)
+        _LOG.info("Base + CFG: %d steps, %s / %s, guidance %g%s", self.cfg_steps, self.sampler_name, self.scheduler_name,
+                  self.pass1_cfg, "" if self.cfg_active else " (no guidance: positive-only path)")
+        return model, sigmas
+
+    def initialize_cfg_model(self):
+        """Hand-off mode: the un-LoRA'd base model for the CFG segment (the Pika model is the engine's pass-1 model)."""
+        if self.cfg_model is None:
+            self.initialize_model()
+            self.cfg_model = self._finish_model(self.shifted_model, tst=True)
+        return self.cfg_model
+
+    def _prepare_flash_base(self, model):
+        """Flash mode: the base model (SigmaShift) is the pass-2 / audio-refine model; pass 1 is the Flash transformer,
+        loaded lazily by initialize_flash_model. Only its sigmas are needed here (pass-2 tails and cached clips)."""
+        self.flash_steps = check_flash_steps(self.flash_steps)
+        self.turbo_steps = "8"
+        pack = _flash_pack()
+        _LOG.info("HyperFlow Flash: pass 1 runs the Flash transformer (%s, %d steps, euler, cfg 1); the base "
+                  "model input and any LoRAs stacked on it are NOT used for pass 1, only for pass 2 / audio refine",
+                  self.flash_file, self.flash_steps)
+        if self.shift_video != 12.0:
+            _LOG.warning("HyperFlow Flash: shift_video is %.2f but the Flash schedule is built for 12.0", self.shift_video)
+        return model, pack.step_sigmas(self.flash_steps).clone().cpu()
+
+    def initialize_flash_model(self):
+        """Pass-1 model in Flash mode: the GGUF / INT8 transformer from the pack's loader (cached across clips and jobs), with
+        SigmaShift, the dense attention backend and sparse attention applied like for the base model."""
+        if self.flash_model is not None:
+            return self.flash_model
+        self.initialize_model()
+        pack = _flash_pack()
+        steps = check_flash_steps(self.flash_steps)
+        check_flash_file_supported(pack, self.flash_file)
+        try:
+            available = flash_file_list(pack, pack.gguf_files())
+        except Exception:
+            available = []
+        name, note = resolve_flash_file(self.flash_file, available)
+        if note:
+            _LOG.warning("HyperFlow Flash: %s", note)
+        key = name
+        patcher = _FLASH_CACHE.get(key)
+        if patcher is None:
+            _FLASH_CACHE.clear()
+            _LOG.info("HyperFlow Flash: loading %s", name)
+            patcher = load_flash_model(pack, name)
+            _FLASH_CACHE[key] = patcher
+        else:
+            _LOG.info("HyperFlow Flash: %s already loaded, reusing", name)
+        self.flash_raw = patcher
+        warn_pikafold_without_lora(name, self.flash_lora)
+        if self.flash_lora:
+            patcher = apply_flash_lora(patcher, self.flash_lora, self.flash_lora_strength)
+        dm = patcher.model.diffusion_model
+        schedule = getattr(dm, "hyperflow_sigmas", None)
+        sigmas = schedule.clone().cpu() if (steps == 6 and schedule is not None) else pack.step_sigmas(steps).clone().cpu()
+        self.flash_grid = sigmas
+        if not self.handoff_mode:
+            self.pass1_sigmas = sigmas
+        if self.sla_enabled:
+            _LOG.info("HyperFlow Flash: sparse attention ON for pass 1 (%s); the Flash blocks keep the attention module "
+                      "calls (qkv_proj / out_proj are plain modules), so it runs, but it is not validated on Flash "
+                      "weights. Turn sla_enabled off for a dense reference.", self.sparse_method)
+        _LOG.info("HyperFlow Flash: grid %s, sampler euler, cfg 1; feed-forward chunking is skipped for this pass "
+                  "(it assumes the dense fused fc1/fc2)", [round(float(x), 4) for x in sigmas])
+        self.flash_model = self._finish_model(self._apply_sigma_shift(patcher), tst=True)
+        return self.flash_model
+
+    def _unload_flash(self):
+        """Evict ONLY the Flash transformer from the GPU, so it and the base model are never resident together."""
+        flash = self.flash_raw
+        if flash is None:
+            return
+        mm = comfy.model_management
+        try:
+            def is_flash(lm):
+                m = getattr(lm, "model", None)
+                return m is not None and (m is flash or m.is_clone(flash))
+            keep = [lm for lm in mm.current_loaded_models if not is_flash(lm)]
+            before = mm.get_free_memory(mm.get_torch_device())
+            mm.free_memory(1e30, mm.get_torch_device(), keep_loaded=keep)
+            mm.soft_empty_cache(force=True)
+            _LOG.info("HyperFlow Flash: transformer offloaded before pass 2: free %.1f -> %.1f GB",
+                      before / 1024 ** 3, mm.get_free_memory(mm.get_torch_device()) / 1024 ** 3)
+        except Exception as exc:
+            _LOG.warning("HyperFlow Flash: could not offload the transformer explicitly (%s); pass 2's VRAM reclaim evicts it", exc)
+
+    def _finish_model(self, model, sparse=True, sparsity=None, tst=False):
+        """Dense attention backend, then TST (pass-1 models only, when on), then optional block-sparse
+        attention on top (SLA wraps the override below it as its fall-through, so order matters)."""
         attention_name = {
             "comfy kitchen attention": "comfy_kitchen_int8",
             "sage attention 2.2": "sage",
@@ -389,7 +699,40 @@ class MasterEngine:
         model = model.clone()
         model.set_model_optimized_attention(attention_function)
         _LOG.info("Sampling attention: %s", self.attention_backend)
+        if tst:
+            model = self._apply_tst(model)
         return self._apply_sla(model, sparsity) if sparse else model
+
+    # ------------------------------------------------------------------
+    # YoYo H3 Temporal State Transport (ComfyUI-YoYo-H3-TST), pass 1 only
+    # ------------------------------------------------------------------
+    def configure_tst(self, enabled=True, tau=0.2):
+        """TST (arXiv:2609.08505): per-head spectral-tension diagnosis of the frame-level attention operator,
+        corrected by a scheduled query temperature (strong in early steps, ~0 at the last). Applied to the pass-1
+        models only: pass 2 is a low-noise tail, where the paper's step schedule is already ~0, but the node would
+        see it as a 1-step schedule and run it at full strength."""
+        self.tst_tau = float(tau if tau is not None else 0.2)
+        self.tst_enabled = bool(enabled) and self.tst_tau > 0.0
+
+    def _tst_active(self):
+        return bool(getattr(self, "tst_enabled", False))
+
+    def _apply_tst(self, model):
+        if not self._tst_active():
+            return model
+        node = nodes.NODE_CLASS_MAPPINGS.get("YoYo_H3TemporalStateTransport")
+        if node is None:
+            _LOG.warning("TST is on but the ComfyUI-YoYo-H3-TST node is not installed; continuing without it")
+            return model
+        try:
+            out = node().patch(model, self.tst_tau, True)[0]
+        except Exception as exc:
+            _LOG.warning("TST could not be applied (%s); continuing without it", exc)
+            return model
+        _LOG.info("TST (YoYo H3 Temporal State Transport): tau %.2f on pass 1%s", self.tst_tau,
+                  "; with SLA on it acts on the dense steps only (core's sparse H3 block path bypasses attention "
+                  "overrides)" if self.sla_enabled else "")
+        return out
 
     # ------------------------------------------------------------------
     # Pass-2 (refine) LoRA: a different LoRA for the high-res tail only
@@ -402,6 +745,8 @@ class MasterEngine:
         self.pass2_lora = lora if lora and lora != "none" else None
         self.pass2_lora_strength = float(strength)
         self.pass2_lora_mode = "replace" if str(mode).lower().startswith("replace") else "stack"
+        if self.flash_mode and self.pass2_lora_mode != "replace":
+            self.pass2_lora_mode = "replace"
         if self.hyperflow_mode and self.pass2_lora and self.pass2_lora_mode != "replace":
             _LOG.info("HyperFlow: pass-2 LoRA forces 'replace' mode (pass 2 runs on the SigmaShift model + this "
                       "LoRA, without HyperFlow, so HyperFlow never sees a non-trained sigma tail)")
@@ -419,8 +764,8 @@ class MasterEngine:
         self.dual_split_step = int(split_step)
         if not enabled:
             return
-        if self.turbo_mode:
-            _LOG.warning("Dual sampling needs HyperFlow 8-step; Turbo LoRA mode runs the normal two passes")
+        if not self.hyperflow_mode:
+            _LOG.warning("Dual sampling needs HyperFlow 8-step; %s mode runs the normal two passes", self.accel_mode)
             return
         if self.pass2_lora:
             _LOG.warning("Dual sampling: pass 2 runs the HyperFlow grid tail without a refine LoRA; ignoring pass-2 LoRA %s",
@@ -431,6 +776,19 @@ class MasterEngine:
         self.dual_active = True
         self.pass1_early_stop = bool(early_stop)
 
+    def configure_time_gate(self, cfg=None):
+        """cfg: parsed time_gate_json (time_gate_lora.parse_time_gate) or None = off."""
+        self.time_gate = cfg
+
+    def _time_gate_scope(self, model, clip_index, trim_frames):
+        """Pass-1 sampling scope of the time-gated LoRA: hooks on the diffusion model, removed on exit (also on an exception)."""
+        if not self.time_gate:
+            return contextlib.nullcontext()
+        if self.handoff_mode or self.cfg_handoff_mode:
+            _LOG.warning("Clip %d: time_gate_json is not applied in the hand-off modes (the second segment runs another model)", clip_index + 1)
+            return contextlib.nullcontext()
+        return time_gate_lora.scope(model, self.time_gate, clip_index, trim_frames)
+
     def configure_pass1_steps(self, steps=0):
         """Opt-in: stop HyperFlow's pass 1 after `steps` of its 8 steps and hand the model's clean x0 estimate to the
         normal upscale + pass-2 refine. 0 (the default) changes nothing. Call after configure_dual_sampling."""
@@ -438,8 +796,9 @@ class MasterEngine:
         steps = int(steps or 0)
         if steps <= 0:
             return
-        if self.turbo_mode:
-            _LOG.warning("pass1_steps=%d ignored: it needs HyperFlow 8-step, Turbo LoRA mode runs the full pass 1", steps)
+        if not self.hyperflow_mode:
+            _LOG.warning("pass1_steps=%d ignored: it needs HyperFlow 8-step, %s mode runs the full pass 1", steps,
+                         self.accel_mode)
             return
         if self.dual_active:
             _LOG.warning("pass1_steps=%d ignored: dual sampling sets the pass-1 length (dual_split_step)", steps)
@@ -540,7 +899,7 @@ class MasterEngine:
         prepared, _ = self.initialize_model()
         p2_sparsity = self._pass2_sla_override()
         if not self._pass2_lora_active():
-            if p2_sparsity is None:
+            if p2_sparsity is None and not self._tst_active():
                 return prepared
             if self.pass2_sla_model is None:
                 self.pass2_sla_model = self._finish_model(self.accel_model, sparsity=p2_sparsity)
@@ -622,8 +981,10 @@ class MasterEngine:
         schedule is never a BasicScheduler one, and turbo_steps does not apply."""
         apply_cls = nodes.NODE_CLASS_MAPPINGS.get("ApplyHyperFlowH3")
         if apply_cls is None:
-            raise RuntimeError("HyperFlow 8-step needs the ComfyUI-HyperFlow-H3 node pack "
-                               "(ApplyHyperFlowH3) in custom_nodes.")
+            raise RuntimeError("This workflow uses the legacy HyperFlow 8-step engine (retired 2026-11-17), which needs the "
+                               "ComfyUI-HyperFlow-H3 node pack (ApplyHyperFlowH3) in custom_nodes, and it is not "
+                               "installed. Reinstall the pack, or switch accel_mode to Turbo LoRA to render the "
+                               "clip with Pika + DMAD.")
         self.turbo_steps = "8"
         dm = model.get_model_object("diffusion_model")
         pruned_base = hasattr(dm, "adaln_t_table") or not hasattr(dm, "time_embedder")
@@ -753,7 +1114,10 @@ class MasterEngine:
                       dual_split_index(self.pass1_sigmas, self.dual_split_step), len(tail) - 1,
                       [round(float(x), 4) for x in tail])
             return tail
-        if self.hyperflow_mode and not self._pass2_lora_active():
+        if self.flash_mode and not self._pass2_lora_active():
+            _LOG.warning("HyperFlow Flash without a pass-2 LoRA: pass 2 runs the tail of the Flash grid on the plain "
+                         "base model, which has no few-step distillation. Pick a pass-2 LoRA (DMAD).")
+        if (self.hyperflow_mode or self.flash_mode) and not self._pass2_lora_active():
             tail = hyperflow_tail_sigmas(self.pass1_sigmas, pass2_denoise)
             _LOG.info("HyperFlow: pass 2 uses the tail of HyperFlow's own grid (%d steps): %s",
                       len(tail) - 1, [round(float(x), 4) for x in tail])
@@ -999,7 +1363,34 @@ class MasterEngine:
             _LOG.exception("x0 debug dump: setup failed, rendering without it")
             return None
 
-    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False):
+    def _sample_handoff(self, pika_model, pika_sigmas, positive, latent, seed):
+        """Pass 1 as an expert hand-off: Pika samples steps 1..k of its schedule (composition, pose, anatomy), then Flash
+        finishes from the noise level Pika stopped at (materials, texture). Flash gets no new noise (_sample_euler add_noise)."""
+        flash_model = self.initialize_flash_model()
+        k = clamp_handoff_step(self.handoff_step, len(pika_sigmas) - 1)
+        pika_seg, flash_seg, sigma = split_handoff_sigmas(pika_sigmas, k, self.flash_grid)
+        _LOG.info("Pika -> Flash hand-off: Pika steps 1..%d (sigma 1.0->%.4f), Flash %d steps (%.4f->0) [%s]",
+                  k, sigma, len(flash_seg) - 1, sigma, self.flash_file)
+        mid = self._sample_euler(pika_model, positive, latent, torch.tensor(pika_seg, dtype=torch.float32), seed)
+        return self._sample_euler(flash_model, positive, mid, torch.tensor(flash_seg, dtype=torch.float32), seed,
+                                  ff_chunk=False, sampler_name="euler", add_noise=False)
+
+    def _sample_cfg_handoff(self, cfg_model, pika_model, pika_grid, positive, negative, latent, seed):
+        """Pass 1 as CFG -> Pika: the undistilled base model with real CFG samples the first k steps of a cfg_steps schedule
+        (composition, pose, the negative prompt's work), then Pika finishes from that noise level on its own grid at CFG 1
+        (the same split and continuation as the Pika -> Flash hand-off, with Pika in the finishing role)."""
+        cfg_sigmas = self._basic_sigmas(cfg_model, self.cfg_steps, 1.0)
+        k = clamp_cfg_handoff_steps(self.cfg_handoff_steps, self.cfg_steps)
+        cfg_seg, pika_seg, sigma = split_handoff_sigmas(cfg_sigmas, k, pika_grid)
+        _LOG.info("CFG -> Pika hand-off: CFG %g steps 1..%d of %d (sigma 1.0->%.4f), Pika %d steps (%.4f->0)",
+                  self.pass1_cfg, k, self.cfg_steps, sigma, len(pika_seg) - 1, sigma)
+        mid = self._sample_euler(cfg_model, positive, latent, torch.tensor(cfg_seg, dtype=torch.float32), seed,
+                                 cfg=self.pass1_cfg, negative=negative)
+        return self._sample_euler(pika_model, positive, mid, torch.tensor(pika_seg, dtype=torch.float32), seed,
+                                  add_noise=False)
+
+    def _sample_euler(self, model, positive, latent_image, sigmas, seed, return_denoised=False, ff_chunk=True,
+                      sampler_name=None, add_noise=True, cfg=1.0, negative=None):
         """Standard Euler sampling using ComfyUI core sampler internals directly.
 
         NOTE: Do NOT place any bare 'import comfy' statements inside this function.
@@ -1010,7 +1401,7 @@ class MasterEngine:
         BasicGuider node, because ComfyUI v3 node calls return NodeOutput wrappers
         that don't expose .model_patcher, making them unusable for direct sampling.
         """
-        from comfy_extras.nodes_custom_sampler import Noise_RandomNoise
+        from comfy_extras.nodes_custom_sampler import Noise_RandomNoise, Noise_EmptyNoise
         try:
             import latent_preview as _lp
             _have_lp = True
@@ -1018,22 +1409,33 @@ class MasterEngine:
             _have_lp = False
 
         # Noise_RandomNoise is a plain class: Noise_RandomNoise(seed)
-        noise_obj = Noise_RandomNoise(seed)
+        # add_noise=False continues a partially denoised latent (the hand-off's Flash segment): zero noise, as the
+        # DisableNoise node does. The previous segment ended at this one's first sigma; the sampler's own
+        # inverse_noise_scaling (end of segment 1) / noise_scaling (start of segment 2) pair round-trips the latent.
+        noise_obj = Noise_RandomNoise(seed) if add_noise else Noise_EmptyNoise()
 
         # Size the feed-forward chunking to this pass's packed token count.
-        model = self._with_ff_chunking(model, self._packed_tokens(latent_image["samples"]))
+        # CFG > 1 with a negative runs the conditional and unconditional branches (a batch of 2): size for both.
+        use_cfg = negative is not None and float(cfg) > 1.0 + 1e-6
+        tokens = self._packed_tokens(latent_image["samples"]) * (2 if use_cfg else 1)
+        if ff_chunk:
+            model = self._with_ff_chunking(model, tokens)
 
         # Build guider directly — bypass ComfyUI v3 node wrapper (NodeOutput issue)
         # MiniMax H3 is a pure flow model: no negative conditioning needed.
         # CFGGuider.set_conds(positive, negative) — pass positive for both.
         # With set_cfg(1.0): output = neg + 1.0*(pos-neg) = pos, so negative is never used.
         guider = comfy.samplers.CFGGuider(model)
-        guider.set_conds(positive, positive)
-        guider.set_cfg(1.0)
+        if use_cfg:
+            guider.set_conds(positive, negative)
+            guider.set_cfg(float(cfg))
+        else:
+            guider.set_conds(positive, positive)
+            guider.set_cfg(1.0)
 
         # Build sampler object: HyperFlow was distilled for plain Euler; turbo mode
         # uses the user's sampler (res_multistep by default).
-        euler_sampler = comfy.samplers.sampler_object(pass_sampler_name(self.turbo_mode, self.sampler_name))
+        euler_sampler = comfy.samplers.sampler_object(sampler_name or pass_sampler_name(self.turbo_mode, self.sampler_name))
 
         # Fix empty latent channels if needed
         latent = dict(latent_image)
@@ -1060,7 +1462,10 @@ class MasterEngine:
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        self._reclaim_vram(guider.model_patcher, latent["samples"])
+        if use_cfg:
+            self._reclaim_vram(guider.model_patcher, tokens=tokens)
+        else:
+            self._reclaim_vram(guider.model_patcher, latent["samples"])
 
         samples = guider.sample(
             noise_obj.generate_noise(latent),
@@ -1174,6 +1579,7 @@ class MasterEngine:
         cached_pass1: dict = None,
         cached_trim: int = 0,
         p1_text_size: tuple = None,
+        memory_frame: torch.Tensor = None,
     ):
         """Execute the complete 2-Stage 2-Pass Pipeline for a single clip.
 
@@ -1195,6 +1601,22 @@ class MasterEngine:
         w1, h1 = pass1_res
         w2, h2 = pass2_res
         ref_images = dict(ref_images or {})
+
+        # Chain memory: the previous clip's last frame that shows the people, one free picture slot, labelled in the prompt.
+        # Every later encode below uses this prompt (the CFG negative keeps its own text).
+        if memory_frame is not None:
+            if len(ref_images) >= 9:
+                _LOG.warning("Clip %d: chain memory skipped, all nine picture slots are in use", clip_index + 1)
+            else:
+                for index in range(9):
+                    key = f"ref_image_{index}"
+                    if key not in ref_images:
+                        ref_images[key] = memory_frame
+                        break
+                picture_number = list(ref_images).index(key) + 1
+                subject_number = chain_memory.next_subject_number(prompt)
+                prompt = chain_memory.append_memory_text(prompt, picture_number)
+                _LOG.info("Clip %d: chain memory is <Picture %d>, <Subject %d>", clip_index + 1, picture_number, subject_number)
 
         # Explicit pictures keep their numbered slots; continuity uses a free slot.
         if last_frame_guide is not None:
@@ -1265,6 +1687,31 @@ class MasterEngine:
             pos_p1 = self._bridge(_safe_get_output(out_p1, 0, "positive"), "pass 1")
             latent_p1 = _safe_get_output(out_p1, 1, "latent")
 
+        # Negative branch of the undistilled modes. It is the same encode as the positive (same reference pictures / videos /
+        # audio, same size) with the negative text as the prompt, so both branches have the same packed layout (H3's reference
+        # latents ride in the sequence, and a batched CFG forward needs equal lengths) and CFG amplifies only the text
+        # difference, not the references. Not bridged: the semantic bridge is tuned to a real prompt.
+        neg_p1 = None
+        if not cached and self.cfg_active:
+            out_neg = MiniMaxH3ReferenceToVideo.execute(
+                clip=self.clip,
+                vae=self.vae,
+                audio_vae=self.audio_vae,
+                prompt=self.negative_prompt,
+                width=w1,
+                height=h1,
+                length=frame_count,
+                ref_image_size="match",
+                ref_images=ref_images,
+                ref_videos=ref_videos or None,
+                ref_video_audios=ref_video_audios or None,
+                ref_audios=ref_audios or None,
+            )
+            neg_p1 = _safe_get_output(out_neg, 0, "positive")
+            del out_neg
+            _LOG.info("Clip %d: CFG %g with %s negative prompt (same references, %dx%d)", clip_index + 1, self.pass1_cfg,
+                      "a" if self.negative_prompt.strip() else "an empty", w1, h1)
+
         # If extending (clip_index > 0) and previous latent available: attach motion context
         self.last_trim_frames = 0
         self.last_draft = None
@@ -1277,6 +1724,15 @@ class MasterEngine:
                 str(context_length),
                 int(audio_context_length),
             )
+            if neg_p1 is not None:
+                # Same continuation guides on the negative so the two branches keep the same layout.
+                neg_p1 = self.motion_ram.apply(
+                    neg_p1,
+                    latent_p1,
+                    previous_draft,
+                    str(context_length),
+                    int(audio_context_length),
+                )[0]
 
         # Pass 2 conditioning is encoded NOW, while the text encoder is still
         # resident, instead of between the passes. It only depends on the
@@ -1320,6 +1776,9 @@ class MasterEngine:
         if cached:
             sampled_p1 = {"samples": cached_pass1["samples"]}
         else:
+            if self.flash_mode:
+                model = self.initialize_flash_model()
+                sigmas_p1 = self.pass1_sigmas
             # Sample Pass 1 with the pass-1 sigmas
             early_stop = self.dual_active and self.pass1_early_stop and pass2_enabled
             if (not early_stop and self.pass1_steps > 0 and not self.dual_active and pass2_enabled
@@ -1334,14 +1793,26 @@ class MasterEngine:
                 _LOG.info("Clip %d: dual sampling early stop, pass 1 runs grid[:%d] (%d steps): %s",
                           clip_index + 1, len(sigmas_p1), len(sigmas_p1) - 1,
                           [round(float(x), 4) for x in sigmas_p1])
-            sampled_p1 = self._sample_euler(
-                model=model,
-                positive=pos_p1,
-                latent_image=latent_p1,
-                sigmas=sigmas_p1,
-                seed=seed,
-                return_denoised=early_stop,
-            )
+            with self._time_gate_scope(model, clip_index, trim_p1):
+                if self.handoff_mode:
+                    sampled_p1 = self._sample_handoff(model, sigmas_p1, pos_p1, latent_p1, seed)
+                elif self.cfg_handoff_mode:
+                    sampled_p1 = self._sample_cfg_handoff(self.initialize_cfg_model(), model, sigmas_p1, pos_p1, neg_p1,
+                                                          latent_p1, seed)
+                else:
+                    sampled_p1 = self._sample_euler(
+                        model=model,
+                        positive=pos_p1,
+                        latent_image=latent_p1,
+                        sigmas=sigmas_p1,
+                        seed=seed,
+                        return_denoised=early_stop,
+                        ff_chunk=not self.flash_mode,
+                        cfg=self.pass1_cfg if self.cfg_mode else 1.0,
+                        negative=neg_p1,
+                    )
+            if (self.flash_mode or self.handoff_mode) and pass2_enabled:
+                self._unload_flash()
 
         if not pass2_enabled:
             self.last_draft = None if cached else sampled_p1

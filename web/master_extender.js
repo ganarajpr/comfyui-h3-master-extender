@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { dropCaptionModelValue, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, dualWidgetValue, pass1StepsValue, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, pass2RowBinding } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -55,9 +55,7 @@ async function copyText(text) {
 }
 
 // Copy all clips / Paste clips: one Extender's whole clip list moves to another in one go.
-// The payload goes to the system clipboard AND localStorage: ComfyUI on the box is served over plain http,
-// where navigator.clipboard.readText() does not exist, so paste reads localStorage first-hand there.
-const CLIPS_CLIPBOARD_KEY = "minimax_h3_master.clips_clipboard";
+// Copy all puts the list on the clipboard; Paste clips takes it from a text box you paste into (askForClipsText).
 const CLIPS_CLIPBOARD_FORMAT = "minimax-h3-master-clips";
 
 function packClips(clips) {
@@ -67,6 +65,8 @@ function packClips(clips) {
 // Accepts our envelope, a bare clips array (a clips_json value), or an object with a clips array. Returns null otherwise.
 function unpackClips(text) {
     if (typeof text !== "string" || !text.trim()) return null;
+    // Tolerate a BOM and a ```json fence around text copied from a chat or an editor.
+    text = text.replace(/^﻿/, "").trim().replace(/^```[a-zA-Z]*\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
     let data;
     try { data = JSON.parse(text); } catch (e) { return null; }
     const clips = Array.isArray(data) ? data : (data && Array.isArray(data.clips) ? data.clips : null);
@@ -74,18 +74,59 @@ function unpackClips(text) {
     return clips;
 }
 
-async function readClipsClipboard() {
-    if (navigator.clipboard?.readText && window.isSecureContext) {
-        try {
-            const clips = unpackClips(await navigator.clipboard.readText());
-            if (clips) return clips;
-        } catch (e) { /* permission denied: fall through */ }
-    }
-    try {
-        const clips = unpackClips(localStorage.getItem(CLIPS_CLIPBOARD_KEY));
-        if (clips) return clips;
-    } catch (e) { /* storage blocked */ }
-    return null;
+// Paste clips opens its own text box and reads ONLY what is pasted into it. It never reads the system clipboard
+// (needs https or localhost, and a permission) or localStorage (that held a stale list from this browser's last
+// Copy all and got pasted instead of text copied on another machine, e.g. on the Mac over Parsec).
+// Resolves to the clips, or null when cancelled.
+function askForClipsText() {
+    return new Promise((resolve) => {
+        const overlay = document.createElement("div");
+        overlay.style.cssText = "position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center;";
+        const box = document.createElement("div");
+        box.style.cssText = "background: #1e1e2a; border: 1px solid #3c5480; border-radius: 8px; padding: 14px; width: min(760px, 92vw); display: flex; flex-direction: column; gap: 8px; font: 12px sans-serif; color: #ddd;";
+        const title = document.createElement("div");
+        title.textContent = "Paste clips: paste the clips JSON below (Ctrl+V), then Paste. Copy all output, a [ {...}, ... ] clips array, or a clips.json file's contents.";
+        const area = document.createElement("textarea");
+        area.spellcheck = false;
+        area.style.cssText = "width: 100%; height: 50vh; box-sizing: border-box; background: #111118; color: #ddd; border: 1px solid #444; border-radius: 5px; font: 11px monospace; padding: 8px; resize: vertical;";
+        const status = document.createElement("div");
+        status.style.cssText = "min-height: 14px; color: #8fb0e6;";
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+        const btnStyle = "padding: 4px 14px; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px;";
+        const cancel = document.createElement("button");
+        cancel.textContent = "Cancel";
+        cancel.style.cssText = btnStyle + "background: transparent; border: 1px solid #555; color: #ccc;";
+        const ok = document.createElement("button");
+        ok.textContent = "Paste";
+        ok.disabled = true;
+        ok.style.cssText = btnStyle + "background: #3c5480; border: 1px solid #8fb0e6; color: #fff;";
+        row.append(cancel, ok);
+        box.append(title, area, status, row);
+        overlay.appendChild(box);
+        // Keep ComfyUI's canvas shortcuts (Ctrl+V pastes nodes, Delete removes them) out of the text box.
+        for (const type of ["keydown", "keyup", "keypress", "paste", "copy", "cut"]) {
+            overlay.addEventListener(type, (e) => e.stopPropagation());
+        }
+        let clips = null;
+        const check = () => {
+            clips = unpackClips(area.value);
+            ok.disabled = !clips;
+            status.style.color = clips ? "#8fb0e6" : "#f87171";
+            status.textContent = !area.value.trim() ? "" : clips ? `${clips.length} clip${clips.length === 1 ? "" : "s"} ready to paste` : "Not a clip list yet (expected the JSON from Copy all or a clips array)";
+        };
+        area.addEventListener("input", check);
+        const close = (result) => { overlay.remove(); resolve(result); };
+        cancel.onclick = () => close(null);
+        ok.onclick = () => { if (clips) close(clips); };
+        overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(null); });
+        area.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") close(null);
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && clips) close(clips);
+        });
+        document.body.appendChild(overlay);
+        area.focus();
+    });
 }
 
 function escapeHtml(text) {
@@ -229,16 +270,28 @@ const TURBO_ONLY_WIDGETS = ["turbo_lora", "turbo_lora_strength", "turbo_sampler"
 // pdd_file is retired: it keeps its slot in widgets_values (saved workflows) but is never shown.
 const ALWAYS_HIDDEN_WIDGETS = ["pdd_file"];
 const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
-const HYPERFLOW_ONLY_WIDGETS = ["hyperflow_file", "hyperflow_curve_refit", "hyperflow_strength", "hyperflow_lora_mode"];
-const SLA_ONLY_WIDGETS = ["sla_sparsity", "pass2_sla_sparsity"];
-// Dual sampling (appended last, after sparse_sink): HyperFlow only; the split step and early stop only while it is on.
+// Legacy HyperFlow 8-step (retired as a choice 2026-11-17, kept for workflows saved before): its four widgets are shown only in
+// its two modes. dual_sampling only in plain HyperFlow; the split step and early stop only while dual sampling is on;
+// pass1_steps only without dual sampling. Appended after tst_tau, so saved workflows keep their widget order.
+const HYPERFLOW_ONLY_WIDGETS = HYPERFLOW_WIDGETS;
 const DUAL_WIDGET = "dual_sampling";
 const DUAL_DETAIL_WIDGETS = ["dual_split_step", "pass1_early_stop"];
-// pass1_steps (appended after pass1_early_stop): HyperFlow without dual sampling only; 0 = the full 8-step pass 1.
 const PASS1_STEPS_WIDGET = "pass1_steps";
-// The engine combo value that is HyperFlow with dual sampling forced on (the dual_sampling toggle is then redundant).
-const DUAL_MODE = "HyperFlow 8-step \u00b7 dual sampling";
 const isDualMode = (value) => String(value ?? "") === DUAL_MODE;
+// HyperFlow Flash (GGUF) engine: its own two widgets, shown only in that mode.
+const FLASH_MODE = "HyperFlow Flash (GGUF)";
+const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength"];
+const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
+// Pika \u2192 Flash hand-off: Pika (the turbo widgets) runs the first handoff_step steps, Flash (its widgets) the rest.
+const HANDOFF_MODE = "Pika \u2192 Flash hand-off";
+const isHandoffMode = (value) => String(value ?? "") === HANDOFF_MODE;
+// Undistilled pass 1 with real CFG: the base model, no turbo LoRA (Base + CFG), or CFG for the first cfg_handoff_steps then Pika (CFG \u2192 Pika hand-off).
+const CFG_MODE = "Base + CFG (undistilled)";
+const CFG_HANDOFF_MODE = "CFG \u2192 Pika hand-off";
+const isCfgMode = (value) => String(value ?? "") === CFG_MODE;
+const isCfgHandoffMode = (value) => String(value ?? "") === CFG_HANDOFF_MODE;
+const CFG_WIDGETS = ["pass1_cfg", "cfg_steps", "negative_prompt"];
+const SLA_ONLY_WIDGETS = ["sla_sparsity", "pass2_sla_sparsity"];
 // Widgets appended after master_ui-less workflows were saved: a missing/invalid value is put back to the default.
 const AUDIO_REFINE_WIDGETS = ["audio_refine_steps", "audio_refine_denoise", "audio_refine_cache"];
 // auto_clips is appended after rewrite_story; a workflow saved before it carries the empty master_ui value there.
@@ -246,7 +299,7 @@ const AUTO_CLIPS_WIDGETS = ["auto_clips", "planner_refs", "auto_clip_seconds"];
 // story_engine and its E4 settings are appended after auto_clip_seconds, so the same empty master_ui value lands in story_engine.
 // Only the dropdowns are repaired: the two text widgets (e4_language, e4_picture_notes) read an empty value as their default.
 const STORY_ENGINE_WIDGETS = ["story_engine", "e4_score", "e4_decision_budget"];
-const REPAIRED_WIDGETS = [...HYPERFLOW_ONLY_WIDGETS, ...AUDIO_REFINE_WIDGETS, ...AUTO_CLIPS_WIDGETS, ...STORY_ENGINE_WIDGETS];
+const REPAIRED_WIDGETS = [...AUDIO_REFINE_WIDGETS, ...AUTO_CLIPS_WIDGETS, ...STORY_ENGINE_WIDGETS];
 
 function setWidgetVisible(widget, visible) {
     if (!widget) return;
@@ -263,11 +316,9 @@ function setWidgetVisible(widget, visible) {
     }
 }
 
-// Workflows saved before the HyperFlow inputs existed stored the DOM widget master_ui's empty
-// string in the slot that hyperflow_file now occupies, so it loads as "" and the server rejects
-// it (value_not_in_list). Put any missing/invalid HyperFlow value back to the node-definition default.
-// The same happens one slot later for audio_refine_steps in workflows saved before the audio-refine inputs,
-// and for final_decode (the last native widget, just before master_ui) in workflows saved before it existed.
+// Workflows saved before the audio-refine inputs stored the DOM widget master_ui's empty string in the slot
+// audio_refine_steps now occupies, so it loads as "" and the server rejects it (value_not_in_list). Put any
+// missing/invalid value back to the node-definition default. The same goes for final_decode (the last native widget, just before master_ui) in workflows saved before it existed.
 function hyperflowValueOk(widget, value) {
     if (widget.type === "combo" || widget._origType === "combo") {
         const values = comboValues(widget);
@@ -298,13 +349,17 @@ function repairReasoningBudget(node) {
 function repairMergedRewriterModel(node, info) {
     const names = (node.widgets || []).map(w => w.name);
     const values = info?.widgets_values;
-    const afterCaption = dropCaptionModelValue(names, values);
-    const afterSingle = dropSingleTextEncodeValue(names, afterCaption ?? values);
-    const afterAccel = migrateAccelMode(names, afterSingle ?? afterCaption ?? values);
-    const migrated = afterAccel ?? afterSingle ?? afterCaption;
-    if (!migrated) return;
-    info.widgets_values = migrated;
-    migrated.forEach((value, i) => { if (node.widgets[i]) node.widgets[i].value = value; });
+    // The legacy HyperFlow values leave the positional array (the widgets after them re-seat) and come back by name:
+    // those widgets are appended after tst_tau now. info.widgets_values stays the shortened array, which is what
+    // repairTstForOldWorkflow reads (a workflow from before TST loads with it off).
+    const result = migrateSavedValues(names, values);
+    if (!result) return;
+    info.widgets_values = result.values;
+    result.values.forEach((value, i) => { if (node.widgets[i]) node.widgets[i].value = value; });
+    for (const [name, value] of Object.entries(result.legacy)) {
+        const w = node.widgets?.find(x => x.name === name);
+        if (w) w.value = value;
+    }
 }
 
 // sparse_start_percent / sparse_dense_blocks / sparse_sink are the last widgets, after e4_picture_notes; a workflow
@@ -328,13 +383,15 @@ function repairStoryEngine(node) {
     if (w && (w.value === "e4" || w.value === "e4.8")) w.value = "e4.10";
 }
 
-function repairDualWidgets(node) {
-    for (const name of [DUAL_WIDGET, ...DUAL_DETAIL_WIDGETS]) {
+function repairDualWidgets(node, defaults) {
+    for (const name of DUAL_WIDGETS) {
         const w = node.widgets?.find(x => x.name === name);
         if (w) w.value = dualWidgetValue(name, w.value);
     }
-    const steps = node.widgets?.find(x => x.name === PASS1_STEPS_WIDGET);
-    if (steps) steps.value = pass1StepsValue(steps.value);
+    for (const name of HYPERFLOW_WIDGETS) {
+        const w = node.widgets?.find(x => x.name === name);
+        if (w) w.value = hyperflowWidgetValue(name, w.value, defaults?.hyperflow_file ?? comboValues(w)[0] ?? "");
+    }
     const chunkWhen = node.widgets?.find(x => x.name === "pass2_chunk_when");
     if (chunkWhen) chunkWhen.value = pass2ChunkWhenValue(chunkWhen.value);
     const p2Sla = node.widgets?.find(x => x.name === "pass2_sla_sparsity");
@@ -343,10 +400,45 @@ function repairDualWidgets(node) {
     if (p2Sched) p2Sched.value = pass2SchedulerValue(p2Sched.value, p2Sched.options?.values);
     const p2Audio = node.widgets?.find(x => x.name === "pass2_audio");
     if (p2Audio) p2Audio.value = pass2AudioValue(p2Audio.value);
+    const flashFile = node.widgets?.find(x => x.name === "hyperflow_flash_file");
+    if (flashFile) flashFile.value = flashFileValue(flashFile.value, comboValues(flashFile));
+    const flashSteps = node.widgets?.find(x => x.name === "hyperflow_flash_steps");
+    if (flashSteps) flashSteps.value = flashStepsValue(flashSteps.value);
+    const flashLora = node.widgets?.find(x => x.name === "hyperflow_flash_lora");
+    if (flashLora) flashLora.value = flashLoraValue(flashLora.value, comboValues(flashLora));
+    const flashLoraStrength = node.widgets?.find(x => x.name === "hyperflow_flash_lora_strength");
+    if (flashLoraStrength) flashLoraStrength.value = flashLoraStrengthValue(flashLoraStrength.value);
+    const handoffStep = node.widgets?.find(x => x.name === "handoff_step");
+    if (handoffStep) handoffStep.value = handoffStepValue(handoffStep.value);
+    const cfgScale = node.widgets?.find(x => x.name === "pass1_cfg");
+    if (cfgScale) cfgScale.value = pass1CfgValue(cfgScale.value);
+    const cfgSteps = node.widgets?.find(x => x.name === "cfg_steps");
+    if (cfgSteps) cfgSteps.value = cfgStepsValue(cfgSteps.value);
+    const negative = node.widgets?.find(x => x.name === "negative_prompt");
+    if (negative) negative.value = negativePromptValue(negative.value);
+    const cfgHandoff = node.widgets?.find(x => x.name === "cfg_handoff_steps");
+    if (cfgHandoff) cfgHandoff.value = cfgHandoffStepsValue(cfgHandoff.value);
+    // TST (appended after cfg_handoff_steps): a workflow saved before it carries master_ui's "" (or nothing) here. It was
+    // rendered without TST, so it loads with TST OFF and re-renders as it did. Only a new node defaults to on.
+    const tst = node.widgets?.find(x => x.name === "tst_enabled");
+    if (tst && typeof tst.value !== "boolean") tst.value = false;
+    const tstTau = node.widgets?.find(x => x.name === "tst_tau");
+    if (tstTau && (typeof tstTau.value !== "number" || !Number.isFinite(tstTau.value))) tstTau.value = 0.2;
+    // Chain memory (after pass1_steps): a workflow saved before it, or from when it was a toggle, carries a value that is not one of the modes: OFF.
+    const chainMemory = node.widgets?.find(x => x.name === "chain_memory");
+    if (chainMemory && !["off", "picture", "context", "picture + context"].includes(chainMemory.value)) chainMemory.value = "off";
+}
+
+// A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
+// or nothing). It was rendered without TST, so it loads with TST off whatever lands in the slot.
+function repairTstForOldWorkflow(node, info) {
+    const names = (node.widgets || []).map(w => w.name);
+    const tst = node.widgets?.find(x => x.name === "tst_enabled");
+    if (tst && tstOffForSavedValues(names, info?.widgets_values)) tst.value = false;
 }
 
 function repairHyperflowWidgets(node, defaults) {
-    repairDualWidgets(node);
+    repairDualWidgets(node, defaults);
     repairFinalDecode(node);
     repairStoryEngine(node);
     repairReasoningBudget(node);
@@ -370,8 +462,12 @@ function setupModeWidgets(node) {
 
     const apply = () => {
         const mode = String(accel?.value ?? "").toLowerCase();
-        const turbo = mode.startsWith("turbo");
-        const hyperflow = !turbo;
+        const handoff = isHandoffMode(accel?.value);
+        const cfgOnly = isCfgMode(accel?.value);
+        const cfgHandoff = isCfgHandoffMode(accel?.value);
+        const turbo = mode.startsWith("turbo") || handoff || cfgHandoff;
+        const flash = isFlashMode(accel?.value) || handoff;
+        const hyperflow = isHyperflowMode(accel?.value) || mode.startsWith("pdd");
         const slaOn = sla ? !!sla.value : false;
         TURBO_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         HYPERFLOW_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), hyperflow));
@@ -380,6 +476,10 @@ function setupModeWidgets(node) {
         setWidgetVisible(byName(DUAL_WIDGET), hyperflow && !dualMode);
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
+        FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
+        setWidgetVisible(byName("handoff_step"), handoff);
+        CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
+        setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
         TURBO_STEPS_WIDGETS.forEach(n => setWidgetVisible(byName(n), turbo));
         SLA_ONLY_WIDGETS.forEach(n => setWidgetVisible(byName(n), slaOn));
@@ -449,7 +549,7 @@ function comboValues(widget) {
 }
 
 function shortModelName(name) {
-    return String(name || "none").replace(/\.(safetensors|pt|pth|ckpt)$/i, "").replace(/^minimax[_-]?h3[_-]?/i, "");
+    return String(name || "none").replace(/\.(safetensors|pt|pth|ckpt|gguf)$/i, "").replace(/^minimax[_-]?h3[_-]?/i, "");
 }
 
 function hideNativeWidgets(node) {
@@ -602,7 +702,7 @@ app.registerExtension({
         };
 
         const hyperflowDefaults = {};
-        for (const name of REPAIRED_WIDGETS) {
+        for (const name of [...REPAIRED_WIDGETS, "hyperflow_file"]) {
             const spec = nodeData.input?.optional?.[name] ?? nodeData.input?.required?.[name];
             if (spec?.[1]?.default !== undefined) hyperflowDefaults[name] = spec[1].default;
         }
@@ -800,6 +900,13 @@ app.registerExtension({
             const clipsCallback = clipsWidget.callback;
             clipsWidget.callback = function (value) {
                 const result = clipsCallback?.apply(this, arguments);
+                // API-format load (only path that calls this callback; the panel writes clips_json directly): a prompt from before
+                // TST has no tst_enabled, so turn it off here; a newer prompt sets tst_enabled after clips_json and wins.
+                if (!node._tstApiLoadSeen) {
+                    node._tstApiLoadSeen = true;
+                    const tstW = node.widgets?.find(x => x.name === "tst_enabled");
+                    if (tstW) tstW.value = false;
+                }
                 try {
                     const restored = JSON.parse(value || "[]");
                     if (Array.isArray(restored)) {
@@ -819,6 +926,7 @@ app.registerExtension({
                 repairHyperflowWidgets(node, hyperflowDefaults);
                 repairSemanticBridge(node);
                 repairSparseWidgets(node);
+                repairTstForOldWorkflow(node, info);
                 // Older workflows stored the empty master_ui value in this slot.
                 const attentionWidget = node.widgets?.find(w => w.name === "attention_backend");
                 if (attentionWidget && attentionWidget.value === "") {
@@ -877,7 +985,11 @@ app.registerExtension({
                 if (rerender) renderUI();
             };
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
-            const isHyperflow = () => !isTurbo();
+            const isHandoff = () => isHandoffMode(getW("accel_mode", ""));
+            const isFlash = () => isFlashMode(getW("accel_mode", ""));
+            const isCfg = () => isCfgMode(getW("accel_mode", ""));
+            const isCfgHandoff = () => isCfgHandoffMode(getW("accel_mode", ""));
+            const isHyperflow = () => isHyperflowMode(getW("accel_mode", ""));
 
             function bindSelect(name, opts = {}) {
                 const w = W(name);
@@ -920,18 +1032,23 @@ app.registerExtension({
             }
 
             function engineSummary() {
-                const steps = getW("pdd_nfe", "8");
+                const steps = getW("pdd_nfe", "6");
                 const p2 = String(getW("pass2_lora", "none"));
                 const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
-                const dualMode = isDualMode(getW("accel_mode", ""));
-                const dualNote = (dualMode || getW(DUAL_WIDGET, false))
-                    ? ` · dual sampling (pass 2 from step ${getW("dual_split_step", 2)}${dualMode ? ", whole clip" : ""}${getW("pass1_early_stop", false) ? ", pass 1 early stop" : ""})` : "";
-                const p1s = Number(getW(PASS1_STEPS_WIDGET, 0));
-                const p1sNote = (isHyperflow() && !dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
-                if (dualMode) return `HyperFlow · dual sampling · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${dualNote.replace(" · dual sampling", "")}${bridgeNote}`;
-                if (isHyperflow()) return `HyperFlow 8-step · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
+                if (isCfg()) return `Base + CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} · ${getW("cfg_steps", 24)} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
+                if (isCfgHandoff()) return `CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} \u2192 Pika @${getW("cfg_handoff_steps", 8)}/${getW("cfg_steps", 24)} · ${shortModelName(getW("turbo_lora"))} · ${steps} steps${p2note}${bridgeNote}`;
+                if (isHandoff()) return `Pika \u2192 Flash hand-off @${parseInt(getW("handoff_step", 3), 10) || 3} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
+                if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
+                if (isHyperflow()) {
+                    const dualMode = isDualMode(getW("accel_mode", ""));
+                    const dualNote = (dualMode || getW(DUAL_WIDGET, false))
+                        ? ` · dual sampling (pass 2 from step ${getW("dual_split_step", 2)}${dualMode ? ", whole clip" : ""}${getW("pass1_early_stop", false) ? ", pass 1 early stop" : ""})` : "";
+                    const p1s = Number(getW(PASS1_STEPS_WIDGET, 0));
+                    const p1sNote = (!dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
+                    return `HyperFlow 8-step (legacy) · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
+                }
                 return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
             }
             function qualitySummary() {
@@ -1091,32 +1208,75 @@ app.registerExtension({
                     } catch (e) { console.warn("[H3 Master] preset row skipped", e); }
                 }
                 const accelW = W("accel_mode");
-                const accelSel = uiSelect(comboValues(accelW), accelW?.value, (v) => {
+                // The HyperFlow 8-step options are offered only while the node already holds one (a workflow saved before
+                // 2026-11-17): the engine is retired as a choice, so a new pick never lands on it.
+                const accelOptions = comboValues(accelW).filter(v => !isHyperflowMode(v) || isHyperflowMode(accelW?.value));
+                const accelSel = uiSelect(accelOptions, accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
-                    setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") ? "4" : "8", { rerender: false });
+                    setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) || isCfgMode(v) || isCfgHandoffMode(v) ? "6" : "8", { rerender: false });
                     renderUI();
-                });
-                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count. HyperFlow 8-step: Video Rebirth's 8-step LoRA with two-time conditioning. HyperFlow 8-step \u00b7 dual sampling: HyperFlow with pass 2 as the grid tail over the whole clip in one window." }));
+                }, { render: (v) => isHyperflowMode(v) ? `${v} (legacy)` : String(v) });
+                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." + (isHyperflow() ? " HyperFlow 8-step is the retired legacy engine: it is here only so a workflow saved before 2026-11-17 re-renders as saved." : "") }));
                 if (isHyperflow()) {
+                    wrap.appendChild(uiHint("Legacy engine (retired 2026-11-17): this workflow was saved with HyperFlow 8-step and re-renders with it as saved. Switch the engine to Turbo LoRA for Pika + DMAD."));
                     wrap.appendChild(uiRow("hyperflow file", bindSelect("hyperflow_file", { render: shortModelName }),
                         { hint: "Pruned bases (Singularity) need the _pruned build; full bases need the one without. Always the trained 8-step grid with Euler." }));
                     wrap.appendChild(uiRow("curve refit", bindToggle("hyperflow_curve_refit"),
                         { hint: "Pruned base only: restores most of the two-time (t, r) conditioning. Off = LoRA-only." }));
                     if (expert()) wrap.appendChild(uiRow("strength", bindNumber("hyperflow_strength"), { indent: true }));
                     wrap.appendChild(uiHint("Pass 2 without a refine LoRA is cut from HyperFlow's own grid; a refine LoRA forces replace mode (no HyperFlow on that tail)."));
-                    const dualMode = isDualMode(getW("accel_mode", ""));
+                    const dualModeNow = isDualMode(getW("accel_mode", ""));
                     if (W(DUAL_WIDGET)) {
-                        if (!dualMode) wrap.appendChild(uiRow("dual sampling", bindToggle(DUAL_WIDGET),
+                        if (!dualModeNow) wrap.appendChild(uiRow("dual sampling", bindToggle(DUAL_WIDGET),
                             { hint: "Pass 2 = the grid tail from the split step, generated at the pass-2 size; pass 1 only sets the layout. No refine LoRA, refine denoise ignored." }));
-                        if (dualMode || getW(DUAL_WIDGET, false)) {
+                        if (dualModeNow || getW(DUAL_WIDGET, false)) {
                             wrap.appendChild(uiRow("pass 1 early stop", bindToggle("pass1_early_stop"),
                                 { indent: true, hint: "Experimental: pass 1 runs only the first split-step steps. The 3D upscaler was trained on clean latents." }));
                         }
                     }
-                    if (W(PASS1_STEPS_WIDGET) && !(dualMode || getW(DUAL_WIDGET, false))) {
+                    if (W(PASS1_STEPS_WIDGET) && !(dualModeNow || getW(DUAL_WIDGET, false))) {
                         wrap.appendChild(uiRow("pass 1 steps", bindNumber(PASS1_STEPS_WIDGET),
                             { hint: "0 = all 8 HyperFlow steps. 1-7: stop pass 1 early, upscale its clean estimate, then the normal refine (same LoRA, windows, denoise). Saves the skipped steps." }));
                     }
+                }
+                if (isCfg() || isCfgHandoff()) {
+                    wrap.appendChild(uiRow("cfg scale", bindNumber("pass1_cfg"),
+                        { hint: "Guidance of the undistilled pass 1. 1.0 = no guidance (plain positive-only path). Above 1 each CFG step also runs the negative branch, about twice the step cost." }));
+                    wrap.appendChild(uiRow("cfg steps", bindNumber("cfg_steps"),
+                        { hint: "Steps of the undistilled schedule (sampler / scheduler below, no turbo LoRA)." }));
+                    if (isCfgHandoff()) {
+                        wrap.appendChild(uiRow("cfg \u2192 pika at", bindNumber("cfg_handoff_steps"),
+                            { hint: "CFG runs this many of the cfg steps, then Pika finishes from that noise level on its own grid. Clamped to cfg steps - 1." }));
+                        wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName }),
+                            { hint: "The Pika LoRA that finishes pass 1 after the CFG segment." }));
+                    }
+                    wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe"), { hint: "Turbo schedule length: Pika's step count in the hand-off, and the base of pass 2's refine tail." }));
+                    wrap.appendChild(uiRow("sampler", bindSelect("turbo_sampler"), { indent: true }));
+                    wrap.appendChild(uiRow("scheduler", bindSelect("turbo_scheduler"), { indent: true }));
+                    wrap.appendChild(uiRow("negative prompt", uiTextarea(getW("negative_prompt", ""), (v) => setW("negative_prompt", v, { rerender: false }), { rows: 2, placeholder: "blurry, flat lighting, extra fingers (plain things to avoid, not 'no X'). Used only with cfg scale above 1." }),
+                        { hint: "Encoded with the same references and motion context as the prompt, so CFG amplifies only the text difference." }));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD), at CFG 1."));
+                } else if (isHandoff()) {
+                    wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName }),
+                        { hint: "The Pika LoRA: runs pass-1 steps 1..N (composition, pose, anatomy)." }));
+                    wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
+                    wrap.appendChild(uiRow("hand-off step", bindSelect("handoff_step"),
+                        { hint: "Pika runs steps 1..N of its schedule, then Flash finishes from that noise level (texture). The decimal is the noise level left (exact for 6 steps). Clamped to steps - 1." }));
+                    wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName })));
+                    wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps")));
+                    wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora")));
+                    wrap.appendChild(uiRow("flash lora strength", bindNumber("hyperflow_flash_lora_strength")));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
+                } else if (isFlash()) {
+                    wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName }),
+                        { hint: "Pass 1 runs this Flash transformer (ref2va build, GGUF or INT8 convrot safetensors). The base model input is used for pass 2 only." }));
+                    wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps"),
+                        { hint: "4 fastest, 6 balanced, 8 best quality. Euler, CFG 1." }));
+                    wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora"),
+                        { hint: "A LoRA applied to the Flash pass-1 model (e.g. the _for_flash companion of a pikafold checkpoint). The LoRA stack only reaches pass 2." }));
+                    wrap.appendChild(uiRow("flash lora strength", bindNumber("hyperflow_flash_lora_strength"),
+                        { hint: "1.0 for the Pika x Flash companion." }));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
@@ -1128,22 +1288,15 @@ app.registerExtension({
                         wrap.appendChild(uiHint(`sampler ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}, strength ${Number(getW("turbo_lora_strength", 1)).toFixed(2)} — switch to Expert to change`));
                     }
                 }
-                // Pass 2: with dual sampling one row edits the split step and the refine LoRA is not used; otherwise the refine LoRA + schedule.
-                const dualActive = isHyperflow() && Boolean(W(DUAL_WIDGET)) && (isDualMode(getW("accel_mode", "")) || Boolean(getW(DUAL_WIDGET, false)));
-                const p2b = pass2RowBinding(dualActive, getW("dual_split_step", 2));
-                if (dualActive) {
-                    wrap.appendChild(uiRow("pass 2 steps", bindNumber(p2b.widget), { hint: p2b.hint }));
-                    wrap.appendChild(uiHint("Refine lora, strength and mode are ignored in dual sampling."));
-                } else {
-                    const p2lora = String(getW("pass2_lora", "none"));
-                    wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
-                        { hint: "LoRA applied only on the pass-2 refine tail. none = same model as pass 1." }));
-                    if (p2lora !== "none") {
-                        wrap.appendChild(uiRow("refine lora strength", bindNumber("pass2_lora_strength"), { indent: true }));
-                        wrap.appendChild(uiRow("mode", bindSelect("pass2_lora_mode", { render: (v) => String(v).replace(" engine LoRA", "") }),
-                            { indent: true, hint: "stack: on top of the engine LoRA. replace: base model + this LoRA only (step-distilled LoRAs)." }));
-                        wrap.appendChild(uiRow("pass 2 steps", bindNumber(p2b.widget), { indent: true, hint: p2b.hint }));
-                    }
+                const p2lora = String(getW("pass2_lora", "none"));
+                wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
+                    { hint: "LoRA applied only on the pass-2 refine tail. none = same model as pass 1." }));
+                if (p2lora !== "none") {
+                    wrap.appendChild(uiRow("refine lora strength", bindNumber("pass2_lora_strength"), { indent: true }));
+                    wrap.appendChild(uiRow("mode", bindSelect("pass2_lora_mode", { render: (v) => String(v).replace(" engine LoRA", "") }),
+                        { indent: true, hint: "stack: on top of the engine LoRA. replace: base model + this LoRA only (step-distilled LoRAs)." }));
+                    wrap.appendChild(uiRow("pass 2 steps", bindNumber("pass2_steps"), { indent: true,
+                        hint: "Refine schedule. 0 = same as engine steps. Tail length = round(steps x refine denoise)." }));
                 }
                 // Semantic bridge (BUNNY H3 Conditioning Bridge): a small residual MLP on the
                 // text conditioning of both passes. Only shown on node builds that have the widget.
@@ -1156,6 +1309,13 @@ app.registerExtension({
                             { indent: true, hint: "Residual strength. 0.10-0.15 recommended; higher is not better." }));
                         if (expert()) wrap.appendChild(uiRow("magnitude match", bindSelect("semantic_bridge_match"), { indent: true }));
                     }
+                }
+                // YoYo H3 Temporal State Transport (ComfyUI-YoYo-H3-TST): pass 1 only, default on.
+                if (W("tst_enabled")) {
+                    wrap.appendChild(uiRow("temporal state transport (TST)", bindToggle("tst_enabled"),
+                        { hint: "Training-free attention correction for flicker, identity / outfit drift and implausible motion. Pass 1 only; with SLA on it acts on the dense early steps." }));
+                    if (getW("tst_enabled", true)) wrap.appendChild(uiRow("TST tau", bindNumber("tst_tau"),
+                        { indent: true, hint: "Correction strength. 0.2 = paper setting; 0.5 is usually too strong." }));
                 }
             }
 
@@ -1178,7 +1338,7 @@ app.registerExtension({
                     wrap.appendChild(uiRow("refine resolution", bindSelect("pass2_resolution"), { indent: true }));
                     wrap.appendChild(uiRow("refine denoise", bindNumber("pass2_denoise"), { indent: true }));
                     if (W("pass2_scheduler")) wrap.appendChild(uiRow("refine scheduler", bindSelect("pass2_scheduler"), { indent: true,
-                        hint: "Scheduler for the refine tail sigmas. same as pass 1 = the engine scheduler. Not used by HyperFlow's own tail." }));
+                        hint: "Scheduler for the refine tail sigmas. same as pass 1 = the engine scheduler. Not used by Flash's own grid tail." }));
                     if (W("pass2_audio")) wrap.appendChild(uiRow("clip audio from", bindSelect("pass2_audio"), { indent: true,
                         hint: "pass 1 = keep the draft pass's audio and take only the video from the refine pass." }));
                 } else {
@@ -1200,6 +1360,7 @@ app.registerExtension({
                 wrap.appendChild(uiRow("motion context frames", bindSelect("context_length"), { hint: "Video frames from the previous clip fed into the next one." }));
                 wrap.appendChild(uiRow("audio context frames", bindNumber("audio_context_length")));
                 wrap.appendChild(uiRow("identity continuity", bindToggle("identity_continuity"), { hint: "Use an empty picture slot for the previous clip's last frame." }));
+                if (W("chain_memory")) wrap.appendChild(uiRow("chain memory", bindSelect("chain_memory"), { hint: "picture: pass the previous clip's last frame that shows the people as a labelled weak reference. context: take the motion context from the latest shot that shows the people, skipping a trailing insert. Carries positions, contact, clothing and marks across a cut-away. Off by default." }));
             }
 
             function buildPerformance(wrap) {
@@ -1210,7 +1371,7 @@ app.registerExtension({
                     if (W("pass2_sla_sparsity")) wrap.appendChild(uiRow("pass 2 SLA sparsity (0 = same)", bindNumber("pass2_sla_sparsity"), { indent: true,
                         hint: "Sparsity for the refine pass only (sla / vsa methods). 0.95 keeps 5% of key blocks in pass 2 while pass 1 keeps the sparsity above." }));
                     wrap.appendChild(uiRow("method", bindSelect("sparse_method"), { indent: true }));
-                    if (getW("sparse_method", "sla") === "sol-attn") wrap.appendChild(uiRow("tau", bindNumber("sparse_tau"), { indent: true, hint: "HyperFlow's validated recipe is tau 1.0." }));
+                    if (getW("sparse_method", "sla") === "sol-attn") wrap.appendChild(uiRow("tau", bindNumber("sparse_tau"), { indent: true, hint: isHyperflow() ? "HyperFlow's validated recipe is tau 1.0." : "sol-attn threshold in score sigmas. Higher = sparser." }));
                     const recipe = isHyperflow() && getW("sparse_method", "sla") === "sol-attn";
                     const autoNote = recipe ? "auto = HyperFlow sol-attn recipe" : "auto = default";
                     wrap.appendChild(uiRow("sparse start %", bindNumber("sparse_start_percent"), { indent: true,
@@ -1294,6 +1455,22 @@ app.registerExtension({
                 }
                 saveState();
                 renderUI();
+            }
+            // "Fill from story so far": every EMPTY clip (no prompt, no raw prompt) is written as a raw shot list from the clips around it, in one run.
+            const clipIsEmpty = (c) => !String(c.prompt_raw || "").trim() && !String(c.prompt || "").trim();
+            // The empty clips are flagged only for the queued graph (it is serialised while queuePrompt runs) and unflagged as soon as the call returns. The backend writes
+            // them and ends the run like prompts_only: nothing is rewritten or rendered, so the raw shot lists can be read first.
+            async function fillEmptyClips() {
+                const empties = clipsState.filter(clipIsEmpty);
+                if (!empties.length || empties.length === clipsState.length) return;
+                for (const c of empties) c.fill_empty = true;
+                saveState();
+                try { await app.queuePrompt(0, 1); }
+                finally {
+                    for (const c of empties) delete c.fill_empty;
+                    saveState();
+                    renderUI();
+                }
             }
             function writerLinked() {
                 return Boolean(node.inputs?.find((i) => i.name === "clips_in" && i.link != null));
@@ -1598,7 +1775,7 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow · dual sampling" : `${isHyperflow() ? "HyperFlow" : "Turbo"} · ${isHyperflow() ? "8" : getW("pdd_nfe", "8")} steps · 2-pass`}</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow \u00b7 dual sampling (legacy)" : isHyperflow() ? "HyperFlow 8-step (legacy)" : `${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : "Turbo"} \u00b7 ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps`} · 2-pass</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">
@@ -1727,7 +1904,6 @@ app.registerExtension({
                         e.stopPropagation();
                         const text = packClips(clipsState);
                         let ok = false;
-                        try { localStorage.setItem(CLIPS_CLIPBOARD_KEY, text); ok = true; } catch (error) { /* storage blocked */ }
                         try { await copyText(text); ok = true; } catch (error) { /* clipboard blocked */ }
                         copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy failed";
                         setTimeout(() => { copyAllBtn.textContent = "⧉ Copy all"; }, 1500);
@@ -1738,14 +1914,8 @@ app.registerExtension({
                     pasteBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3c5480").replace("#4ade80", "#8fb0e6");
                     pasteBtn.onclick = async (e) => {
                         e.stopPropagation();
-                        let incoming = await readClipsClipboard();
-                        if (!incoming) {
-                            const typed = prompt("No copied clips found in this browser. Paste the copied clips text (from Copy all) here:");
-                            if (typed == null) return;
-                            incoming = unpackClips(typed);
-                            if (!incoming) { alert("That is not a copied clip list. Use Copy all on the source Master Extender first."); return; }
-                        }
-                        pasteClips(incoming);
+                        const incoming = await askForClipsText();
+                        if (incoming) pasteClips(incoming);
                     };
                     actions.append(copyAllBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
@@ -1816,6 +1986,7 @@ app.registerExtension({
                     const durMax = clip.beyond ? DUR_HARD_MAX : DUR_SOFT_MAX;
                     const frames = alignH3Frames(durValue);
                     const seedMode = clip.seed_mode || "randomize";
+                    const fillable = clipIsEmpty(clip) && !externalPromptWired(index) && clipsState.some((c) => !clipIsEmpty(c));
 
                     card.innerHTML = `
                         <!-- Card Header -->
@@ -1846,6 +2017,7 @@ app.registerExtension({
                                 <span style="display: flex; align-items: center; gap: 6px;"><span class="prompt-meta" style="font-size: 10px; color: #6f6f8a; font-variant-numeric: tabular-nums;"></span><span class="copy-slot"></span></span>
                             </div>
                             <div class="prompt-preview minimax-prompt-preview" title="Click to edit in the prompt panel" style="box-sizing: border-box; width: 100%; min-height: ${PROMPT_PREVIEW_LINES * 15 + 12}px; max-height: ${PROMPT_PREVIEW_LINES * 15 + 12}px; overflow: hidden; background: #101016; border: 1px solid #2e2e42; border-radius: 4px; color: #d4d4e4; padding: 6px 8px; font-size: 11px; line-height: 15px; white-space: pre-wrap; word-break: break-word; cursor: text; position: relative;"></div>
+                            ${fillable ? `<button class="fill-btn" title="Write ${clipsState.filter(clipIsEmpty).length > 1 ? "every empty clip" : "this clip"} as a raw timed shot list that continues the story so far (the raw prompts of the clips before it, and the next written clip after a gap), with the reference pictures. Nothing is rewritten or rendered; read the shot lists, then rewrite and render as usual." style="margin-top: 5px; width: 100%; background: #1f3a2e; color: #86efac; border: 1px solid #2f6b4c; border-radius: 4px; padding: 4px 8px; font-size: 11px; cursor: pointer;">✍ Fill from story so far${clipsState.filter(clipIsEmpty).length > 1 ? ` (${clipsState.filter(clipIsEmpty).length} empty clips)` : ""}</button>` : ""}
                         </div>
 
                         <!-- Duration Setting: 5-15 s slider, "go beyond" unlocks up to 30 s -->
@@ -1882,6 +2054,12 @@ app.registerExtension({
                     // Event Listeners for Card
                     const preview = card.querySelector(".prompt-preview");
                     const promptMeta = card.querySelector(".prompt-meta");
+                    const fillBtn = card.querySelector(".fill-btn");
+                    if (fillBtn) {
+                        fillBtn.disabled = projectControls.isBusy();
+                        if (fillBtn.disabled) fillBtn.style.opacity = "0.5";
+                        fillBtn.onclick = (e) => { e.stopPropagation(); fillEmptyClips(); };
+                    }
                     const cardVideo = clipVideo(index, "width: 100%; aspect-ratio: 16 / 9;");
                     if (cardVideo) preview.parentElement.appendChild(cardVideo);
                     const paintPreview = () => {
@@ -2114,6 +2292,11 @@ app.registerExtension({
                         if (item.index === clipsState.length) { clipsState.push(incoming); changed = true; }
                         continue;
                     }
+                    // Clips written into empty slots by "Fill from story so far" take the slot whole, unless text was typed there meanwhile.
+                    if (item.fill === true) {
+                        if (!rawTextOf(local).trim() && !String(local.prompt || "").trim()) { clipsState[item.index] = incoming; changed = true; }
+                        continue;
+                    }
                     if (rawTextOf(local).trim() || "planned" in local) continue;
                     // Clips imported from the Shot Writer arrive whole (seed, mode, title) and take the empty slot as they are.
                     if (incoming.from_writer === true) {
@@ -2129,6 +2312,10 @@ app.registerExtension({
                 ensureClipIds(clipsState);
                 saveState();
                 renderUI();
+                if (promptPanel.el) {
+                    const { clip } = findClip(promptPanel.clipId);
+                    if (clip) openPromptPanel(clip.id, { focus: false });
+                }
             };
             api.addEventListener(EVENT_PLAN, planHandler);
 
