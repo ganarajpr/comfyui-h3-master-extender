@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import os
 import re
 from pathlib import Path
@@ -16,6 +17,9 @@ MIN_SHOT_FRAMES = 6
 CUT_FLOOR = 0.06
 CUT_MEDIAN_FACTOR = 4.0
 FACE_SCORE = 0.5
+# The memory picture carries scene state (positions, contact, clothes), not detail: it is passed at most this wide. At 720p a full-size
+# extra reference made the text encode and the DiT see a ~1280x720 picture (+11 s per join measured, 2026-11-20).
+MEMORY_MAX_WIDTH = 640
 
 MEMORY_DEFINITION = "<Subject {s}> is the state of this scene at the moment just before, in <Picture {p}>: a weak reference for continuity only."
 MEMORY_RETENTION = (
@@ -190,6 +194,7 @@ def select_memory_frame(video):
     ``video`` is the decoded clip, a float (T, H, W, 3) tensor in [0, 1]. Falls back to the last frame
     when no face detector is available or no shot has a face.
     """
+    started = time.time()
     total = int(video.shape[0])
     last = total - 1
     info = {"index": last, "shots": [], "faces": [], "fallback": True, "shot_end": total, "tail_after_shot": 0}
@@ -209,9 +214,24 @@ def select_memory_frame(video):
             info["fallback"] = False
             info["shot_end"] = best[2]
             info["tail_after_shot"] = total - best[2]
-    _LOG.info("Chain memory: frame %d of %d (shots %s, faces per sampled frame %s%s)", info["index"], total, info["shots"], info["faces"],
-              ", fallback to the last frame" if info["fallback"] else "")
-    return video[info["index"]:info["index"] + 1].to(device="cpu").clone(), info
+    _LOG.info("Chain memory: frame %d of %d (shots %s, faces per sampled frame %s%s; picked in %.2f s)", info["index"], total, info["shots"],
+              info["faces"], ", fallback to the last frame" if info["fallback"] else "", time.time() - started)
+    frame = video[info["index"]:info["index"] + 1].to(device="cpu")
+    info["seconds"] = round(time.time() - started, 2)
+    return _shrink(frame), info
+
+
+def _shrink(frame):
+    """(1, H, W, 3) -> at most MEMORY_MAX_WIDTH wide, aspect kept, even size."""
+    import torch.nn.functional as F
+
+    h, w = int(frame.shape[1]), int(frame.shape[2])
+    if w <= MEMORY_MAX_WIDTH:
+        return frame.clone()
+    nw = MEMORY_MAX_WIDTH
+    nh = max(2, int(round(h * nw / w / 2.0)) * 2)
+    out = F.interpolate(frame.permute(0, 3, 1, 2).float(), size=(nh, nw), mode="bilinear", antialias=True, align_corners=False)
+    return out.clamp(0, 1).permute(0, 2, 3, 1).contiguous()
 
 
 # Same constants as motion_context_ram (kept here so this module imports without ComfyUI).
