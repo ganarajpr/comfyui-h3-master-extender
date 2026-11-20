@@ -27,6 +27,7 @@ from . import prompt_rewriter
 from . import clips_metadata
 from . import shared_server
 from . import shot_writer
+from . import time_gate_lora
 
 from . import motion_context_disk
 from .motion_context_disk import (
@@ -575,6 +576,7 @@ class MiniMaxH3MasterExtender:
                 "dual_split_step": ("INT", {"default": 2, "min": 1, "max": 7, "step": 1, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). Dual sampling: the grid index where pass 2 takes over, so pass 2 runs 8 minus this many steps (2 -> 6 steps, 6 -> 2 steps). Higher = pass 2 changes less of pass 1's image."}),
                 "pass1_early_stop": ("BOOLEAN", {"default": False, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). EXPERIMENTAL, dual sampling only. Pass 1 runs only the first dual_split_step steps instead of all 8; its clean estimate is upscaled and pass 2 re-noises it to the split sigma and continues. Saves most of pass 1, but the 3D latent upscaler was trained on clean latents, so quality is not validated. Off keeps the full 8-step pass 1."}),
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
+                "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
             },
@@ -1043,6 +1045,8 @@ class MiniMaxH3MasterExtender:
         tst_tau_raw = kwargs.get("tst_tau", 0.2)
         tst_tau = float(tst_tau_raw) if isinstance(tst_tau_raw, (int, float)) and not isinstance(tst_tau_raw, bool) else 0.2
         engine.configure_tst(tst_on, tst_tau)
+        time_gate_cfg = time_gate_lora.parse_time_gate(kwargs.get("time_gate_json", ""))
+        engine.configure_time_gate(time_gate_cfg)
 
         p1_settings = {
             # pdd_file is inert now but stays in the fingerprint so pass-1 caches written before PDD's removal still hit.
@@ -1060,6 +1064,9 @@ class MiniMaxH3MasterExtender:
             "single_te": bool(single_te),
             "refs": _media_digest([refs, ref_videos, ref_video_audios, ref_audios]),
         }
+        if time_gate_cfg:
+            # Only when set, so every pass-1 cache written without a time gate keeps its fingerprint.
+            p1_settings["time_gate"] = hashlib.sha256(json.dumps(time_gate_cfg, sort_keys=True).encode()).hexdigest()[:16]
         if engine._tst_active():
             # Only when on, so pass-1 caches written with TST off (and before it existed) keep their fingerprint.
             p1_settings["tst"] = [round(engine.tst_tau, 4)]

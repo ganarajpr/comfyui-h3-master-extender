@@ -7,6 +7,7 @@ Stage 2: 3D Latent Upscaling (MinimaxH3LatentUpscaler3D) + Concat AV
 Stage 3: Pass 2 High-Res Refinement via the quality tail (denoise 0.25)
 """
 
+import contextlib
 import inspect
 import math
 import logging
@@ -34,6 +35,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 from . import x0_debug
+from . import time_gate_lora
 
 _LOG = logging.getLogger("minimax_h3_master_extender.engine")
 
@@ -535,6 +537,7 @@ class MasterEngine:
         self.dual_split_step = 2
         self.pass1_early_stop = False
         self.pass1_steps = 0
+        self.time_gate = None
 
     def initialize_model(self):
         """Prepare base model with SigmaShift, the acceleration (Turbo LoRA or HyperFlow) and the attention backend."""
@@ -771,6 +774,19 @@ class MasterEngine:
             self.pass2_sla_model = None
         self.dual_active = True
         self.pass1_early_stop = bool(early_stop)
+
+    def configure_time_gate(self, cfg=None):
+        """cfg: parsed time_gate_json (time_gate_lora.parse_time_gate) or None = off."""
+        self.time_gate = cfg
+
+    def _time_gate_scope(self, model, clip_index, trim_frames):
+        """Pass-1 sampling scope of the time-gated LoRA: hooks on the diffusion model, removed on exit (also on an exception)."""
+        if not self.time_gate:
+            return contextlib.nullcontext()
+        if self.handoff_mode or self.cfg_handoff_mode:
+            _LOG.warning("Clip %d: time_gate_json is not applied in the hand-off modes (the second segment runs another model)", clip_index + 1)
+            return contextlib.nullcontext()
+        return time_gate_lora.scope(model, self.time_gate, clip_index, trim_frames)
 
     def configure_pass1_steps(self, steps=0):
         """Opt-in: stop HyperFlow's pass 1 after `steps` of its 8 steps and hand the model's clean x0 estimate to the
@@ -1759,23 +1775,24 @@ class MasterEngine:
                 _LOG.info("Clip %d: dual sampling early stop, pass 1 runs grid[:%d] (%d steps): %s",
                           clip_index + 1, len(sigmas_p1), len(sigmas_p1) - 1,
                           [round(float(x), 4) for x in sigmas_p1])
-            if self.handoff_mode:
-                sampled_p1 = self._sample_handoff(model, sigmas_p1, pos_p1, latent_p1, seed)
-            elif self.cfg_handoff_mode:
-                sampled_p1 = self._sample_cfg_handoff(self.initialize_cfg_model(), model, sigmas_p1, pos_p1, neg_p1,
-                                                      latent_p1, seed)
-            else:
-                sampled_p1 = self._sample_euler(
-                    model=model,
-                    positive=pos_p1,
-                    latent_image=latent_p1,
-                    sigmas=sigmas_p1,
-                    seed=seed,
-                    return_denoised=early_stop,
-                    ff_chunk=not self.flash_mode,
-                    cfg=self.pass1_cfg if self.cfg_mode else 1.0,
-                    negative=neg_p1,
-                )
+            with self._time_gate_scope(model, clip_index, trim_p1):
+                if self.handoff_mode:
+                    sampled_p1 = self._sample_handoff(model, sigmas_p1, pos_p1, latent_p1, seed)
+                elif self.cfg_handoff_mode:
+                    sampled_p1 = self._sample_cfg_handoff(self.initialize_cfg_model(), model, sigmas_p1, pos_p1, neg_p1,
+                                                          latent_p1, seed)
+                else:
+                    sampled_p1 = self._sample_euler(
+                        model=model,
+                        positive=pos_p1,
+                        latent_image=latent_p1,
+                        sigmas=sigmas_p1,
+                        seed=seed,
+                        return_denoised=early_stop,
+                        ff_chunk=not self.flash_mode,
+                        cfg=self.pass1_cfg if self.cfg_mode else 1.0,
+                        negative=neg_p1,
+                    )
             if (self.flash_mode or self.handoff_mode) and pass2_enabled:
                 self._unload_flash()
 
