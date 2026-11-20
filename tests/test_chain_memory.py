@@ -208,5 +208,20 @@ class Truncate(unittest.TestCase):
         self.assertIs(out, lat)
 
 
+
+@unittest.skipIf(torch is None, "torch not installed")
+class Shrink(unittest.TestCase):
+    def test_wide_frame_is_shrunk_to_max_width(self):
+        out = cm._shrink(torch.rand(1, 720, 1280, 3))
+        self.assertEqual(tuple(out.shape), (1, 360, cm.MEMORY_MAX_WIDTH, 3))
+        self.assertTrue(float(out.min()) >= 0.0 and float(out.max()) <= 1.0)
+
+    def test_small_frame_is_unchanged(self):
+        f = torch.rand(1, 352, 608, 3)
+        out = cm._shrink(f)
+        self.assertEqual(tuple(out.shape), tuple(f.shape))
+        self.assertTrue(torch.equal(out, f))
+
+
 if __name__ == "__main__":
     unittest.main()
