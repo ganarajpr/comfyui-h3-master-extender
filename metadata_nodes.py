@@ -179,6 +179,8 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
                          + (" · negative prompt" if str(inputs.get('negative_prompt') or "").strip() else ""))
         elif str(accel).startswith("Pika"):
             lines.append(f"Engine: Pika\u2192Flash hand-off @{_handoff_k(inputs.get('handoff_step'))}: {inputs.get('turbo_lora', '')} \u2192 {inputs.get('hyperflow_flash_file', '')}")
+        elif str(accel).startswith("pi-H3"):
+            lines.append(f"Engine: pi-H3 {inputs.get('pih3_base_file', '')} · {inputs.get('pih3_steps', 2)} steps · euler · cfg 1")
         elif str(accel).startswith("HyperFlow Flash"):
             lines.append(f"Engine: HyperFlow Flash (GGUF) {inputs.get('hyperflow_flash_file', '')} · {inputs.get('hyperflow_flash_steps', 6)} steps · euler · cfg 1"
                          + (f" · Flash LoRA {inputs.get('hyperflow_flash_lora')} x{inputs.get('hyperflow_flash_lora_strength', 1.0)}" if inputs.get('hyperflow_flash_lora') not in (None, '', 'none') else ""))

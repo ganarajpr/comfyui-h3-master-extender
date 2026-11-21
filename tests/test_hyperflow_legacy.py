@@ -87,7 +87,7 @@ GRID = [1.0, 0.9939, 0.9843, 0.9661, 0.9231, 0.8349, 0.6969, 0.4688, 0.0]
 class LegacyModes(unittest.TestCase):
     def test_the_two_hyperflow_modes_are_appended_last_and_the_default_is_turbo(self):
         self.assertEqual(_NODE["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)",
-                                                "CFG \u2192 Pika hand-off", "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"])
+                                                "CFG \u2192 Pika hand-off", "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "pi-H3 (FL2VA adapter)"])
         self.assertEqual(_NODE["DUAL_SAMPLING_ACCEL_MODE"], "HyperFlow 8-step \u00b7 dual sampling")
         self.assertRegex(NODE.read_text(encoding="utf-8"), r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
 

@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -282,6 +282,10 @@ const isDualMode = (value) => String(value ?? "") === DUAL_MODE;
 const FLASH_MODE = "HyperFlow Flash (GGUF)";
 const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength"];
 const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
+// pi-H3 (Lakonik/ComfyUI-piFlow) engine: the FL2VA base + a 2 / 4-step adapter for pass 1, its own two widgets, shown only in that mode.
+const PIH3_MODE = "pi-H3 (FL2VA adapter)";
+const PIH3_WIDGETS = ["pih3_base_file", "pih3_steps"];
+const isPih3Mode = (value) => String(value ?? "") === PIH3_MODE;
 // Pika \u2192 Flash hand-off: Pika (the turbo widgets) runs the first handoff_step steps, Flash (its widgets) the rest.
 const HANDOFF_MODE = "Pika \u2192 Flash hand-off";
 const isHandoffMode = (value) => String(value ?? "") === HANDOFF_MODE;
@@ -427,6 +431,10 @@ function repairDualWidgets(node, defaults) {
     // Chain memory (after pass1_steps): a workflow saved before it, or from when it was a toggle, carries a value that is not one of the modes: OFF.
     const chainMemory = node.widgets?.find(x => x.name === "chain_memory");
     if (chainMemory && !["off", "picture", "context", "picture + context"].includes(chainMemory.value)) chainMemory.value = "off";
+    const pih3File = node.widgets?.find(x => x.name === "pih3_base_file");
+    if (pih3File) pih3File.value = pih3BaseFileValue(pih3File.value, comboValues(pih3File));
+    const pih3Steps = node.widgets?.find(x => x.name === "pih3_steps");
+    if (pih3Steps) pih3Steps.value = pih3StepsValue(pih3Steps.value);
 }
 
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
@@ -480,6 +488,7 @@ function setupModeWidgets(node) {
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
+        PIH3_WIDGETS.forEach(n => setWidgetVisible(byName(n), isPih3Mode(accel?.value)));
         setWidgetVisible(byName("handoff_step"), handoff);
         CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
         setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
@@ -990,6 +999,7 @@ app.registerExtension({
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
             const isHandoff = () => isHandoffMode(getW("accel_mode", ""));
             const isFlash = () => isFlashMode(getW("accel_mode", ""));
+            const isPih3 = () => isPih3Mode(getW("accel_mode", ""));
             const isCfg = () => isCfgMode(getW("accel_mode", ""));
             const isCfgHandoff = () => isCfgHandoffMode(getW("accel_mode", ""));
             const isHyperflow = () => isHyperflowMode(getW("accel_mode", ""));
@@ -1043,6 +1053,7 @@ app.registerExtension({
                 if (isCfg()) return `Base + CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} · ${getW("cfg_steps", 24)} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
                 if (isCfgHandoff()) return `CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} \u2192 Pika @${getW("cfg_handoff_steps", 8)}/${getW("cfg_steps", 24)} · ${shortModelName(getW("turbo_lora"))} · ${steps} steps${p2note}${bridgeNote}`;
                 if (isHandoff()) return `Pika \u2192 Flash hand-off @${parseInt(getW("handoff_step", 3), 10) || 3} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
+                if (isPih3()) return `pi-H3 · ${shortModelName(getW("pih3_base_file"))} · ${getW("pih3_steps", 2)} steps · euler${p2note}${bridgeNote}`;
                 if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
                 if (isHyperflow()) {
                     const dualMode = isDualMode(getW("accel_mode", ""));
@@ -1221,7 +1232,7 @@ app.registerExtension({
                     setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) || isCfgMode(v) || isCfgHandoffMode(v) ? "6" : "8", { rerender: false });
                     renderUI();
                 }, { render: (v) => isHyperflowMode(v) ? `${v} (legacy)` : String(v) });
-                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." + (isHyperflow() ? " HyperFlow 8-step is the retired legacy engine: it is here only so a workflow saved before 2026-11-17 re-renders as saved." : "") }));
+                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model. pi-H3 (FL2VA adapter): the pi-H3 2/4-step adapter on the FL2VA base for pass 1 (needs ComfyUI-piFlow), pass 2 on the base model." + (isHyperflow() ? " HyperFlow 8-step is the retired legacy engine: it is here only so a workflow saved before 2026-11-17 re-renders as saved." : "") }));
                 if (isHyperflow()) {
                     wrap.appendChild(uiHint("Legacy engine (retired 2026-11-17): this workflow was saved with HyperFlow 8-step and re-renders with it as saved. Switch the engine to Turbo LoRA for Pika + DMAD."));
                     wrap.appendChild(uiRow("hyperflow file", bindSelect("hyperflow_file", { render: shortModelName }),
@@ -1271,6 +1282,12 @@ app.registerExtension({
                     wrap.appendChild(uiRow("flash steps", bindNumber("hyperflow_flash_steps")));
                     wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora")));
                     wrap.appendChild(uiRow("flash lora strength", bindNumber("hyperflow_flash_lora_strength")));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
+                } else if (isPih3()) {
+                    wrap.appendChild(uiRow("pi-H3 base", bindSelect("pih3_base_file", { render: shortModelName }),
+                        { hint: "Pass 1 patches the pi-H3 adapter onto this FL2VA base (conditioning is still the extender's Ref2VA). The base model input is used for pass 2 only." }));
+                    wrap.appendChild(uiRow("pi-H3 steps", bindNumber("pih3_steps"),
+                        { hint: "2 or 4 steps: picks the adapter and the pi-Flow schedule. Euler, CFG 1. Needs the ComfyUI-piFlow node pack." }));
                     wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
                 } else if (isFlash()) {
                     wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName }),
@@ -1784,7 +1801,7 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow \u00b7 dual sampling (legacy)" : isHyperflow() ? "HyperFlow 8-step (legacy)" : `${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : "Turbo"} \u00b7 ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps`} · 2-pass</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow \u00b7 dual sampling (legacy)" : isHyperflow() ? "HyperFlow 8-step (legacy)" : `${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : isPih3() ? "pi-H3" : "Turbo"} \u00b7 ${isFlash() ? getW("hyperflow_flash_steps", 6) : isPih3() ? getW("pih3_steps", 2) : getW("pdd_nfe", "6")} steps`} · 2-pass</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">

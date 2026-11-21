@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -114,6 +114,13 @@ for (const file of workflows) {
 }
 
 // HyperFlow Flash widgets (appended last): master_ui's "" in the file slot and any non-4/6/8 steps fall back to the defaults
+assert.equal(pih3StepsValue(""), 2);
+assert.equal(pih3StepsValue(3), 2);
+assert.deepEqual([2, 4].map(pih3StepsValue), [2, 4]);
+assert.equal(pih3BaseFileValue("", [PIH3_BASE_DEFAULT, "x.safetensors"]), PIH3_BASE_DEFAULT);
+assert.equal(pih3BaseFileValue("", ["x.safetensors"]), "x.safetensors");
+assert.equal(pih3BaseFileValue("gone.safetensors", [PIH3_BASE_DEFAULT]), PIH3_BASE_DEFAULT);
+assert.equal(pih3BaseFileValue("x.safetensors", [PIH3_BASE_DEFAULT, "x.safetensors"]), "x.safetensors");
 assert.equal(flashStepsValue(""), 6);
 assert.equal(flashStepsValue(5), 6);
 assert.deepEqual([4, 6, 8].map(flashStepsValue), [4, 6, 8]);

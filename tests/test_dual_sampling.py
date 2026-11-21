@@ -302,7 +302,7 @@ class DualSamplingMode(unittest.TestCase):
     NEW = "HyperFlow 8-step \u00b7 dual sampling"
 
     def test_the_dual_value_is_appended_last_and_the_default_is_turbo(self):
-        self.assertEqual(_NODE["ACCEL_MODES"][-2:], ["HyperFlow 8-step", self.NEW])
+        self.assertEqual(_NODE["ACCEL_MODES"][-3:-1], ["HyperFlow 8-step", self.NEW])
         self.assertEqual(_NODE["DUAL_SAMPLING_ACCEL_MODE"], self.NEW)
         self.assertRegex(NODE.read_text(encoding="utf-8"), r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
 

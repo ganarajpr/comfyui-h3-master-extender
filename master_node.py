@@ -62,6 +62,12 @@ from .pdd_pure_engine import (
     parse_resolution,
     duration_to_h3_frames,
     FLASH_ACCEL_MODE,
+    PIH3_ACCEL_MODE,
+    PIH3_BASE_DEFAULT,
+    PIH3_STEPS,
+    check_pih3_steps,
+    pih3_missing_pack_error,
+    pih3_pack_module,
     HYPERFLOW_ACCEL_MODE,
     with_dual_p1_settings,
     with_pass1_steps_p1_settings,
@@ -352,10 +358,10 @@ PASS2_LORA_DEFAULT = "h3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safet
 HYPERFLOW_DEFAULT_FILE = "custom_node_hyperflow_8step_v1.0_comfyui_pruned.safetensors"
 PIKA_LORA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors"
 
-# Options are restored by name, so new ones are only ever appended. The two HyperFlow 8-step options come last:
+# Options are restored by name, so new ones are only ever appended (pi-H3 last). The two HyperFlow 8-step options sit before it:
 # the engine was retired as a choice on 2026-11-17 but stays for workflows saved before, which re-render as saved.
 ACCEL_MODES = ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off",
-               "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"]
+               "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "pi-H3 (FL2VA adapter)"]
 DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES[6]
 
 
@@ -412,6 +418,17 @@ def _flash_files():
         except Exception:
             pass
     return flash_file_list(flash_pack_module(), sorted(scanned)) or [FLASH_DEFAULT_FILE]
+
+
+def _pih3_base_files():
+    """pi-H3 base candidates: every diffusion_models / unet file; the default is the FL2VA pruned INT8 convrot build."""
+    scanned = set()
+    for key in ("diffusion_models", "unet"):
+        try:
+            scanned.update(folder_paths.get_filename_list(key))
+        except Exception:
+            pass
+    return sorted(scanned) or [PIH3_BASE_DEFAULT]
 
 
 class MiniMaxH3MasterExtender:
@@ -581,6 +598,9 @@ class MiniMaxH3MasterExtender:
                 "pass1_early_stop": ("BOOLEAN", {"default": False, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). EXPERIMENTAL, dual sampling only. Pass 1 runs only the first dual_split_step steps instead of all 8; its clean estimate is upscaled and pass 2 re-noises it to the split sigma and continues. Saves most of pass 1, but the 3D latent upscaler was trained on clean latents, so quality is not validated. Off keeps the full 8-step pass 1."}),
                 "pass1_steps": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1, "tooltip": "Legacy HyperFlow 8-step (workflows saved before 2026-11-17). HyperFlow 8-step only (ignored with dual sampling and in Turbo LoRA mode). 0 = the full 8-step pass 1. k = 1..7: pass 1 stops after k of the 8 steps, its clean estimate is upscaled, and the normal pass-2 refine runs unchanged (same LoRA, windows and denoise). Saves (8 - k) pass-1 steps; the refine re-noises the latent anyway."}),
                 "chain_memory": (["off", "picture", "context", "picture + context"], {"default": "picture + context", "tooltip": "Carry the state of the scene across a cut-away. picture: the previous clip's last frame that shows the people becomes one extra reference picture with a generic continuity line in the prompt (one picture slot, a face-detection pass per clip). context: the motion context is taken from the latest shot that shows the people, dropping a trailing insert from the previous clip's end (in whole 17-frame steps). picture + context: both (the default for a new node). off turns it off. Workflows saved before this input existed, and API graphs that do not send it, render with it off, so their cached clips stay valid."}),
+                # --- pi-H3 (appended after chain_memory, before the time_gate_json socket) ---
+                "pih3_base_file": (_pih3_base_files(), {"default": PIH3_BASE_DEFAULT, "tooltip": "pi-H3 mode only: the MiniMax H3 FL2VA base model that the pi-H3 adapter is patched onto for pass 1 (default minimax_h3_fl2va_pruned_int8_convrot.safetensors). Conditioning is still the extender's Ref2VA one. The base model input is used for pass 2 only in this mode."}),
+                "pih3_steps": ("INT", {"default": 2, "min": 2, "max": 4, "step": 2, "tooltip": "pi-H3 mode only: 2 or 4 steps. Picks the adapter (pi_h3_2step_dwd_adapter_int8_convrot / pi_h3_4step_dwd_adapter_int8_convrot) and the pi-Flow schedule (max_raw_t 0.93 / 0.96, final step scale 0.6). Euler, CFG 1. pdd_nfe does not apply."}),
                 "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -600,7 +620,8 @@ class MiniMaxH3MasterExtender:
 
     @classmethod
     def VALIDATE_INPUTS(cls, hyperflow_file=None, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
-                        hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None, turbo_lora=None):
+                        hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None, turbo_lora=None,
+                        pih3_base_file=None, pih3_steps=None):
         # accel_mode: API graphs saved before PDD mode was removed still send "PDD 8-step"; normalize_accel_mode maps
         # it to HyperFlow 8-step at run time. Naming it here skips core's combo check, so anything else unknown is rejected.
         if accel_mode is not None and accel_mode not in ACCEL_MODES and not is_legacy_accel_mode(accel_mode):
@@ -628,6 +649,13 @@ class MiniMaxH3MasterExtender:
                 return f"hyperflow_flash_steps: {hyperflow_flash_steps!r} not in {list(FLASH_STEPS)}"
             if hyperflow_flash_lora and hyperflow_flash_lora != "none" and hyperflow_flash_lora not in folder_paths.get_filename_list("loras"):
                 return f"hyperflow_flash_lora: '{hyperflow_flash_lora}' not in loras"
+        # pi-H3 inputs are appended after chain_memory, so an older workflow can carry master_ui's "" in the file slot: it means the default.
+        # They are named here (which skips core's combo check), so they are only checked in pi-H3 mode.
+        if normalize_accel_mode(accel_mode) == PIH3_ACCEL_MODE:
+            if pih3_base_file and pih3_base_file not in _pih3_base_files():
+                return f"pih3_base_file: '{pih3_base_file}' not in {_pih3_base_files()}"
+            if isinstance(pih3_steps, (int, float)) and not isinstance(pih3_steps, bool) and int(pih3_steps) not in PIH3_STEPS:
+                return f"pih3_steps: {pih3_steps!r} not in {list(PIH3_STEPS)}"
         # hyperflow_file is checked only for the legacy HyperFlow 8-step engine: a Turbo / Flash workflow must never fail
         # because models/hyperflow is empty. "" (a workflow from before HyperFlow existed, or master_ui's slot) = the default.
         if not is_hyperflow_accel_mode(accel_mode) or not hyperflow_file:
@@ -713,6 +741,14 @@ class MiniMaxH3MasterExtender:
                 _LOG.warning("HyperFlow Flash: %s", flash_note)
             if dual_mode or kwargs.get("dual_sampling") or kwargs.get("pass1_steps"):
                 _LOG.warning("HyperFlow Flash: dual sampling and pass1_steps are HyperFlow 8-step features and are ignored")
+        pih3_base, pih3_steps = PIH3_BASE_DEFAULT, 2
+        if accel_mode == PIH3_ACCEL_MODE:
+            if pih3_pack_module() is None:
+                raise pih3_missing_pack_error()
+            pih3_base = kwargs.get("pih3_base_file") or PIH3_BASE_DEFAULT
+            pih3_steps = check_pih3_steps(kwargs.get("pih3_steps") or 2)
+            if dual_mode or kwargs.get("dual_sampling") or kwargs.get("pass1_steps"):
+                _LOG.warning("pi-H3: dual sampling and pass1_steps are HyperFlow 8-step features and are ignored")
         handoff_step = HANDOFF_STEP_DEFAULT
         if accel_mode == HANDOFF_ACCEL_MODE:
             if turbo_lora in (None, "", "none"):
@@ -999,6 +1035,8 @@ class MiniMaxH3MasterExtender:
             hyperflow_flash_steps=flash_steps,
             hyperflow_flash_lora=flash_lora,
             hyperflow_flash_lora_strength=flash_lora_strength,
+            pih3_base_file=pih3_base,
+            pih3_steps=pih3_steps,
             handoff_step=handoff_step,
             pass1_cfg=pass1_cfg,
             cfg_steps=cfg_steps,
@@ -1087,6 +1125,14 @@ class MiniMaxH3MasterExtender:
             p1_settings["flash"] = [flash_file, flash_steps]
             if flash_lora != "none":
                 p1_settings["flash"] += [flash_lora, flash_lora_strength]
+
+        if accel_mode == PIH3_ACCEL_MODE:
+            # Only in pi-H3 mode, so pass-1 caches of every other mode keep their fingerprint. The pass-1 step-count and
+            # sampler fields do not apply here, so they are taken out of the key: changing them must not re-render the draft.
+            p1_settings["pih3"] = [pih3_base, pih3_steps]
+            p1_settings["pdd_nfe"] = "pi-h3"
+            p1_settings["turbo_lora"], p1_settings["turbo_lora_strength"] = "none", 1.0
+            p1_settings["sampler"], p1_settings["scheduler"] = "euler", "simple"
 
         if accel_mode == HANDOFF_ACCEL_MODE:
             # Only in hand-off mode (the Pika parts are already in the base keys): a different Flash file / steps /

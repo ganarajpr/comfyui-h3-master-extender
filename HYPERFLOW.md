@@ -51,3 +51,18 @@
 **Cache.** The pass-1 fingerprint includes the Flash parts and `handoff_step` in this mode only, so different hand-offs never share a cached pass 1.
 
 The log line reads `Pika -> Flash hand-off: Pika steps 1..3 (sigma 1.0->0.7000), Flash 3 steps (0.7000->0) [file]`.
+
+# pi-H3 (FL2VA adapter) mode
+
+`accel_mode` = "pi-H3 (FL2VA adapter)" runs pass 1 on [Lakonik/ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow)'s pi-H3: a 2- or 4-step adapter that distills MiniMax H3 FL2VA. Pass 2 is unchanged (base model + the pass-2 refiner LoRA, DMAD, replace mode).
+
+**Requirements.** The ComfyUI-piFlow node pack (`Load LakonLab Adapter`, `pi-Flow Scheduler`), `models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`, and `models/loras/pi_h3_2step_dwd_adapter_int8_convrot.safetensors` / `pi_h3_4step_dwd_adapter_int8_convrot.safetensors`. A missing pack stops the job with a message naming it.
+
+**Inputs** (appended after `chain_memory`, before the `time_gate_json` socket): `pih3_base_file` (default `minimax_h3_fl2va_pruned_int8_convrot.safetensors`), `pih3_steps` (2 or 4, default 2; picks the adapter). `pdd_nfe`, `turbo_lora`, `turbo_sampler` and `turbo_scheduler` do not apply to pass 1 (and are left out of the pass-1 cache key in this mode).
+
+**Pass 1.** The FL2VA base is loaded and the adapter patched in (as the vendor graph: UNETLoader -> Load LakonLab Adapter, strength 1), then SigmaShift (12 / 3), the dense attention backend and, when `sla_enabled`, sparse attention, exactly as for the Flash model. Sigmas come from the pack's `pi-Flow Scheduler` on that model's sampling: `min_raw_t` 0, `max_raw_t` 0.93 (2 steps) / 0.96 (4 steps), `final_step_size_scale` 0.6. Euler, CFG 1, the same noise seed and the same Ref2VA conditioning (references, motion context, bridge) as the other engines, even though the adapter was trained on FL2VA. The patched model is cached across clips and jobs (clip 2 reuses it; the adapter is patched once), and it is evicted from the GPU before pass 2.
+
+**The DWD head is dropped.** The `*_dwd_adapter` files carry `dwd_*` tensors: a pixel head that, at the last sampling step, decodes the final hidden states straight to frames for the `DWD Decode` node. The extender needs a normal video+audio latent (pass 2 refines it and chaining reads its motion context), so `dwd_*` tensors are removed before patching. This changes nothing in the latent: in the piFlow source the head only reads the final hidden states and the model's own output is untouched, so the sampler returns the same latent with or without it. With the head loaded, every sampling run would also stash its frames in `DWD_PIXELS` (up to 4 runs, fp16, a few GB per 15 s clip) and SHA-1 the output latent. The adapter's own denoiser weights were trained with the head; whether they give as good a VAE-decoded latent as the separate non-DWD adapters (`pi_h3_*step_adapter`) is judged on a render.
+
+**Cache.** The pass-1 fingerprint gains a `pih3` entry `[base file, steps]` in this mode only.
+

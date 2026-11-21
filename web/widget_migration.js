@@ -233,3 +233,16 @@ export function cfgHandoffStepsValue(value) {
 export function negativePromptValue(value) {
     return typeof value === "string" ? value : "";
 }
+
+// pih3_base_file and pih3_steps are appended after chain_memory: a workflow saved before them carries master_ui's "" (or nothing)
+// in those slots. "" / unknown file = the FL2VA pruned INT8 convrot build, else the first option; steps other than 2 / 4 = 2.
+export const PIH3_BASE_DEFAULT = "minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+export const PIH3_STEPS_DEFAULT = 2;
+export function pih3StepsValue(value) {
+    return value === 2 || value === 4 ? value : PIH3_STEPS_DEFAULT;
+}
+export function pih3BaseFileValue(value, options) {
+    if (typeof value === "string" && value !== "" && (!Array.isArray(options) || options.includes(value))) return value;
+    if (Array.isArray(options) && options.length) return options.includes(PIH3_BASE_DEFAULT) ? PIH3_BASE_DEFAULT : options[0];
+    return PIH3_BASE_DEFAULT;
+}
