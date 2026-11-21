@@ -246,3 +246,12 @@ export function pih3BaseFileValue(value, options) {
     if (Array.isArray(options) && options.length) return options.includes(PIH3_BASE_DEFAULT) ? PIH3_BASE_DEFAULT : options[0];
     return PIH3_BASE_DEFAULT;
 }
+
+// pass2_engine is appended after pih3_steps: a workflow saved before it carries master_ui's "" (or nothing) in that slot.
+// Anything that is not one of the options = the LoRA refine, which is what those workflows rendered with.
+export const PASS2_ENGINE_LORA = "LoRA refine";
+export const PASS2_ENGINE_PIH3 = "pi-H3 refine (DWD, no VAE decode)";
+export function pass2EngineValue(value) {
+    return value === PASS2_ENGINE_PIH3 ? PASS2_ENGINE_PIH3 : PASS2_ENGINE_LORA;
+}
+

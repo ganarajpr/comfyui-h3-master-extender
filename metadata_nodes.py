@@ -188,6 +188,8 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
             refit = "curve refit on" if inputs.get("hyperflow_curve_refit", True) else "curve refit off"
             label = "HyperFlow · dual sampling" if "dual sampling" in str(accel) else "HyperFlow 8-step"
             lines.append(f"Engine: {label} {inputs.get('hyperflow_file', '')} x{inputs.get('hyperflow_strength', 1.0)} · {refit} · {inputs.get('hyperflow_lora_mode', 'bypass')} · euler{' · pass 1 stops at step ' + str(inputs.get('pass1_steps')) + ' of 8' if int(inputs.get('pass1_steps', 0) or 0) > 0 and 'dual sampling' not in str(accel) else ''}")
+        if str(inputs.get("pass2_engine") or "").startswith("pi-H3 refine"):
+            lines.append(f"Pass 2: pi-H3 refine · {inputs.get('pih3_base_file', '')} + 2-step DWD adapter · one step · DWD pixels, no video VAE decode")
         lines.append(f"Quality: draft {inputs.get('pass1_resolution', '?')} → refine {inputs.get('pass2_resolution', '?')} · denoise {inputs.get('pass2_denoise', '?')}{' · pass 2 scheduler ' + str(inputs.get('pass2_scheduler')) if inputs.get('pass2_scheduler') not in (None, '', 'same as pass 1') else ''}{' · pass-1 audio' if inputs.get('pass2_audio') == 'pass 1' else ''} · upscaler {inputs.get('upscaler_model', '?')}")
         lines.append(f"Continuity: motion {inputs.get('context_length', '?')} f · audio {inputs.get('audio_context_length', '?')} f · identity {inputs.get('identity_continuity', '?')}")
         sla = inputs.get("sla_enabled", False)

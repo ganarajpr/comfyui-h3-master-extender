@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, PASS2_ENGINE_PIH3, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -435,6 +435,8 @@ function repairDualWidgets(node, defaults) {
     if (pih3File) pih3File.value = pih3BaseFileValue(pih3File.value, comboValues(pih3File));
     const pih3Steps = node.widgets?.find(x => x.name === "pih3_steps");
     if (pih3Steps) pih3Steps.value = pih3StepsValue(pih3Steps.value);
+    const pass2Engine = node.widgets?.find(x => x.name === "pass2_engine");
+    if (pass2Engine) pass2Engine.value = pass2EngineValue(pass2Engine.value);
 }
 
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
@@ -488,7 +490,7 @@ function setupModeWidgets(node) {
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
-        PIH3_WIDGETS.forEach(n => setWidgetVisible(byName(n), isPih3Mode(accel?.value)));
+        PIH3_WIDGETS.forEach(n => setWidgetVisible(byName(n), isPih3Mode(accel?.value) || byName("pass2_engine")?.value === PASS2_ENGINE_PIH3));
         setWidgetVisible(byName("handoff_step"), handoff);
         CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
         setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
@@ -503,7 +505,7 @@ function setupModeWidgets(node) {
     };
     node.applyModeWidgets = apply;
 
-    for (const w of [accel, sla, byName(DUAL_WIDGET)]) {
+    for (const w of [accel, sla, byName(DUAL_WIDGET), byName("pass2_engine")]) {
         if (!w) continue;
         const original = w.callback;
         w.callback = function () {
@@ -1047,7 +1049,7 @@ app.registerExtension({
             function engineSummary() {
                 const steps = getW("pdd_nfe", "6");
                 const p2 = String(getW("pass2_lora", "none"));
-                const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
+                const p2note = getW("pass2_engine", "") === PASS2_ENGINE_PIH3 ? " · refine pi-H3 DWD (no VAE decode)" : p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
                 if (isCfg()) return `Base + CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} · ${getW("cfg_steps", 24)} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
@@ -1310,6 +1312,8 @@ app.registerExtension({
                         wrap.appendChild(uiHint(`sampler ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}, strength ${Number(getW("turbo_lora_strength", 1)).toFixed(2)} — switch to Expert to change`));
                     }
                 }
+                if (W("pass2_engine")) wrap.appendChild(uiRow("refine engine", bindSelect("pass2_engine"),
+                    { hint: "LoRA refine: base + the pass-2 LoRA, then the video VAE decode. pi-H3 refine (DWD, no VAE decode): pass 2 is one pi-H3 step (FL2VA base + 2-step DWD adapter) whose DWD head outputs the clip's frames, so the video VAE decode is skipped. Needs ComfyUI-piFlow and the standard final decode." }));
                 const p2lora = String(getW("pass2_lora", "none"));
                 wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
                     { hint: "LoRA applied only on the pass-2 refine tail. none = same model as pass 1." }));

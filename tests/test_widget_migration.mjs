@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT, pass2EngineValue, PASS2_ENGINE_LORA, PASS2_ENGINE_PIH3 } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -114,6 +114,10 @@ for (const file of workflows) {
 }
 
 // HyperFlow Flash widgets (appended last): master_ui's "" in the file slot and any non-4/6/8 steps fall back to the defaults
+assert.equal(pass2EngineValue(""), PASS2_ENGINE_LORA);
+assert.equal(pass2EngineValue(undefined), PASS2_ENGINE_LORA);
+assert.equal(pass2EngineValue("gone"), PASS2_ENGINE_LORA);
+assert.equal(pass2EngineValue(PASS2_ENGINE_PIH3), PASS2_ENGINE_PIH3);
 assert.equal(pih3StepsValue(""), 2);
 assert.equal(pih3StepsValue(3), 2);
 assert.deepEqual([2, 4].map(pih3StepsValue), [2, 4]);

@@ -63,6 +63,9 @@ from .pdd_pure_engine import (
     duration_to_h3_frames,
     FLASH_ACCEL_MODE,
     PIH3_ACCEL_MODE,
+    PASS2_ENGINES,
+    PASS2_ENGINE_LORA,
+    PASS2_ENGINE_PIH3,
     PIH3_BASE_DEFAULT,
     PIH3_STEPS,
     check_pih3_steps,
@@ -601,6 +604,7 @@ class MiniMaxH3MasterExtender:
                 # --- pi-H3 (appended after chain_memory, before the time_gate_json socket) ---
                 "pih3_base_file": (_pih3_base_files(), {"default": PIH3_BASE_DEFAULT, "tooltip": "pi-H3 mode only: the MiniMax H3 FL2VA base model that the pi-H3 adapter is patched onto for pass 1 (default minimax_h3_fl2va_pruned_int8_convrot.safetensors). Conditioning is still the extender's Ref2VA one. The base model input is used for pass 2 only in this mode."}),
                 "pih3_steps": ("INT", {"default": 2, "min": 2, "max": 4, "step": 2, "tooltip": "pi-H3 mode only: 2 or 4 steps. Picks the adapter (pi_h3_2step_dwd_adapter_int8_convrot / pi_h3_4step_dwd_adapter_int8_convrot) and the pi-Flow schedule (max_raw_t 0.93 / 0.96, final step scale 0.6). Euler, CFG 1. pdd_nfe does not apply."}),
+                "pass2_engine": (PASS2_ENGINES, {"default": PASS2_ENGINE_LORA, "tooltip": "Pass-2 refine engine. LoRA refine (default): the base model + the pass-2 LoRA (DMAD), then the video VAE decodes the clip. pi-H3 refine (DWD, no VAE decode): pass 2 is ONE step, the last step of the pi-H3 2-step pi-Flow grid, on the FL2VA base (pih3_base_file) + pi_h3_2step_dwd_adapter_int8_convrot with its DWD head kept; the head's pixels are the clip's frames and the video VAE decode is skipped (the audio VAE still decodes the audio; the latent is stored as always, so chaining and caches work). Pass 1 is independent. Needs ComfyUI-piFlow. pass2_denoise, pass2_steps, the pass-2 LoRA and windowed pass 2 do not apply; an X2 final_decode is rejected."}),
                 "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -621,7 +625,7 @@ class MiniMaxH3MasterExtender:
     @classmethod
     def VALIDATE_INPUTS(cls, hyperflow_file=None, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
                         hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None, turbo_lora=None,
-                        pih3_base_file=None, pih3_steps=None):
+                        pih3_base_file=None, pih3_steps=None, pass2_engine=None):
         # accel_mode: API graphs saved before PDD mode was removed still send "PDD 8-step"; normalize_accel_mode maps
         # it to HyperFlow 8-step at run time. Naming it here skips core's combo check, so anything else unknown is rejected.
         if accel_mode is not None and accel_mode not in ACCEL_MODES and not is_legacy_accel_mode(accel_mode):
@@ -656,6 +660,15 @@ class MiniMaxH3MasterExtender:
                 return f"pih3_base_file: '{pih3_base_file}' not in {_pih3_base_files()}"
             if isinstance(pih3_steps, (int, float)) and not isinstance(pih3_steps, bool) and int(pih3_steps) not in PIH3_STEPS:
                 return f"pih3_steps: {pih3_steps!r} not in {list(PIH3_STEPS)}"
+        # pass2_engine is appended after pih3_steps: "" (master_ui's slot in an older workflow) / None = LoRA refine.
+        if pass2_engine not in (None, "") and pass2_engine not in PASS2_ENGINES:
+            return f"pass2_engine: '{pass2_engine}' not in {PASS2_ENGINES}"
+        if pass2_engine == PASS2_ENGINE_PIH3:
+            if final_decode not in (None, "", "standard") and normalize_final_decode(final_decode) != "standard":
+                return ("pass2_engine: pi-H3 refine outputs the DWD head's 1x pixels and skips the video VAE decode, so it cannot "
+                        f"be combined with final_decode '{final_decode}' (X2 / upscaling decodes). Set final_decode to standard.")
+            if pih3_base_file and pih3_base_file not in _pih3_base_files():
+                return f"pih3_base_file: '{pih3_base_file}' not in {_pih3_base_files()}"
         # hyperflow_file is checked only for the legacy HyperFlow 8-step engine: a Turbo / Flash workflow must never fail
         # because models/hyperflow is empty. "" (a workflow from before HyperFlow existed, or master_ui's slot) = the default.
         if not is_hyperflow_accel_mode(accel_mode) or not hyperflow_file:
@@ -742,6 +755,17 @@ class MiniMaxH3MasterExtender:
             if dual_mode or kwargs.get("dual_sampling") or kwargs.get("pass1_steps"):
                 _LOG.warning("HyperFlow Flash: dual sampling and pass1_steps are HyperFlow 8-step features and are ignored")
         pih3_base, pih3_steps = PIH3_BASE_DEFAULT, 2
+        pass2_engine = kwargs.get("pass2_engine") if kwargs.get("pass2_engine") in PASS2_ENGINES else PASS2_ENGINE_LORA
+        pih3_refine = pass2_engine == PASS2_ENGINE_PIH3
+        if pih3_refine:
+            pack = pih3_pack_module()
+            if pack is None or not hasattr(pack, "LakonLabAdapterLoader") or not hasattr(pack, "get_dwd_pixels"):
+                raise pih3_missing_pack_error()
+            if normalize_final_decode(kwargs.get("final_decode")) != "standard":
+                raise ValueError("pass2_engine pi-H3 refine skips the video VAE decode, so final_decode must be standard "
+                                 "(an X2 / upscaling final decode needs the VAE decode)")
+            pih3_base = kwargs.get("pih3_base_file") or PIH3_BASE_DEFAULT
+            _LOG.info("pi-H3 refine: pass 2 is a single DWD step; pass2_denoise, pass2_steps, the pass-2 LoRA and windowed pass 2 are ignored")
         if accel_mode == PIH3_ACCEL_MODE:
             if pih3_pack_module() is None:
                 raise pih3_missing_pack_error()
@@ -999,6 +1023,8 @@ class MiniMaxH3MasterExtender:
             background["worker"] = None
             return worker.wait()
 
+        motion_context_disk.clear_dwd_frames()
+
         # Instantiate the Master Engine
         engine = MasterEngine(
             model=model,
@@ -1037,6 +1063,7 @@ class MiniMaxH3MasterExtender:
             hyperflow_flash_lora_strength=flash_lora_strength,
             pih3_base_file=pih3_base,
             pih3_steps=pih3_steps,
+            pass2_engine=pass2_engine,
             handoff_step=handoff_step,
             pass1_cfg=pass1_cfg,
             cfg_steps=cfg_steps,
@@ -1448,6 +1475,7 @@ class MiniMaxH3MasterExtender:
 
         _finish_background()
         # Re-apply after any background decode rewrote the manifest.
+        motion_context_disk.clear_dwd_frames()
         _store_fingerprints(data_path, manifest_path, fingerprints)
         _store_fingerprints(draft_path, draft_manifest_path, p1_fingerprints)
         status_msg = f"Rendered {rendered_count} clip(s), reused {validated_count}/{len(clips)} from cache"

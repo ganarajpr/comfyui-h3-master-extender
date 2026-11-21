@@ -18,6 +18,8 @@ unchanged. This module only changes persistence/execution and final streaming.
 """
 
 import asyncio
+import collections
+import hashlib
 import json
 import logging
 import math
@@ -1200,6 +1202,78 @@ def _loaded_entries_for(patcher):
     return [lm for lm in mm.current_loaded_models if getattr(lm, "model", None) is patcher]
 
 
+# ---------------------------------------------------------------------------
+# DWD frames (pi-H3 refine pass 2): the pixels the pass-2 model's DWD head produced, in place of the video VAE decode.
+# Registered by the engine right after pass 2, keyed by a fingerprint of the clip's video latent (the cached latent is
+# bit-identical, so the decode paths find them from the segment alone). A clip with no entry decodes with the VAE as always.
+# ---------------------------------------------------------------------------
+_DWD_FRAMES = collections.OrderedDict()
+_DWD_LOCK = threading.Lock()
+_DWD_MAX_ENTRIES = 4
+
+
+def dwd_latent_key(video):
+    return hashlib.sha1(video.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()
+
+
+def _video_t(video):
+    return int(video.shape[2] if video.ndim == 5 else video.shape[1])
+
+
+def _pair_previous_tail_frames(latent_t):
+    """Frames of the previous clip's tail that a pair decode includes (see _build_pair_video)."""
+    prev_drop = max(0, ((int(latent_t) - PAIR_PREVIOUS_TAIL_T) // 5) * 5)
+    return _frames_from_video_t(int(latent_t) - prev_drop)
+
+
+def register_dwd_frames(video, pixels):
+    """Keep one clip's DWD pixels ((F, H, W, 3) in [0, 1], F = the VAE frame count). Returns False (nothing kept) when the
+    frame count is not the one the VAE would give."""
+    t = _video_t(video)
+    expected = _frames_from_video_t(t)
+    if pixels.ndim != 4 or int(pixels.shape[0]) != expected:
+        log.warning("DWD frames: %s frames for a %d-latent clip (the VAE gives %d); this clip uses the VAE decode",
+                    tuple(pixels.shape), t, expected)
+        return False
+    tail = pixels[-_pair_previous_tail_frames(t):].clone()
+    with _DWD_LOCK:
+        _DWD_FRAMES[dwd_latent_key(video)] = {"full": pixels, "tail": tail}
+        while len(_DWD_FRAMES) > _DWD_MAX_ENTRIES:
+            _DWD_FRAMES.popitem(last=False)
+    return True
+
+
+def clear_dwd_frames():
+    with _DWD_LOCK:
+        _DWD_FRAMES.clear()
+
+
+def dwd_guide_frame(video):
+    """The clip's last frame (1, H, W, 3) float CPU tensor from its DWD pixels, or None."""
+    with _DWD_LOCK:
+        entry = _DWD_FRAMES.get(dwd_latent_key(video))
+    if not entry:
+        return None
+    frames = entry["full"] if entry.get("full") is not None else entry["tail"]
+    return frames[-1:].float().clamp(0.0, 1.0).to(device="cpu").clone()
+
+
+def _take_dwd_full(video):
+    """The clip's full DWD pixels, released from the registry (its tail stays for the next clip's pair), or None."""
+    with _DWD_LOCK:
+        entry = _DWD_FRAMES.get(dwd_latent_key(video))
+        if not entry or entry.get("full") is None:
+            return None
+        full, entry["full"] = entry["full"], None
+        return full
+
+
+def _dwd_tail(video):
+    with _DWD_LOCK:
+        entry = _DWD_FRAMES.get(dwd_latent_key(video))
+    return None if not entry else entry["tail"]
+
+
 def decode_video_latent(vae, latent):
     """VAE-decode an H3 video latent with the memory it actually needs.
 
@@ -1245,6 +1319,9 @@ def decode_guide_frame(vae, video_latent, context_latent_frames=3):
     """Decode only the tail of a clip's video latent and return its last frame
     as a (1, H, W, 3) CPU tensor -- the identity guide the next clip needs,
     available long before the full decode has run."""
+    dwd = dwd_guide_frame(video_latent)
+    if dwd is not None:
+        return dwd
     tail = video_latent[:, :, -int(context_latent_frames):].contiguous()
     frames = vae.decode(tail)
     if frames.ndim == 5:
@@ -3474,6 +3551,27 @@ def _assemble_progressive_preview(
                 pass
 
 
+def _dwd_pair_decoded(data_path, prev_desc, curr_desc, meta):
+    """The (previous tail + current clip from the VAE warm-up start) frame buffer a pair decode would return, built from the
+    two clips' DWD pixels, or None when either clip has none (the VAE decodes the pair then)."""
+    curr_v = _load_segment_video(data_path, curr_desc)
+    prev_v = _load_segment_video(data_path, prev_desc)
+    tail = _dwd_tail(prev_v)
+    with _DWD_LOCK:
+        entry = _DWD_FRAMES.get(dwd_latent_key(curr_v))
+    if tail is None or not entry or entry.get("full") is None:
+        return None
+    current = entry["full"]
+    warmup_start = int(meta["previous_frames"]) + int(meta["next_frames"]) - int(meta["decode_frames"])
+    if int(tail.shape[0]) != int(meta["previous_frames"]) or int(current.shape[0]) != int(meta["next_frames"]):
+        log.warning("DWD frames: tail %d / clip %d frames do not fit the pair (%d / %d); the VAE decodes it",
+                    int(tail.shape[0]), int(current.shape[0]), int(meta["previous_frames"]), int(meta["next_frames"]))
+        return None
+    decoded = torch.cat((tail.float(), current[warmup_start:].float()), dim=0).clamp_(0.0, 1.0)
+    _take_dwd_full(curr_v)
+    return decoded
+
+
 def _render_one_final_video_segment(
     data_path,
     segments,
@@ -3486,9 +3584,18 @@ def _render_one_final_video_segment(
     i = int(index)
     curr = segments[i]
 
+    started = time.time()
+    dwd_used = False
     if i == 0:
         v = _load_segment_video(data_path, curr)
-        video = (decode_fn or decode_video_latent)(vae, v)
+        video = None
+        if decode_fn is None:
+            pixels = _take_dwd_full(v)
+            if pixels is not None and int(pixels.shape[0]) == int(curr["frames"]):
+                video = pixels.float().clamp_(0.0, 1.0)
+                dwd_used = True
+        if video is None:
+            video = (decode_fn or decode_video_latent)(vae, v)
         if progress is not None:
             progress.advance()
         if video.ndim == 5:
@@ -3502,10 +3609,17 @@ def _render_one_final_video_segment(
                 f"expected {expected}."
             )
         del v
+        if dwd_used:
+            log.info("H3 video output (DWD): clip %d, %d frames, %.1f s (no VAE decode)", i + 1, expected, time.time() - started)
         return video, 0
 
     prev = segments[i - 1]
     chain, meta = _build_pair_video(data_path, prev, curr)
+    if decode_fn is None:
+        dwd_decoded = _dwd_pair_decoded(data_path, prev, curr, meta)
+        if dwd_decoded is not None:
+            decode_fn = lambda _vae, _chain, _decoded=dwd_decoded: _decoded
+            dwd_used = True
     decoded, previous_raw, current_raw, shift = _decode_pair_video(
         vae, chain, meta, decode_fn=decode_fn, forced_shift=forced_shift
     )
@@ -3516,6 +3630,9 @@ def _render_one_final_video_segment(
         progress.advance()
     current_video = _correct_current_segment(previous_raw, current_raw)
     del decoded, previous_raw, current_raw
+    if dwd_used:
+        log.info("H3 video output (DWD): clip %d, %d frames, %.1f s (no VAE decode)", i + 1,
+                 int(current_video.shape[0]), time.time() - started)
     return current_video, int(shift)
 
 
