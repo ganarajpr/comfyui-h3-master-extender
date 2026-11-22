@@ -668,6 +668,22 @@
   "min": 0,
   "max": 8
  },
+ "pass2_engine": {
+  "options": [
+   "LoRA refine",
+   "pi-H3 refine (DWD, no VAE decode)"
+  ]
+ },
+ "pih3_refine_steps": {
+  "type": "INT",
+  "min": 2,
+  "max": 4
+ },
+ "pih3_refine_tail": {
+  "type": "INT",
+  "min": 1,
+  "max": 4
+ },
  "clips_in": {
   "type": "STRING"
  }

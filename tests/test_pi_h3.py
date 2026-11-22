@@ -14,7 +14,7 @@ AD2 = "pi_h3_2step_dwd_adapter_int8_convrot.safetensors"
 AD4 = "pi_h3_4step_dwd_adapter_int8_convrot.safetensors"
 GRID = [1.0, 0.8, 0.0]
 FUNCS = ("check_pih3_steps", "pih3_adapter_file", "pih3_pack_module", "pih3_missing_pack_error", "_pih3_pack", "load_pih3_model",
-         "pih3_sigmas", "hyperflow_tail_sigmas", "cache_pih3_model", "pih3_dwd_module")
+         "pih3_sigmas", "hyperflow_tail_sigmas", "cache_pih3_model", "pih3_dwd_module", "check_pih3_tail", "pih3_tail_sigmas")
 NAMES = ("PIH3_ACCEL_MODE", "PIH3_STEPS", "PIH3_BASE_DEFAULT", "PIH3_ADAPTER_FILES", "PIH3_SCHEDULE", "_PIH3_CACHE",
          "PASS2_ENGINE_LORA", "PASS2_ENGINE_PIH3", "PASS2_ENGINES", "PIH3_REFINE_STEPS", "_PIH3_BASE_CACHE", "_PIH3_CACHE_MAX")
 LOG = logging.getLogger("test_pi_h3")
@@ -290,11 +290,13 @@ class ListScheduler:
 
 
 def refine_engine(**kw):
-    e = pih3_engine(**kw)
+    e = pih3_engine(**{k: v for k, v in kw.items() if k in ("lora", "steps")})
     e.pih3_refine = True
     e.pih3_refine_model = e.pih3_refine_raw = None
     e.dwd_sink = None
     e.pass2_chunk_frames = 124
+    e.pih3_refine_steps = kw.get("refine_steps", 2)
+    e.pih3_refine_tail = kw.get("refine_tail", 1)
     return e
 
 
@@ -421,7 +423,7 @@ class RefineEngine(unittest.TestCase):
 
     def test_pass1_shares_the_head_model_only_for_the_two_step_adapter(self):
         src = ENGINE.read_text(encoding="utf-8")
-        self.assertIn("keep_dwd = self.pih3_refine and adapter == PIH3_ADAPTER_FILES[PIH3_REFINE_STEPS]", src)
+        self.assertIn("keep_dwd = self.pih3_refine and adapter == PIH3_ADAPTER_FILES[self.pih3_refine_steps]", src)
         self.assertIn("if self.pih3_refine:\n                    self._discard_dwd_stash()", src)
 
     def _dwd_env(self):
@@ -503,6 +505,137 @@ class RefineWiring(unittest.TestCase):
 
     def test_frames_are_cleared_at_job_start_and_end(self):
         self.assertEqual(self.node.count("motion_context_disk.clear_dwd_frames()"), 2)
+
+
+GRIDS = {2: [0.9938, 0.8653, 0.0], 4: [0.9965, 0.9645, 0.8993, 0.6957, 0.0]}
+
+
+class GridScheduler:
+    calls = []
+
+    def get_sigmas(self, model, steps, min_raw_t, max_raw_t, final_step_size_scale):
+        GridScheduler.calls.append((steps, min_raw_t, max_raw_t, final_step_size_scale))
+        return (list(GRIDS[steps]),)
+
+
+class RefineTail(unittest.TestCase):
+    def sigmas(self, steps, tail):
+        _install(types.SimpleNamespace(NODE_CLASS_MAPPINGS={"pi-Flow Scheduler": GridScheduler}))
+        GridScheduler.calls.clear()
+        e = refine_engine(refine_steps=steps, refine_tail=tail)
+        with self.assertLogs("test_pi_h3", "INFO"):
+            return e._pass2_sigmas(Model(), 0.25)
+
+    def test_two_step_tail_one_is_the_old_behaviour(self):
+        self.assertEqual(self.sigmas(2, 1), [0.8653, 0.0])
+        self.assertEqual(GridScheduler.calls, [(2, 0.0, 0.93, 0.6)])
+
+    def test_four_step_tail_one(self):
+        self.assertEqual(self.sigmas(4, 1), [0.6957, 0.0])
+        self.assertEqual(GridScheduler.calls, [(4, 0.0, 0.96, 0.6)])
+
+    def test_four_step_tail_two(self):
+        self.assertEqual(self.sigmas(4, 2), [0.8993, 0.6957, 0.0])
+
+    def test_full_tail_is_the_whole_grid(self):
+        self.assertEqual(self.sigmas(2, 2), GRIDS[2])
+        self.assertEqual(self.sigmas(4, 4), GRIDS[4])
+
+    def test_the_dwd_head_fires_once_for_a_multi_step_tail(self):
+        # lakonlab fires when the current sigma equals the last non-zero sigma of the whole schedule, so only the last step does
+        tail = self.sigmas(4, 2)
+        last = [x for x in tail if x > 0][-1]
+        self.assertEqual([x for x in tail[:-1] if abs(x - last) < 1e-6], [last])
+
+    def test_tail_validation(self):
+        check = NS["check_pih3_tail"]
+        self.assertEqual([check(t, 4) for t in (1, 2, 3, 4, "2")], [1, 2, 3, 4, 2])
+        self.assertEqual(check(None, 2), 1)
+        for tail, steps in ((0, 2), (3, 2), (5, 4), (-1, 4)):
+            with self.assertRaises(ValueError):
+                check(tail, steps)
+        self.assertEqual(NS["pih3_tail_sigmas"]([1.0, 0.5, 0.0], 1), [0.5, 0.0])
+
+
+class RefineAdapterCache(unittest.TestCase):
+    def build(self, loads, steps, tail=1):
+        pack = DwdPack()
+        ENG_NS["load_pih3_model"] = lambda p, b, a, **kw: loads.append((b, a, kw["keep_dwd"])) or Model(a)
+        ENG_NS["_pih3_pack"] = lambda: pack
+        e = refine_engine(refine_steps=steps, refine_tail=tail)
+        e.initialize_model = lambda: (None, None)
+        e._apply_sigma_shift = lambda m: ("shifted", m.tag)
+        e._pass2_sla_override = lambda: None
+        e._finish_model = lambda m, **kw: ("final", m)
+        with self.assertLogs("test_pi_h3", "INFO"):
+            return e, e.initialize_pass2_model()
+
+    def tearDown(self):
+        NS["_PIH3_CACHE"].clear()
+        ENG_NS["load_pih3_model"] = NS["load_pih3_model"]
+        ENG_NS["_pih3_pack"] = NS["_pih3_pack"]
+
+    def test_two_and_four_step_pass2_models_never_get_confused(self):
+        NS["_PIH3_CACHE"].clear()
+        loads = []
+        _, two = self.build(loads, 2)
+        _, four = self.build(loads, 4)
+        _, two_again = self.build(loads, 2)
+        self.assertEqual(two, ("final", ("shifted", AD2)))
+        self.assertEqual(four, ("final", ("shifted", AD4)))
+        self.assertEqual(two_again, two)
+        self.assertEqual(loads, [(BASE, AD2, True), (BASE, AD4, True)])
+        self.assertEqual(sorted(k[1] for k in NS["_PIH3_CACHE"]), sorted([AD2, AD4]))
+
+    def test_pass1_shares_only_the_same_adapter(self):
+        src = ENGINE.read_text(encoding="utf-8")
+        self.assertIn("keep_dwd = self.pih3_refine and adapter == PIH3_ADAPTER_FILES[self.pih3_refine_steps]", src)
+        loads = []
+        NS["_PIH3_CACHE"].clear()
+        pack = DwdPack()
+        ENG_NS["load_pih3_model"] = lambda p, b, a, **kw: loads.append((a, kw["keep_dwd"])) or Model(a)
+        ENG_NS["_pih3_pack"] = lambda: pack
+        ENG_NS["pih3_sigmas"] = lambda cls, model, steps: types.SimpleNamespace(clone=lambda: types.SimpleNamespace(cpu=lambda: [1.0, 0.0]))
+        _install(types.SimpleNamespace(NODE_CLASS_MAPPINGS={"pi-Flow Scheduler": GridScheduler}))
+        try:
+            for pass1_steps, refine_steps in ((2, 2), (4, 2), (4, 4)):
+                loads.clear()
+                NS["_PIH3_CACHE"].clear()
+                e = refine_engine(steps=pass1_steps, refine_steps=refine_steps)
+                e.initialize_model = lambda: None
+                e._apply_sigma_shift = lambda m: m
+                e._finish_model = lambda m, **kw: m
+                with self.assertLogs("test_pi_h3", "INFO"):
+                    e.initialize_pih3_model()
+                self.assertEqual(loads, [(PIH3_FILES[pass1_steps], pass1_steps == refine_steps)])
+        finally:
+            ENG_NS["pih3_sigmas"] = NS["pih3_sigmas"]
+
+
+PIH3_FILES = {2: AD2, 4: AD4}
+
+
+class HiddenModesStayInTheBackend(unittest.TestCase):
+    node = NODE.read_text(encoding="utf-8")
+
+    def test_every_mode_is_still_accepted(self):
+        tree = ast.parse(self.node)
+        modes = next(ast.literal_eval(n.value) for n in tree.body
+                     if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
+        for mode in ("Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)",
+                     "CFG \u2192 Pika hand-off", "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", MODE):
+            self.assertIn(mode, modes)
+        self.assertIn("if accel_mode is not None and accel_mode not in ACCEL_MODES and not is_legacy_accel_mode(accel_mode):", self.node)
+
+    def test_new_inputs_defaults_and_validation(self):
+        self.assertRegex(self.node, r'"pih3_refine_steps": \("INT", \{"default": 2, "min": 2, "max": 4, "step": 2')
+        self.assertRegex(self.node, r'"pih3_refine_tail": \("INT", \{"default": 1, "min": 1, "max": 4, "step": 1')
+        self.assertLess(self.node.index('"pass2_engine": ('), self.node.index('"pih3_refine_steps": ('))
+        self.assertLess(self.node.index('"pih3_refine_tail": ('), self.node.index('"time_gate_json": ('))
+        self.assertIn("pih3_refine_steps=None, pih3_refine_tail=None", self.node)
+        self.assertIn("pih3_refine_tail: {pih3_refine_tail!r} must be between 1 and pih3_refine_steps", self.node)
+        self.assertIn("pih3_refine_steps=refine_steps,\n            pih3_refine_tail=refine_tail,", self.node)
+        self.assertIn("refine_tail = check_pih3_tail(kwargs.get(\"pih3_refine_tail\") or 1, refine_steps)", self.node)
 
 
 class Wiring(unittest.TestCase):

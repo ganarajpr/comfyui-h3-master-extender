@@ -300,6 +300,22 @@ def check_pih3_steps(steps):
     return steps
 
 
+def check_pih3_tail(tail, steps):
+    """Number of last steps of the refine adapter's grid that pass 2 runs: 1..steps."""
+    try:
+        tail = int(tail)
+    except (TypeError, ValueError):
+        tail = 1
+    if tail < 1 or tail > int(steps):
+        raise ValueError(f"pih3_refine_tail must be between 1 and pih3_refine_steps ({int(steps)}), got {tail}")
+    return tail
+
+
+def pih3_tail_sigmas(grid, tail):
+    """The last `tail` steps of a pi-Flow grid (steps + 1 points, ending in 0): [first sigma of the tail, ..., 0]."""
+    return grid[-(int(tail) + 1):]
+
+
 def pih3_adapter_file(steps):
     return PIH3_ADAPTER_FILES[check_pih3_steps(steps)]
 
@@ -579,6 +595,8 @@ class MasterEngine:
         pih3_base_file=PIH3_BASE_DEFAULT,
         pih3_steps=2,
         pass2_engine=PASS2_ENGINE_LORA,
+        pih3_refine_steps=PIH3_REFINE_STEPS,
+        pih3_refine_tail=1,
         handoff_step=HANDOFF_STEP_DEFAULT,
         pass1_cfg=PASS1_CFG_DEFAULT,
         cfg_steps=CFG_STEPS_DEFAULT,
@@ -618,6 +636,8 @@ class MasterEngine:
         self.pih3_model = None
         self.pih3_raw = None
         self.pih3_refine = str(pass2_engine) == PASS2_ENGINE_PIH3
+        self.pih3_refine_steps = check_pih3_steps(pih3_refine_steps)
+        self.pih3_refine_tail = check_pih3_tail(pih3_refine_tail, self.pih3_refine_steps)
         self.pih3_refine_model = None
         self.pih3_refine_raw = None
         self.dwd_sink = None
@@ -816,7 +836,7 @@ class MasterEngine:
         pack = _pih3_pack()
         steps = check_pih3_steps(self.pih3_steps)
         adapter = pih3_adapter_file(steps)
-        keep_dwd = self.pih3_refine and adapter == PIH3_ADAPTER_FILES[PIH3_REFINE_STEPS]
+        keep_dwd = self.pih3_refine and adapter == PIH3_ADAPTER_FILES[self.pih3_refine_steps]
         key = (self.pih3_base_file, adapter, keep_dwd)
         patcher, hit = cache_pih3_model(key, lambda: load_pih3_model(
             pack, self.pih3_base_file, adapter, keep_dwd=keep_dwd, base_cache=_PIH3_BASE_CACHE))
@@ -845,11 +865,12 @@ class MasterEngine:
         pack = _pih3_pack()
         if not hasattr(pack, "LakonLabAdapterLoader") or not hasattr(pack, "get_dwd_pixels"):
             raise pih3_missing_pack_error()
-        adapter = PIH3_ADAPTER_FILES[PIH3_REFINE_STEPS]
+        adapter = PIH3_ADAPTER_FILES[self.pih3_refine_steps]
         key = (self.pih3_base_file, adapter, True)
         patcher, hit = cache_pih3_model(key, lambda: load_pih3_model(
             pack, self.pih3_base_file, adapter, keep_dwd=True, base_cache=_PIH3_BASE_CACHE))
-        _LOG.info("pi-H3 refine: pass 2 on %s + %s (DWD head kept, one step, euler, cfg 1)%s", self.pih3_base_file, adapter,
+        _LOG.info("pi-H3 refine: pass 2 on %s + %s (DWD head kept, last %d step(s), euler, cfg 1)%s", self.pih3_base_file, adapter,
+                  self.pih3_refine_tail,
                   ", model already loaded" if hit else "")
         self.pih3_refine_raw = patcher
         self.pih3_refine_model = self._finish_model(self._apply_sigma_shift(patcher), sparsity=self._pass2_sla_override())
@@ -1338,9 +1359,10 @@ class MasterEngine:
             scheduler_cls = nodes.NODE_CLASS_MAPPINGS.get("pi-Flow Scheduler")
             if scheduler_cls is None:
                 raise pih3_missing_pack_error()
-            tail = pih3_sigmas(scheduler_cls, model, PIH3_REFINE_STEPS)[1:]
-            _LOG.info("pi-H3 refine: pass 2 is the last step of the %d-step pi-Flow grid on the shifted pass-2 model: %s "
-                      "(pass2_denoise, pass2_steps and the pass-2 scheduler do not apply)", PIH3_REFINE_STEPS,
+            steps, n = self.pih3_refine_steps, self.pih3_refine_tail
+            tail = pih3_tail_sigmas(pih3_sigmas(scheduler_cls, model, steps), n)
+            _LOG.info("pi-H3 refine: pass 2 is the last %d step(s) of the %d-step pi-Flow grid on the shifted pass-2 model: %s "
+                      "(pass2_denoise, pass2_steps and the pass-2 scheduler do not apply)", n, steps,
                       [round(float(x), 4) for x in tail])
             return tail
         if self.dual_active:

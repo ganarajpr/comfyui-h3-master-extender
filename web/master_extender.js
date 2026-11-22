@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, PASS2_ENGINE_PIH3, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -285,6 +285,7 @@ const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
 // pi-H3 (Lakonik/ComfyUI-piFlow) engine: the FL2VA base + a 2 / 4-step adapter for pass 1, its own two widgets, shown only in that mode.
 const PIH3_MODE = "pi-H3 (FL2VA adapter)";
 const PIH3_WIDGETS = ["pih3_base_file", "pih3_steps"];
+const PIH3_REFINE_WIDGETS = ["pih3_refine_steps", "pih3_refine_tail"];
 const isPih3Mode = (value) => String(value ?? "") === PIH3_MODE;
 // Pika \u2192 Flash hand-off: Pika (the turbo widgets) runs the first handoff_step steps, Flash (its widgets) the rest.
 const HANDOFF_MODE = "Pika \u2192 Flash hand-off";
@@ -437,6 +438,10 @@ function repairDualWidgets(node, defaults) {
     if (pih3Steps) pih3Steps.value = pih3StepsValue(pih3Steps.value);
     const pass2Engine = node.widgets?.find(x => x.name === "pass2_engine");
     if (pass2Engine) pass2Engine.value = pass2EngineValue(pass2Engine.value);
+    const refineSteps = node.widgets?.find(x => x.name === "pih3_refine_steps");
+    if (refineSteps) refineSteps.value = pih3RefineStepsValue(refineSteps.value);
+    const refineTail = node.widgets?.find(x => x.name === "pih3_refine_tail");
+    if (refineTail) refineTail.value = pih3RefineTailValue(refineTail.value, refineSteps?.value);
 }
 
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
@@ -490,7 +495,10 @@ function setupModeWidgets(node) {
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
-        PIH3_WIDGETS.forEach(n => setWidgetVisible(byName(n), isPih3Mode(accel?.value) || byName("pass2_engine")?.value === PASS2_ENGINE_PIH3));
+        const refineOn = byName("pass2_engine")?.value === PASS2_ENGINE_PIH3;
+        setWidgetVisible(byName("pih3_base_file"), isPih3Mode(accel?.value) || refineOn);
+        setWidgetVisible(byName("pih3_steps"), isPih3Mode(accel?.value));
+        PIH3_REFINE_WIDGETS.forEach(n => setWidgetVisible(byName(n), refineOn));
         setWidgetVisible(byName("handoff_step"), handoff);
         CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
         setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
@@ -1049,7 +1057,7 @@ app.registerExtension({
             function engineSummary() {
                 const steps = getW("pdd_nfe", "6");
                 const p2 = String(getW("pass2_lora", "none"));
-                const p2note = getW("pass2_engine", "") === PASS2_ENGINE_PIH3 ? " · refine pi-H3 DWD (no VAE decode)" : p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
+                const p2note = getW("pass2_engine", "") === PASS2_ENGINE_PIH3 ? ` · refine pi-H3 DWD ${getW("pih3_refine_steps", 2)}-step, last ${getW("pih3_refine_tail", 1)} (no VAE decode)` : p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
                 if (isCfg()) return `Base + CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} · ${getW("cfg_steps", 24)} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
@@ -1228,7 +1236,7 @@ app.registerExtension({
                 const accelW = W("accel_mode");
                 // The HyperFlow 8-step options are offered only while the node already holds one (a workflow saved before
                 // 2026-11-17): the engine is retired as a choice, so a new pick never lands on it.
-                const accelOptions = comboValues(accelW).filter(v => !isHyperflowMode(v) || isHyperflowMode(accelW?.value));
+                const accelOptions = visibleAccelModes(comboValues(accelW), accelW?.value);
                 const accelSel = uiSelect(accelOptions, accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
                     setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) || isCfgMode(v) || isCfgHandoffMode(v) ? "6" : "8", { rerender: false });
@@ -1314,10 +1322,19 @@ app.registerExtension({
                 }
                 if (W("pass2_engine")) wrap.appendChild(uiRow("refine engine", bindSelect("pass2_engine"),
                     { hint: "LoRA refine: base + the pass-2 LoRA, then the video VAE decode. pi-H3 refine (DWD, no VAE decode): pass 2 is one pi-H3 step (FL2VA base + 2-step DWD adapter) whose DWD head outputs the clip's frames, so the video VAE decode is skipped. Needs ComfyUI-piFlow and the standard final decode." }));
+                const refineOn = getW("pass2_engine", "") === PASS2_ENGINE_PIH3;
+                if (refineOn) {
+                    if (!isPih3()) wrap.appendChild(uiRow("pi-H3 base", bindSelect("pih3_base_file", { render: shortModelName }),
+                        { hint: "The FL2VA base the pi-H3 DWD adapter is patched onto for pass 2." }));
+                    wrap.appendChild(uiRow("refine adapter steps", bindNumber("pih3_refine_steps"),
+                        { hint: "2 or 4: which pi-H3 DWD adapter (and pi-Flow grid) pass 2 runs." }));
+                    wrap.appendChild(uiRow("refine tail steps", bindNumber("pih3_refine_tail"),
+                        { hint: "Pass 2 runs the LAST this-many steps of that grid (1..adapter steps); the latent is re-noised to the first sigma of the tail. The DWD head's pixels are the frames." }));
+                }
                 const p2lora = String(getW("pass2_lora", "none"));
-                wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
+                if (!refineOn) wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
                     { hint: "LoRA applied only on the pass-2 refine tail. none = same model as pass 1." }));
-                if (p2lora !== "none") {
+                if (!refineOn && p2lora !== "none") {
                     wrap.appendChild(uiRow("refine lora strength", bindNumber("pass2_lora_strength"), { indent: true }));
                     wrap.appendChild(uiRow("mode", bindSelect("pass2_lora_mode", { render: (v) => String(v).replace(" engine LoRA", "") }),
                         { indent: true, hint: "stack: on top of the engine LoRA. replace: base model + this LoRA only (step-distilled LoRAs)." }));

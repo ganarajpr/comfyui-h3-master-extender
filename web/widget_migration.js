@@ -255,3 +255,19 @@ export function pass2EngineValue(value) {
     return value === PASS2_ENGINE_PIH3 ? PASS2_ENGINE_PIH3 : PASS2_ENGINE_LORA;
 }
 
+// pih3_refine_steps and pih3_refine_tail are appended after pass2_engine: a workflow saved before them carries master_ui's "" (or
+// nothing) in those slots. Steps other than 2 / 4 = 2; a tail outside 1..steps = 1, which is what those workflows rendered.
+export function pih3RefineStepsValue(value) {
+    return value === 2 || value === 4 ? value : 2;
+}
+export function pih3RefineTailValue(value, steps) {
+    return Number.isInteger(value) && value >= 1 && value <= pih3RefineStepsValue(steps) ? value : 1;
+}
+
+// The engine dropdown offers only these two. Every other accel_mode stays in the backend (saved workflows and API graphs that use
+// one still validate and render); a node that already holds one keeps it selectable so the value is shown, never rewritten.
+export const VISIBLE_ACCEL_MODES = ["Turbo LoRA", "pi-H3 (FL2VA adapter)"];
+export function visibleAccelModes(options, current) {
+    return (options || []).filter(v => VISIBLE_ACCEL_MODES.includes(v) || v === current);
+}
+

@@ -80,3 +80,18 @@ The log line reads `Pika -> Flash hand-off: Pika steps 1..3 (sigma 1.0->0.7000),
 - **Not combinable with** an X2 / upscaling `final_decode`: validation and the run reject it with a message (the DWD pixels are 1x).
 - **Log lines:** `Clip N: pass 2 sampling X s`, `H3 video output (DWD): clip N, F frames, X s (no VAE decode)`.
 
+### Choosing the refine adapter and tail
+
+`pih3_refine_steps` (2 or 4, default 2) picks the pass-2 DWD adapter (`pi_h3_2step_dwd_adapter_int8_convrot` / `pi_h3_4step_dwd_adapter_int8_convrot`); `pih3_refine_tail` (default 1, 1..steps, checked) is how many of the LAST steps of that adapter's pi-Flow grid pass 2 runs. The grid is computed on the shifted pass-2 model and the upscaled pass-1 latent is re-noised to the first sigma of the tail. Grids measured on the box:
+
+| adapter | grid | tail 1 | tail 2 |
+|---|---|---|---|
+| 2-step | `[0.9938, 0.8653, 0]` | `[0.8653, 0]` | `[0.9938, 0.8653, 0]` |
+| 4-step | `[0.9965, 0.9645, 0.8993, 0.6957, 0]` | `[0.6957, 0]` | `[0.8993, 0.6957, 0]` |
+
+The DWD head fires only when the current step's sigma equals the last non-zero sigma of the whole schedule, so a multi-step tail still produces pixels once, on its last step. The patched pass-2 model is cached per adapter file, so a 2-step and a 4-step model are never confused; a pi-H3 pass 1 shares the pass-2 model only when it uses the same adapter.
+
+**Presets** (panel Preset dropdown): "Standard · Pika + DMAD" (unchanged, now also sets `pass2_engine` to LoRA refine), "Pika + pi-H3 refine 2-step" (2-step adapter, tail 1) and "Pika + pi-H3 refine 4-step" (4-step adapter, tail 2, starting at sigma 0.8993). The three share the Standard Pika pass-1 values and 608x352 -> 1280x720.
+
+**Engine dropdown.** The panel offers only "Turbo LoRA" and "pi-H3 (FL2VA adapter)". HyperFlow Flash, the Pika -> Flash hand-off, Base + CFG, CFG -> Pika hand-off and the HyperFlow 8-step options are hidden from the dropdown but stay in the backend, so saved workflows and API graphs that use them still validate and render; a node that already holds one shows it and keeps it selectable.
+

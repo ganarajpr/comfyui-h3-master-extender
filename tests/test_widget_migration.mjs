@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT, pass2EngineValue, PASS2_ENGINE_LORA, PASS2_ENGINE_PIH3 } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT, pass2EngineValue, PASS2_ENGINE_LORA, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, VISIBLE_ACCEL_MODES } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -114,6 +114,25 @@ for (const file of workflows) {
 }
 
 // HyperFlow Flash widgets (appended last): master_ui's "" in the file slot and any non-4/6/8 steps fall back to the defaults
+assert.deepEqual([2, 4].map(pih3RefineStepsValue), [2, 4]);
+assert.equal(pih3RefineStepsValue(""), 2);
+assert.equal(pih3RefineStepsValue(3), 2);
+assert.equal(pih3RefineTailValue("", 4), 1);
+assert.equal(pih3RefineTailValue(2, 4), 2);
+assert.equal(pih3RefineTailValue(3, 2), 1, "a tail beyond the adapter steps is repaired");
+assert.equal(pih3RefineTailValue(0, 4), 1);
+{
+    const all = ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off",
+                 "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "pi-H3 (FL2VA adapter)"];
+    assert.deepEqual(visibleAccelModes(all, "Turbo LoRA"), ["Turbo LoRA", "pi-H3 (FL2VA adapter)"]);
+    assert.deepEqual(visibleAccelModes(all, "pi-H3 (FL2VA adapter)"), VISIBLE_ACCEL_MODES);
+    for (const hidden of all.filter(m => !VISIBLE_ACCEL_MODES.includes(m))) {
+        const shown = visibleAccelModes(all, hidden);
+        assert(shown.includes(hidden), `${hidden}: a loaded workflow's hidden mode is still shown`);
+        assert.equal(shown.length, 3, `${hidden}: only that one extra`);
+    }
+    assert.deepEqual(visibleAccelModes(undefined, "x"), []);
+}
 assert.equal(pass2EngineValue(""), PASS2_ENGINE_LORA);
 assert.equal(pass2EngineValue(undefined), PASS2_ENGINE_LORA);
 assert.equal(pass2EngineValue("gone"), PASS2_ENGINE_LORA);

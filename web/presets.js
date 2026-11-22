@@ -3,6 +3,19 @@
 const PIKA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors";
 const DMAD = "h3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors";
 
+const PIH3_REFINE = "pi-H3 refine (DWD, no VAE decode)";
+// The Standard pass-1 values; the pi-H3 refine presets differ only in the pass-2 engine (the pass-2 LoRA widgets are ignored there).
+const PIKA_PASS1 = {
+    accel_mode: "Turbo LoRA",
+    turbo_lora: PIKA,
+    turbo_lora_strength: 1,
+    pdd_nfe: "6",
+    turbo_sampler: "euler",
+    turbo_scheduler: "simple",
+    pass1_resolution: "608x352 (16:9)",
+    pass2_resolution: "1280x720",
+};
+
 export const MASTER_PRESETS = [
     {
         id: "standard",
@@ -22,6 +35,29 @@ export const MASTER_PRESETS = [
             pass1_resolution: "608x352 (16:9)",
             pass2_resolution: "1280x720",
             pass2_chunk_frames: 124,
+            pass2_engine: "LoRA refine",
+        },
+    },
+    {
+        id: "pika_pih3_refine_2",
+        label: "Pika + pi-H3 refine 2-step",
+        hint: "Pika pass 1 as Standard; pass 2 is the last step of the pi-H3 2-step DWD grid, and the DWD head's pixels replace the video VAE decode. The chained 2 x 15 s standard test measured 169.9 s.",
+        values: {
+            ...PIKA_PASS1,
+            pass2_engine: PIH3_REFINE,
+            pih3_refine_steps: 2,
+            pih3_refine_tail: 1,
+        },
+    },
+    {
+        id: "pika_pih3_refine_4",
+        label: "Pika + pi-H3 refine 4-step",
+        hint: "Pika pass 1 as Standard; pass 2 is the last 2 steps of the pi-H3 4-step DWD grid (starts at sigma 0.8993, close to the DMAD refine strength), pixels from the DWD head, no video VAE decode.",
+        values: {
+            ...PIKA_PASS1,
+            pass2_engine: PIH3_REFINE,
+            pih3_refine_steps: 4,
+            pih3_refine_tail: 2,
         },
     },
 ];
