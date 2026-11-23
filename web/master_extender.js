@@ -2036,6 +2036,26 @@ app.registerExtension({
                         if (!ok) showCopyBox(text, `the ${clipsState.length} clips`);
                         setTimeout(() => { copyAllBtn.textContent = "⧉ Copy all"; }, 1500);
                     };
+                    // Save every clip to a file on the ComfyUI machine (user/default/master_extender/clips.json), for lists too
+                    // big for a remote-desktop clipboard (Parsec carries at most ~100 KB). Fetch it elsewhere as plain JSON, e.g.
+                    // on a Mac: ssh <box> "type <ComfyUI>\user\default\master_extender\clips.json" | pbcopy
+                    const saveBtn = document.createElement("button");
+                    saveBtn.textContent = "Save clips";
+                    saveBtn.title = "Save every clip as JSON to user/default/master_extender/clips.json on the ComfyUI machine (overwrites the last save). Use it when the list is too big to copy through Parsec.";
+                    saveBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3f3f58").replace("#4ade80", "#ddd");
+                    saveBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        const text = packClips(clipsState);
+                        let ok = false;
+                        try {
+                            const response = await api.fetchApi(`/userdata/${encodeURIComponent("master_extender/clips.json")}?overwrite=true`, {
+                                method: "POST", headers: { "Content-Type": "application/json" }, body: text,
+                            });
+                            ok = response.ok;
+                        } catch (error) { ok = false; }
+                        saveBtn.textContent = ok ? `✓ Saved ${clipsState.length} (${Math.round(text.length / 1024)} KB)` : "Save failed";
+                        setTimeout(() => { saveBtn.textContent = "Save clips"; }, 2500);
+                    };
                     const pasteBtn = document.createElement("button");
                     pasteBtn.textContent = "Paste clips";
                     pasteBtn.title = "Paste the clips copied with Copy all (from any Master Extender, this workflow or another). Asks whether to append or replace.";
@@ -2045,7 +2065,7 @@ app.registerExtension({
                         const incoming = await askForClipsText();
                         if (incoming) pasteClips(incoming);
                     };
-                    actions.append(copyAllBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
+                    actions.append(copyAllBtn, saveBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
                 container.appendChild(projectControls.references());
