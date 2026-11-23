@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue, diversityLoraValue, diversityStrengthValue, diversityStepsValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -267,6 +267,7 @@ function clampDuration(sec, beyond) {
 // Conditional widget visibility on the Master node. A hidden widget keeps its
 // value and its slot in widgets_values; it just draws with zero height.
 const TURBO_ONLY_WIDGETS = ["turbo_lora", "turbo_lora_strength", "turbo_sampler", "turbo_scheduler"];
+const DIVERSITY_WIDGETS = ["diversity_lora", "diversity_lora_strength", "diversity_steps"];
 // pdd_file is retired: it keeps its slot in widgets_values (saved workflows) but is never shown.
 const ALWAYS_HIDDEN_WIDGETS = ["pdd_file"];
 const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
@@ -442,6 +443,12 @@ function repairDualWidgets(node, defaults) {
     if (refineSteps) refineSteps.value = pih3RefineStepsValue(refineSteps.value);
     const refineTail = node.widgets?.find(x => x.name === "pih3_refine_tail");
     if (refineTail) refineTail.value = pih3RefineTailValue(refineTail.value, refineSteps?.value);
+    const divLora = node.widgets?.find(x => x.name === "diversity_lora");
+    if (divLora) divLora.value = diversityLoraValue(divLora.value, comboValues(divLora));
+    const divStrength = node.widgets?.find(x => x.name === "diversity_lora_strength");
+    if (divStrength) divStrength.value = diversityStrengthValue(divStrength.value);
+    const divSteps = node.widgets?.find(x => x.name === "diversity_steps");
+    if (divSteps) divSteps.value = diversityStepsValue(divSteps.value);
 }
 
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
@@ -500,6 +507,7 @@ function setupModeWidgets(node) {
         setWidgetVisible(byName("pih3_steps"), isPih3Mode(accel?.value));
         PIH3_REFINE_WIDGETS.forEach(n => setWidgetVisible(byName(n), refineOn));
         setWidgetVisible(byName("handoff_step"), handoff);
+        DIVERSITY_WIDGETS.forEach(n => setWidgetVisible(byName(n), mode === "turbo lora"));
         CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
         setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
@@ -1073,7 +1081,8 @@ app.registerExtension({
                     const p1sNote = (!dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
                     return `HyperFlow 8-step (legacy) · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
                 }
-                return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
+                const divNote = String(getW("diversity_lora", "none")) !== "none" ? ` · diversity ${shortModelName(getW("diversity_lora"))} x${Number(getW("diversity_lora_strength", 1)).toFixed(2)} first ${getW("diversity_steps", 1)}` : "";
+                return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))}${divNote} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
             }
             function qualitySummary() {
                 const { preset, orientation } = currentPreset();
@@ -1312,6 +1321,15 @@ app.registerExtension({
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
+                    if (W("diversity_lora")) {
+                        wrap.appendChild(uiRow("diversity lora", bindSelect("diversity_lora", { render: shortModelName }),
+                            { hint: "Applied on top of the turbo LoRA for the first N pass-1 steps only (ReDiverse restores the variety distillation removes). none = off." }));
+                        if (getW("diversity_lora", "none") !== "none") {
+                            wrap.appendChild(uiRow("diversity strength", bindNumber("diversity_lora_strength"), { indent: true }));
+                            wrap.appendChild(uiRow("diversity steps", bindNumber("diversity_steps"),
+                                { indent: true, hint: "How many of the first steps carry the diversity LoRA (1 = the author's recipe). Clamped to steps - 1." }));
+                        }
+                    }
                     if (expert()) {
                         wrap.appendChild(uiRow("lora strength", bindNumber("turbo_lora_strength"), { indent: true }));
                         wrap.appendChild(uiRow("sampler", bindSelect("turbo_sampler"), { indent: true }));

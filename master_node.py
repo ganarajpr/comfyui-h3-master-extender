@@ -85,6 +85,7 @@ from .pdd_pure_engine import (
     CFG_HANDOFF_STEPS_DEFAULT,
     cfg_pass1_settings,
     clamp_cfg_handoff_steps,
+    diversity_p1_settings,
     parse_handoff_step,
     HANDOFF_STEP_OPTIONS,
     HANDOFF_STEP_DEFAULT_LABEL,
@@ -608,6 +609,9 @@ class MiniMaxH3MasterExtender:
                 "pass2_engine": (PASS2_ENGINES, {"default": PASS2_ENGINE_LORA, "tooltip": "Pass-2 refine engine. LoRA refine (default): the base model + the pass-2 LoRA (DMAD), then the video VAE decodes the clip. pi-H3 refine (DWD, no VAE decode): pass 2 is ONE step, the last step of the pi-H3 2-step pi-Flow grid, on the FL2VA base (pih3_base_file) + pi_h3_2step_dwd_adapter_int8_convrot with its DWD head kept; the head's pixels are the clip's frames and the video VAE decode is skipped (the audio VAE still decodes the audio; the latent is stored as always, so chaining and caches work). Pass 1 is independent. Needs ComfyUI-piFlow. pass2_denoise, pass2_steps, the pass-2 LoRA and windowed pass 2 do not apply; an X2 final_decode is rejected."}),
                 "pih3_refine_steps": ("INT", {"default": 2, "min": 2, "max": 4, "step": 2, "tooltip": "pi-H3 refine only (pass2_engine): which pi-H3 DWD adapter pass 2 runs, 2 or 4 steps (pi_h3_2step_dwd_adapter_int8_convrot / pi_h3_4step_dwd_adapter_int8_convrot). Its pi-Flow grid is computed on the shifted pass-2 model: 2-step [0.9938, 0.8653, 0], 4-step [0.9965, 0.9645, 0.8993, 0.6957, 0] on the box."}),
                 "pih3_refine_tail": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1, "tooltip": "pi-H3 refine only: pass 2 runs the LAST this-many steps of the refine adapter's grid (1..steps), re-noising the upscaled pass-1 latent to the first sigma of that tail. 2-step/1 = [0.8653, 0]; 4-step/1 = [0.6957, 0]; 4-step/2 = [0.8993, 0.6957, 0]. The DWD head fires once, on the last step."}),
+                "diversity_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "First-step diversity LoRA (e.g. ReDiverse-Pika-H3-Flex): applied ON TOP of turbo_lora for the first diversity_steps steps of pass 1 only, then the turbo LoRA alone finishes the schedule from that noise level (same seed, no added noise). It restores generation diversity that distillation removes. Turbo LoRA mode only (ignored, with a log line, in every other accel_mode). none = off, and the render is exactly as before. Part of the pass-1 cache key when on."}),
+                "diversity_lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Strength of the diversity LoRA (diversity_lora). 1.0 is the author's setting."}),
+                "diversity_steps": ("INT", {"default": 1, "min": 1, "max": 7, "step": 1, "tooltip": "How many of the first pass-1 steps run with the diversity LoRA on top of the turbo LoRA (clamped to the turbo step count - 1). 1 is the author's recipe: sigma 1.0 -> 0.973 of the 6-step Pika grid."}),
                 "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -629,7 +633,7 @@ class MiniMaxH3MasterExtender:
     def VALIDATE_INPUTS(cls, hyperflow_file=None, final_decode=None, rewrite_reasoning_budget=None, semantic_bridge=None, accel_mode=None,
                         hyperflow_flash_file=None, hyperflow_flash_steps=None, hyperflow_flash_lora=None, turbo_lora=None,
                         pih3_base_file=None, pih3_steps=None, pass2_engine=None,
-                        pih3_refine_steps=None, pih3_refine_tail=None):
+                        pih3_refine_steps=None, pih3_refine_tail=None, diversity_lora=None):
         # accel_mode: API graphs saved before PDD mode was removed still send "PDD 8-step"; normalize_accel_mode maps
         # it to HyperFlow 8-step at run time. Naming it here skips core's combo check, so anything else unknown is rejected.
         if accel_mode is not None and accel_mode not in ACCEL_MODES and not is_legacy_accel_mode(accel_mode):
@@ -646,6 +650,8 @@ class MiniMaxH3MasterExtender:
         # turbo_lora is named here only for the hand-off check; naming it skips core's combo check, so repeat it.
         if isinstance(turbo_lora, str) and turbo_lora != "none" and turbo_lora not in folder_paths.get_filename_list("loras"):
             return f"turbo_lora: '{turbo_lora}' not in loras"
+        if isinstance(diversity_lora, str) and diversity_lora not in ("", "none") and diversity_lora not in folder_paths.get_filename_list("loras"):
+            return f"diversity_lora: '{diversity_lora}' not in loras"
         if normalize_accel_mode(accel_mode) == HANDOFF_ACCEL_MODE and turbo_lora in ("", "none"):
             return "accel_mode: Pika \u2192 Flash hand-off needs a turbo_lora (the Pika LoRA), not none"
         if normalize_accel_mode(accel_mode) == CFG_HANDOFF_ACCEL_MODE and turbo_lora in ("", "none"):
@@ -1088,6 +1094,13 @@ class MiniMaxH3MasterExtender:
             background_busy=lambda: background["worker"] is not None and background["worker"].busy(),
             wait_background=lambda: _finish_background(),
         )
+        div_lora = kwargs.get("diversity_lora", "none")
+        div_lora = div_lora if isinstance(div_lora, str) and div_lora else "none"
+        div_strength = kwargs.get("diversity_lora_strength", 1.0)
+        div_strength = float(div_strength) if isinstance(div_strength, (int, float)) and not isinstance(div_strength, bool) else 1.0
+        div_steps = kwargs.get("diversity_steps", 1)
+        div_steps = int(div_steps) if isinstance(div_steps, (int, float)) and not isinstance(div_steps, bool) and int(div_steps) >= 1 else 1
+        engine.configure_diversity(div_lora, div_strength, div_steps)
         engine.configure_pass2_lora(
             kwargs.get("pass2_lora", "none"),
             kwargs.get("pass2_lora_strength", 1.0),
@@ -1181,6 +1194,11 @@ class MiniMaxH3MasterExtender:
             # Only in hand-off mode (the Pika parts are already in the base keys): a different Flash file / steps /
             # LoRA or hand-off step never shares a cached pass 1.
             p1_settings["handoff"] = [flash_file, flash_steps, flash_lora, flash_lora_strength, handoff_step]
+
+        div_entry = diversity_p1_settings(accel_mode, div_lora, div_strength, engine.diversity_steps) if engine._diversity_active() else None
+        if div_entry is not None:
+            # Only when the diversity LoRA is active, so every pass-1 cache written without it keeps its fingerprint.
+            p1_settings["diversity"] = div_entry
 
         cfg_entry = cfg_pass1_settings(accel_mode, pass1_cfg, cfg_steps, negative_prompt, cfg_handoff_steps)
         if cfg_entry is not None:

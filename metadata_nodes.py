@@ -170,7 +170,8 @@ def _settings_summary(inputs: dict | None, clips: list[dict]) -> str:
         accel = inputs.get("accel_mode", "Turbo LoRA")
         steps = inputs.get("pdd_nfe", "?")
         if str(accel).lower().startswith("turbo"):
-            lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}")
+            lines.append(f"Engine: Turbo LoRA {inputs.get('turbo_lora', '')} x{inputs.get('turbo_lora_strength', 1.0)} · {steps} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}"
+                         + (f" · diversity {inputs.get('diversity_lora')} x{inputs.get('diversity_lora_strength', 1.0)} on first {inputs.get('diversity_steps', 1)} step(s)" if inputs.get('diversity_lora') not in (None, '', 'none') and str(accel) == 'Turbo LoRA' else ""))
         elif str(accel).startswith("Base + CFG"):
             lines.append(f"Engine: Base + CFG {inputs.get('pass1_cfg', 4.5)} (undistilled) · {inputs.get('cfg_steps', 24)} steps · {inputs.get('turbo_sampler', '')} / {inputs.get('turbo_scheduler', '')}"
                          + (" · negative prompt" if str(inputs.get('negative_prompt') or "").strip() else ""))

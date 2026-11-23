@@ -435,6 +435,28 @@ def split_handoff_sigmas(pika_sigmas, k, flash_grid):
     return pika[:k + 1], flash, sigma
 
 
+TURBO_ACCEL_MODE = "Turbo LoRA"
+
+
+def clamp_diversity_steps(k, nfe):
+    """Diversity-LoRA steps: 1..nfe-1 of the nfe-step turbo schedule (at least one step must stay plain turbo)."""
+    return max(1, min(int(k), int(nfe) - 1))
+
+
+def split_diversity_sigmas(sigmas, k):
+    """(diversity_segment, turbo_segment): the diversity LoRA samples sigmas[0..k], plain turbo continues from sigmas[k]."""
+    s = [float(x) for x in sigmas]
+    return s[:k + 1], s[k:]
+
+
+def diversity_p1_settings(accel_mode, lora, strength, steps):
+    """Pass-1 fingerprint entry of the first-step diversity LoRA (None when it is off or not applicable, so every other
+    pass-1 cache keeps its fingerprint)."""
+    if str(accel_mode) != TURBO_ACCEL_MODE or lora in (None, "", "none"):
+        return None
+    return [str(lora), round(float(strength), 4), int(steps)]
+
+
 def is_cfg_accel_mode(accel_mode):
     return str(accel_mode) in (CFG_ACCEL_MODE, CFG_HANDOFF_ACCEL_MODE)
 
@@ -648,6 +670,10 @@ class MasterEngine:
         self.hyperflow_pruned_refit = False
         self.turbo_lora = turbo_lora if turbo_lora and turbo_lora != "none" else None
         self.turbo_lora_strength = float(turbo_lora_strength)
+        self.diversity_lora = None
+        self.diversity_lora_strength = 1.0
+        self.diversity_steps = 1
+        self.diversity_model = None
         self.sampler_name = sampler_name
         self.scheduler_name = scheduler_name
         self.sla_enabled = bool(sla_enabled)
@@ -1032,7 +1058,48 @@ class MasterEngine:
         if self.handoff_mode or self.cfg_handoff_mode:
             _LOG.warning("Clip %d: time_gate_json is not applied in the hand-off modes (the second segment runs another model)", clip_index + 1)
             return contextlib.nullcontext()
+        if self._diversity_active():
+            _LOG.warning("Clip %d: time_gate_json acts on the plain turbo segment only; the diversity LoRA segment runs without it", clip_index + 1)
         return time_gate_lora.scope(model, self.time_gate, clip_index, trim_frames)
+
+    def configure_diversity(self, lora="none", strength=1.0, steps=1):
+        """First-step diversity LoRA (ReDiverse): applied on top of the turbo LoRA for the first `steps` pass-1 steps only.
+        Plain Turbo LoRA mode with a turbo LoRA only; ignored (and logged once) otherwise."""
+        self.diversity_lora = None
+        self.diversity_model = None
+        if lora in (None, "", "none"):
+            return
+        if self.accel_mode != TURBO_ACCEL_MODE or self.turbo_lora is None:
+            _LOG.warning("Diversity LoRA %s ignored: it needs accel_mode Turbo LoRA with a turbo_lora (mode is %s)",
+                         lora, self.accel_mode)
+            return
+        self.diversity_lora = str(lora)
+        self.diversity_lora_strength = float(strength if strength is not None else 1.0)
+        self.diversity_steps = clamp_diversity_steps(steps or 1, int(self.turbo_steps))
+
+    def _diversity_active(self):
+        return self.diversity_lora is not None
+
+    def initialize_diversity_model(self):
+        """Pass-1 model of the first segment: the turbo model + the diversity LoRA, finished like the pass-1 model."""
+        if self.diversity_model is None:
+            self.initialize_model()
+            lora_cls = nodes.NODE_CLASS_MAPPINGS.get("LoraLoaderModelOnly")
+            res = lora_cls().load_lora_model_only(self.accel_model, self.diversity_lora, self.diversity_lora_strength)
+            self.diversity_model = self._finish_model(_safe_get_output(res, 0, "model"), tst=True)
+        return self.diversity_model
+
+    def _sample_diversity(self, turbo_model, sigmas, positive, latent, seed):
+        """Pass 1 with a diversity first segment: turbo + diversity LoRA samples steps 1..k, then the plain turbo model
+        continues from that noise level with no added noise (same seed, same split pattern as the hand-offs)."""
+        k = clamp_diversity_steps(self.diversity_steps, len(sigmas) - 1)
+        div_seg, turbo_seg = split_diversity_sigmas(sigmas, k)
+        _LOG.info("Diversity LoRA: %s @ %.2f on steps 1..%d (sigma 1.0->%.4f), then %s alone",
+                  self.diversity_lora, self.diversity_lora_strength, k, turbo_seg[0], self.turbo_lora)
+        mid = self._sample_euler(self.initialize_diversity_model(), positive, latent,
+                                 torch.tensor(div_seg, dtype=torch.float32), seed)
+        return self._sample_euler(turbo_model, positive, mid, torch.tensor(turbo_seg, dtype=torch.float32), seed,
+                                  add_noise=False)
 
     def configure_pass1_steps(self, steps=0):
         """Opt-in: stop HyperFlow's pass 1 after `steps` of its 8 steps and hand the model's clean x0 estimate to the
@@ -2125,6 +2192,8 @@ class MasterEngine:
                 elif self.cfg_handoff_mode:
                     sampled_p1 = self._sample_cfg_handoff(self.initialize_cfg_model(), model, sigmas_p1, pos_p1, neg_p1,
                                                           latent_p1, seed)
+                elif self._diversity_active() and not early_stop:
+                    sampled_p1 = self._sample_diversity(model, sigmas_p1, pos_p1, latent_p1, seed)
                 else:
                     sampled_p1 = self._sample_euler(
                         model=model,

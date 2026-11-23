@@ -264,6 +264,18 @@ export function pih3RefineTailValue(value, steps) {
     return Number.isInteger(value) && value >= 1 && value <= pih3RefineStepsValue(steps) ? value : 1;
 }
 
+// diversity_lora, diversity_lora_strength and diversity_steps are appended after pih3_refine_tail: a workflow saved before them
+// carries master_ui's "" (or nothing) in those slots. "" / unknown file = none (off), which is what those workflows rendered.
+export function diversityLoraValue(value, options) {
+    return typeof value === "string" && value !== "" && (!Array.isArray(options) || options.includes(value)) ? value : "none";
+}
+export function diversityStrengthValue(value) {
+    return typeof value === "number" && Number.isFinite(value) ? value : 1.0;
+}
+export function diversityStepsValue(value) {
+    return Number.isInteger(value) && value >= 1 ? value : 1;
+}
+
 // The engine dropdown offers only these two. Every other accel_mode stays in the backend (saved workflows and API graphs that use
 // one still validate and render); a node that already holds one keeps it selectable so the value is shown, never rewritten.
 export const VISIBLE_ACCEL_MODES = ["Turbo LoRA", "pi-H3 (FL2VA adapter)"];

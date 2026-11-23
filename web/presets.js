@@ -3,12 +3,17 @@
 const PIKA = "h3\\pika_h3_flex_ref2va_comfy_bf16.safetensors";
 const DMAD = "h3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors";
 
+const REDIVERSE = "h3\\rediverse_pika_h3_flex_ft_comfyui.safetensors";
+
 const PIH3_REFINE = "pi-H3 refine (DWD, no VAE decode)";
 // The Standard pass-1 values; the pi-H3 refine presets differ only in the pass-2 engine (the pass-2 LoRA widgets are ignored there).
 const PIKA_PASS1 = {
     accel_mode: "Turbo LoRA",
     turbo_lora: PIKA,
     turbo_lora_strength: 1,
+    diversity_lora: REDIVERSE,
+    diversity_lora_strength: 1,
+    diversity_steps: 1,
     pdd_nfe: "6",
     turbo_sampler: "euler",
     turbo_scheduler: "simple",
@@ -25,6 +30,9 @@ export const MASTER_PRESETS = [
             accel_mode: "Turbo LoRA",
             turbo_lora: PIKA,
             turbo_lora_strength: 1,
+            diversity_lora: REDIVERSE,
+            diversity_lora_strength: 1,
+            diversity_steps: 1,
             pdd_nfe: "6",
             turbo_sampler: "euler",
             turbo_scheduler: "simple",
