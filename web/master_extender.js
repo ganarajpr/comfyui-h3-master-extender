@@ -40,18 +40,79 @@ const H3_SECTIONS = new Set([
     "camera", "style", "negative", "audio", "music", "voice", "shots",
 ]);
 
+// Returns true only when the text really reached the clipboard. The clipboard API needs https or localhost; a plain
+// http page (ComfyUI opened from another machine, e.g. through the gateway) falls back to execCommand, which can fail
+// WITHOUT throwing, so its return value is checked. Callers show the text to copy by hand when this returns false.
 async function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-        return;
+        try { await navigator.clipboard.writeText(text); return true; } catch (error) { /* try the fallback */ }
     }
     const area = document.createElement("textarea");
     area.value = text;
-    area.style.cssText = "position: fixed; left: -9999px;";
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position: fixed; left: -9999px; top: 0;";
+    // ComfyUI's own copy handler (copies nodes) must not see this event.
+    area.addEventListener("copy", (e) => e.stopPropagation());
     document.body.appendChild(area);
+    const previous = document.activeElement;
+    area.focus();
     area.select();
-    document.execCommand("copy");
+    let ok = false;
+    try { ok = document.execCommand("copy") === true; } catch (error) { ok = false; }
     area.remove();
+    if (previous && typeof previous.focus === "function") previous.focus();
+    return ok;
+}
+
+// When the browser would not copy: a box with the text already selected, to copy with Ctrl+C / Cmd+C.
+function showCopyBox(text, what) {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center;";
+    const box = document.createElement("div");
+    box.style.cssText = "background: #1e1e2a; border: 1px solid #3f3f58; border-radius: 8px; padding: 14px; width: min(760px, 92vw); display: flex; flex-direction: column; gap: 8px; font: 12px sans-serif; color: #ddd;";
+    const title = document.createElement("div");
+    title.textContent = `This browser would not copy ${what} by itself (the page is not https or localhost). The text below is selected: press Ctrl+C (Cmd+C on a Mac), then Close.`;
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.readOnly = true;
+    area.spellcheck = false;
+    area.style.cssText = "width: 100%; height: 50vh; box-sizing: border-box; background: #111118; color: #ddd; border: 1px solid #444; border-radius: 5px; font: 11px monospace; padding: 8px; resize: vertical;";
+    const status = document.createElement("div");
+    status.style.cssText = "min-height: 14px; color: #8fb0e6;";
+    const row = document.createElement("div");
+    row.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+    const btnStyle = "padding: 4px 14px; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px;";
+    const copy = document.createElement("button");
+    copy.textContent = "Copy";
+    copy.style.cssText = btnStyle + "background: #3f3f58; border: 1px solid #ddd; color: #fff;";
+    const close = document.createElement("button");
+    close.textContent = "Close";
+    close.style.cssText = btnStyle + "background: transparent; border: 1px solid #555; color: #ccc;";
+    row.append(copy, close);
+    box.append(title, area, status, row);
+    overlay.appendChild(box);
+    // Keep ComfyUI's canvas shortcuts (Ctrl+C copies nodes, Delete removes them) out of the box.
+    for (const type of ["keydown", "keyup", "keypress", "paste", "copy", "cut"]) {
+        overlay.addEventListener(type, (e) => e.stopPropagation());
+    }
+    area.addEventListener("copy", () => { status.textContent = "Copied."; });
+    const done = () => overlay.remove();
+    close.onclick = done;
+    copy.onclick = () => {
+        // A visible, selected text box copies with execCommand even on plain http.
+        area.focus();
+        area.select();
+        let ok = false;
+        try { ok = document.execCommand("copy") === true; } catch (error) { ok = false; }
+        status.style.color = ok ? "#8fb0e6" : "#f87171";
+        status.textContent = ok ? "Copied." : "Still blocked: press Ctrl+C (Cmd+C on a Mac) with the text selected.";
+        area.select();
+    };
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(); });
+    area.addEventListener("keydown", (e) => { if (e.key === "Escape") done(); });
+    document.body.appendChild(overlay);
+    area.focus();
+    area.select();
 }
 
 // Copy all clips / Paste clips: one Extender's whole clip list moves to another in one go.
@@ -914,11 +975,12 @@ app.registerExtension({
                 button.style.cssText = "background: #252536; border: 1px solid #3f3f58; color: #ddd; border-radius: 3px; cursor: pointer; padding: 1px 6px; font-size: 10px; white-space: nowrap;";
                 button.onclick = async (e) => {
                     e.stopPropagation();
-                    try {
-                        await copyText(clip.prompt || "");
+                    const text = clip.prompt || "";
+                    if (await copyText(text)) {
                         button.textContent = "✓ Copied";
-                    } catch (error) {
-                        button.textContent = "Copy failed";
+                    } else {
+                        button.textContent = "Copy by hand";
+                        showCopyBox(text, "the prompt");
                     }
                     setTimeout(() => { button.textContent = "⧉ Copy"; }, 1200);
                 };
@@ -1969,9 +2031,9 @@ app.registerExtension({
                     copyAllBtn.onclick = async (e) => {
                         e.stopPropagation();
                         const text = packClips(clipsState);
-                        let ok = false;
-                        try { await copyText(text); ok = true; } catch (error) { /* clipboard blocked */ }
-                        copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy failed";
+                        const ok = await copyText(text);
+                        copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy by hand";
+                        if (!ok) showCopyBox(text, `the ${clipsState.length} clips`);
                         setTimeout(() => { copyAllBtn.textContent = "⧉ Copy all"; }, 1500);
                     };
                     const pasteBtn = document.createElement("button");
