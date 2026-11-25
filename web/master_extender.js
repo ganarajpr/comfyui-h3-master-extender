@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue, diversityLoraValue, diversityStrengthValue, diversityStepsValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, cacheClipsValue, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue, diversityLoraValue, diversityStrengthValue, diversityStepsValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -498,6 +498,8 @@ function repairDualWidgets(node, defaults) {
     if (pih3File) pih3File.value = pih3BaseFileValue(pih3File.value, comboValues(pih3File));
     const pih3Steps = node.widgets?.find(x => x.name === "pih3_steps");
     if (pih3Steps) pih3Steps.value = pih3StepsValue(pih3Steps.value);
+    const cacheClips = node.widgets?.find(x => x.name === "cache_clips");
+    if (cacheClips) cacheClips.value = cacheClipsValue(cacheClips.value);
     const pass2Engine = node.widgets?.find(x => x.name === "pass2_engine");
     if (pass2Engine) pass2Engine.value = pass2EngineValue(pass2Engine.value);
     const refineSteps = node.widgets?.find(x => x.name === "pih3_refine_steps");
@@ -816,6 +818,9 @@ app.registerExtension({
             let cacheStates = [];
             let cacheVideos = [];
             let cacheTimer = 0;
+            // Clip caching is opt-in (the cache_clips widget, OFF by default). True while this node is executing: the toggle is locked then.
+            let nodeRunning = false;
+            function cacheOn() { return node.widgets?.find(x => x.name === "cache_clips")?.value === true; }
             try {
                 clipsState = JSON.parse(clipsWidget.value || "[]");
             } catch (e) {
@@ -876,6 +881,10 @@ app.registerExtension({
             function refreshCacheStatus() {
                 clearTimeout(cacheTimer);
                 cacheTimer = setTimeout(async () => {
+                    if (!cacheOn()) {
+                        if (cacheStates.length || cacheVideos.length) { cacheStates = []; cacheVideos = []; renderUI(); }
+                        return;
+                    }
                     try {
                         const response = await api.fetchApi("/minimax_master/cache_status", {
                             method: "POST", headers: { "Content-Type": "application/json" },
@@ -904,12 +913,13 @@ app.registerExtension({
                 none: ["○ not cached", "#6b7280", "Not rendered yet for these inputs."],
             };
             function cacheBadge(index) {
+                if (!cacheOn()) return "";
                 const badge = CACHE_BADGES[cacheStates[index]];
                 return badge ? `<span title="${badge[2]}" style="color: ${badge[1]}; font-size: 10px; white-space: nowrap;">${badge[0]}</span>` : "";
             }
 
             function clipVideo(index, style) {
-                const info = cacheVideos[index];
+                const info = cacheOn() ? cacheVideos[index] : null;
                 if (!info) return null;
                 const video = document.createElement("video");
                 const query = new URLSearchParams({ filename: info.filename, subfolder: info.subfolder, type: "output", t: String(info.mtime) });
@@ -1906,12 +1916,26 @@ app.registerExtension({
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">
+                        <button id="cache-toggle" style="background: ${cacheOn() ? "#173a26" : "#252538"}; color: ${cacheOn() ? "#4ade80" : "#a5a5c5"}; border: 1px solid ${cacheOn() ? "#2e6a45" : "#383852"}; padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 600; cursor: ${nodeRunning ? "not-allowed" : "pointer"}; opacity: ${nodeRunning ? "0.5" : "1"};">Cache clips: ${cacheOn() ? "ON" : "OFF"}</button>
                         <span style="color: #9292ab; font-size: 11px; font-weight: 500;">
                             ${clipsState.length} Clips (${totalSec.toFixed(1)}s / ${totalFrames} frames)
                         </span>
                     </div>
                 `;
                 container.appendChild(header);
+                const cacheBtn = header.querySelector("#cache-toggle");
+                cacheBtn.disabled = nodeRunning;
+                cacheBtn.title = nodeRunning
+                    ? "Locked while this node is running: set it before queueing."
+                    : cacheOn()
+                        ? "ON: rendered clips are kept on disk and reused on the next run when the inputs match (validated clips, re-rolls). Click to turn off."
+                        : "OFF: every run renders every clip; nothing is kept or reused across runs. Click to keep and reuse rendered clips. Set it before queueing a run.";
+                cacheBtn.onclick = () => {
+                    if (nodeRunning) return;
+                    setW("cache_clips", !cacheOn(), { rerender: false });
+                    refreshCacheStatus();
+                    renderUI();
+                };
                 header.querySelector("#mode-toggle").onclick = () => {
                     ui.mode = expert() ? "simple" : "expert";
                     renderUI();
@@ -2065,7 +2089,7 @@ app.registerExtension({
                         const incoming = await askForClipsText();
                         if (incoming) pasteClips(incoming);
                     };
-                    actions.append(copyAllBtn, saveBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
+                    actions.append(copyAllBtn, saveBtn, pasteBtn, clearRewritesBtn, ...(cacheOn() ? [validateAllBtn, invalidateAllBtn] : []), clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
                 container.appendChild(projectControls.references());
@@ -2093,7 +2117,7 @@ app.registerExtension({
                 `;
 
                 clipsState.forEach((clip, index) => {
-                    const isValidated = Boolean(clip.validated);
+                    const isValidated = cacheOn() && Boolean(clip.validated);
                     if (isValidated && !expandedValidated.has(clip.id)) {
                         const row = document.createElement("div");
                         row.className = "minimax-clip-card";
@@ -2149,10 +2173,10 @@ app.registerExtension({
                                 ${clip.prompt_rewritten ? `<span title="Rewritten by the built-in prompt rewriter${clip.rewrite_meta ? ` (${clip.rewrite_meta.model || ""}, ${clip.rewrite_meta.task || ""}${clip.rewrite_meta.thinking ? ", thinking" : ""}, ${clip.rewrite_meta.seconds || 0}s)` : ""}. It is not rewritten again; use 'Restore raw' in the prompt panel to redo it." style="background: #3a2e14; color: #fcd34d; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 500;">✎ rewritten</span>` : ''}
                             </div>
                             <div style="display: flex; align-items: center; gap: 6px;">
-                                <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; color: ${isValidated ? "#4ade80" : "#aaa"}; font-size: 11px;">
+                                ${cacheOn() ? `<label style="display: flex; align-items: center; gap: 4px; cursor: pointer; color: ${isValidated ? "#4ade80" : "#aaa"}; font-size: 11px;">
                                     <input type="checkbox" class="val-check" ${isValidated ? "checked" : ""}>
                                     <span>Validated</span>
-                                </label>
+                                </label>` : ""}
                                 ${isValidated ? `<button class="fold-btn" title="Collapse this validated clip" style="background: transparent; border: none; color: #6b8f7a; cursor: pointer; font-size: 12px; padding: 0 2px;">▴</button>` : ''}
                                 ${clipsState.length > 1 ? `<button class="del-btn" title="Delete Clip" style="background: transparent; border: none; color: #ef4444; cursor: pointer; font-size: 14px; padding: 0 2px;">✕</button>` : ''}
                             </div>
@@ -2283,7 +2307,7 @@ app.registerExtension({
                     };
 
                     const valCheck = card.querySelector(".val-check");
-                    valCheck.onchange = () => {
+                    if (valCheck) valCheck.onchange = () => {
                         clip.validated = valCheck.checked;
                         expandedValidated.delete(clip.id);
                         saveState();
@@ -2506,12 +2530,26 @@ app.registerExtension({
                 }
             };
             api.addEventListener(EVENT_REWRITE, rewriteHandler);
+            // The cache toggle is locked while this node executes (backend reads cache_clips once at the start of the run).
+            const setRunning = (value) => { if (nodeRunning !== value) { nodeRunning = value; renderUI(); } };
+            const executingHandler = (event) => {
+                const detail = event.detail;
+                const id = detail && typeof detail === "object" ? detail.node : detail;
+                if (id == null) setRunning(false);
+                else setRunning(String(id) === String(node.id));
+            };
+            const idleHandler = () => setRunning(false);
+            const idleEvents = ["execution_success", "execution_error", "execution_interrupted"];
+            api.addEventListener("executing", executingHandler);
+            for (const name of idleEvents) api.addEventListener(name, idleHandler);
             const onRemoved = node.onRemoved;
             node.onRemoved = function () {
                 api.removeEventListener(EVENT_PROGRESS, progressHandler);
                 api.removeEventListener(EVENT_CLIPS, clipsHandler);
                 api.removeEventListener(EVENT_PLAN, planHandler);
                 api.removeEventListener(EVENT_REWRITE, rewriteHandler);
+                api.removeEventListener("executing", executingHandler);
+                for (const name of idleEvents) api.removeEventListener(name, idleHandler);
                 return onRemoved?.apply(this, arguments);
             };
         };

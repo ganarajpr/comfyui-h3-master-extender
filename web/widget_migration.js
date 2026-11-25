@@ -283,3 +283,9 @@ export function visibleAccelModes(options, current) {
     return (options || []).filter(v => VISIBLE_ACCEL_MODES.includes(v) || v === current);
 }
 
+// cache_clips is appended after diversity_steps (before the time_gate_json socket): a workflow saved before it carries master_ui's ""
+// (or nothing) in that slot. Clip caching is opt-in, so anything that is not a literal true is OFF.
+export function cacheClipsValue(value) {
+    return value === true;
+}
+

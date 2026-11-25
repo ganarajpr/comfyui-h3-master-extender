@@ -612,6 +612,8 @@ class MiniMaxH3MasterExtender:
                 "diversity_lora": (["none"] + folder_paths.get_filename_list("loras"), {"default": "none", "tooltip": "First-step diversity LoRA (e.g. ReDiverse-Pika-H3-Flex): applied ON TOP of turbo_lora for the first diversity_steps steps of pass 1 only, then the turbo LoRA alone finishes the schedule from that noise level (same seed, no added noise). It restores generation diversity that distillation removes. Turbo LoRA mode only (ignored, with a log line, in every other accel_mode). none = off, and the render is exactly as before. Part of the pass-1 cache key when on."}),
                 "diversity_lora_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Strength of the diversity LoRA (diversity_lora). 1.0 is the author's setting."}),
                 "diversity_steps": ("INT", {"default": 1, "min": 1, "max": 7, "step": 1, "tooltip": "How many of the first pass-1 steps run with the diversity LoRA on top of the turbo LoRA (clamped to the turbo step count - 1). 1 is the author's recipe: sigma 1.0 -> 0.973 of the 6-step Pika grid."}),
+                # --- Clip caching (appended after diversity_steps, before the time_gate_json socket) ---
+                "cache_clips": ("BOOLEAN", {"default": False, "label_on": "Cache clips: ON", "label_off": "Cache clips: OFF", "tooltip": "Cache clips: keep rendered clips on disk (output/MasterExtender_cache) and reuse them on the next run when the inputs match (validated clips, re-rolls, BUST). OFF (default): nothing is reused or kept across runs; the run chains through a scratch folder that is wiped at the start of every run. Read once when the run starts; set it before queueing."}),
                 "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -962,11 +964,24 @@ class MiniMaxH3MasterExtender:
         if str(run_mode) == "prompts_only":
             return self._prompts_only(owner, clips, rewrite_notes, imported)
 
-        # Setup persistent disk caching
+        # Clip caching is opt-in: a missing or non-boolean value (an old API graph, master_ui's "" in an old workflow) is OFF.
+        # Read once, here.
+        cache_clips = kwargs.get("cache_clips") is True
+        extender_ids = {str(k) for k, v in (prompt or {}).items() if isinstance(v, dict) and v.get("class_type") == "MiniMaxH3MasterExtender"}
+        removed = motion_context_disk.wipe_scratch(extender_ids - {str(unique_id)})
+        if removed:
+            _LOG.info("Scratch chains of earlier runs removed: %d", len(removed))
         chain_key = _chain_key(clips)
-        cache_owner = f"master_v2_{chain_key}"
+        if cache_clips:
+            cache_owner = f"master_v2_{chain_key}"
+            _LOG.info(f"Disk cache chain: {cache_owner} (keyed by clip 1's prompt, duration and LoRAs)")
+        else:
+            cache_owner = motion_context_disk.scratch_owner(unique_id)
+            _LOG.info("Cache clips is OFF: every clip is rendered; the chain lives in a scratch folder (%s) wiped at the start of each run", cache_owner)
+            if str(run_mode) == "clip_by_clip":
+                _LOG.warning("run_mode clip_by_clip continues a chain from the previous run's cache; with Cache clips OFF each run starts "
+                             "from clip 1. Turn Cache clips ON, or use full_batch.")
         draft_owner = f"{cache_owner}_draft"
-        _LOG.info(f"Disk cache chain: {cache_owner} (keyed by clip 1's prompt, duration and LoRAs)")
         data_path, manifest_path, manifest = _manifest_for_first(cache_owner, FPS)
         draft_path, draft_manifest_path, draft_manifest = _manifest_for_first(draft_owner, FPS)
         # X2 detail only changes the final clips. The record lives in the chain

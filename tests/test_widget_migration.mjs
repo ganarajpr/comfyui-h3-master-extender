@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT, pass2EngineValue, PASS2_ENGINE_LORA, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, VISIBLE_ACCEL_MODES } from "../web/widget_migration.js";
+import { dropCaptionModelValue, dropHyperflowValues, dropDualSamplingValues, takeHyperflowValues, takeDualSamplingValues, migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, dualWidgetValue, pass1StepsValue, hyperflowWidgetValue, isHyperflowMode, LEGACY_HYPERFLOW_WIDGETS, dropSingleTextEncodeValue, normalizeReasoningBudget, migrateAccelMode, isLegacyAccelMode, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, HANDOFF_STEP_OPTIONS, pih3StepsValue, pih3BaseFileValue, PIH3_BASE_DEFAULT, pass2EngineValue, cacheClipsValue, PASS2_ENGINE_LORA, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, VISIBLE_ACCEL_MODES } from "../web/widget_migration.js";
 
 const workflows = fs.readdirSync(new URL("../example_workflows/", import.meta.url)).filter(f => f.endsWith(".json"));
 assert(workflows.length >= 5);
@@ -133,6 +133,8 @@ assert.equal(pih3RefineTailValue(0, 4), 1);
     }
     assert.deepEqual(visibleAccelModes(undefined, "x"), []);
 }
+assert.equal(cacheClipsValue(true), true);
+for (const v of ["", undefined, null, false, "true", 1]) assert.equal(cacheClipsValue(v), false, `cache_clips ${JSON.stringify(v)} is OFF`);
 assert.equal(pass2EngineValue(""), PASS2_ENGINE_LORA);
 assert.equal(pass2EngineValue(undefined), PASS2_ENGINE_LORA);
 assert.equal(pass2EngineValue("gone"), PASS2_ENGINE_LORA);

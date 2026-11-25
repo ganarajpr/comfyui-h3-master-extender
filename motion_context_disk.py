@@ -424,9 +424,55 @@ def _ensure_cache_root():
     return _CACHE_ROOT
 
 
+# Cache clips OFF: the chain of a run lives in one scratch folder per Extender node, output/MasterExtender_scratch/<node id>/,
+# wiped at the start of every run (wipe_scratch). Owner ids "scratch__<node id>" (and "..._draft") resolve there; every
+# other owner is a persistent chain in _CACHE_ROOT as before.
+SCRATCH_PREFIX = "scratch__"
+_SCRATCH_ROOT = (
+    Path(folder_paths.get_output_directory()) / "MasterExtender_scratch"
+    if folder_paths is not None else _NODE_DIR / "scratch"
+)
+
+
+def scratch_owner(node_id):
+    return SCRATCH_PREFIX + _safe_name(node_id)
+
+
+def _scratch_dir_name(owner_id):
+    rest = str(owner_id)[len(SCRATCH_PREFIX):]
+    return rest[:-len("_draft")] if rest.endswith("_draft") else rest
+
+
+def wipe_scratch(keep_node_ids=()):
+    """Delete every scratch folder except those of `keep_node_ids` (the other Extender nodes of the running prompt).
+    ComfyUI runs one prompt at a time, so nothing else can be using the rest. Returns the names removed."""
+    keep = {_safe_name(n) for n in keep_node_ids}
+    removed = []
+    try:
+        children = list(_SCRATCH_ROOT.iterdir()) if _SCRATCH_ROOT.is_dir() else []
+    except OSError:
+        return removed
+    for child in children:
+        if child.name in keep:
+            continue
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+            removed.append(child.name)
+        except OSError as exc:
+            _LOG.warning("Master Extender scratch: could not remove %s (%s)", child, exc)
+    return removed
+
+
 def _chain_paths(owner_id):
-    root = _ensure_cache_root()
     stem = "chain_" + _safe_name(owner_id)
+    if str(owner_id).startswith(SCRATCH_PREFIX):
+        root = _SCRATCH_ROOT / _scratch_dir_name(owner_id)
+        root.mkdir(parents=True, exist_ok=True)
+    else:
+        root = _ensure_cache_root()
     return root / f"{stem}.h3cache", root / f"{stem}.json"
 
 
