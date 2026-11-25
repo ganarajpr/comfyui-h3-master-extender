@@ -195,7 +195,7 @@ class NodeWiring(unittest.TestCase):
         modes = next(ast.literal_eval(n.value) for n in tree.body
                      if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
         self.assertEqual(modes, ["Turbo LoRA", MODE, "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off",
-                                 "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"])
+                                 "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "pi-H3 (FL2VA adapter)"])
         self.assertRegex(self.text, r'"accel_mode": \(ACCEL_MODES, \{"default": "Turbo LoRA"')
         self.assertRegex(self.text, r'DUAL_SAMPLING_ACCEL_MODE = ACCEL_MODES\[6\]')
 

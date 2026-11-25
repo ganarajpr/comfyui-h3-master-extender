@@ -51,3 +51,47 @@
 **Cache.** The pass-1 fingerprint includes the Flash parts and `handoff_step` in this mode only, so different hand-offs never share a cached pass 1.
 
 The log line reads `Pika -> Flash hand-off: Pika steps 1..3 (sigma 1.0->0.7000), Flash 3 steps (0.7000->0) [file]`.
+
+# pi-H3 (FL2VA adapter) mode
+
+`accel_mode` = "pi-H3 (FL2VA adapter)" runs pass 1 on [Lakonik/ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow)'s pi-H3: a 2- or 4-step adapter that distills MiniMax H3 FL2VA. Pass 2 is unchanged (base model + the pass-2 refiner LoRA, DMAD, replace mode).
+
+**Requirements.** The ComfyUI-piFlow node pack (`Load LakonLab Adapter`, `pi-Flow Scheduler`), `models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`, and `models/loras/pi_h3_2step_dwd_adapter_int8_convrot.safetensors` / `pi_h3_4step_dwd_adapter_int8_convrot.safetensors`. A missing pack stops the job with a message naming it.
+
+**Inputs** (appended after `chain_memory`, before the `time_gate_json` socket): `pih3_base_file` (default `minimax_h3_fl2va_pruned_int8_convrot.safetensors`), `pih3_steps` (2 or 4, default 2; picks the adapter). `pdd_nfe`, `turbo_lora`, `turbo_sampler` and `turbo_scheduler` do not apply to pass 1 (and are left out of the pass-1 cache key in this mode).
+
+**Pass 1.** The FL2VA base is loaded and the adapter patched in (as the vendor graph: UNETLoader -> Load LakonLab Adapter, strength 1), then SigmaShift (12 / 3), the dense attention backend and, when `sla_enabled`, sparse attention, exactly as for the Flash model. Sigmas come from the pack's `pi-Flow Scheduler` on that model's sampling: `min_raw_t` 0, `max_raw_t` 0.93 (2 steps) / 0.96 (4 steps), `final_step_size_scale` 0.6. Euler, CFG 1, the same noise seed and the same Ref2VA conditioning (references, motion context, bridge) as the other engines, even though the adapter was trained on FL2VA. The patched model is cached across clips and jobs (clip 2 reuses it; the adapter is patched once), and it is evicted from the GPU before pass 2.
+
+**The DWD head is dropped.** The `*_dwd_adapter` files carry `dwd_*` tensors: a pixel head that, at the last sampling step, decodes the final hidden states straight to frames for the `DWD Decode` node. The extender needs a normal video+audio latent (pass 2 refines it and chaining reads its motion context), so `dwd_*` tensors are removed before patching. This changes nothing in the latent: in the piFlow source the head only reads the final hidden states and the model's own output is untouched, so the sampler returns the same latent with or without it. With the head loaded, every sampling run would also stash its frames in `DWD_PIXELS` (up to 4 runs, fp16, a few GB per 15 s clip) and SHA-1 the output latent. The adapter's own denoiser weights were trained with the head; whether they give as good a VAE-decoded latent as the separate non-DWD adapters (`pi_h3_*step_adapter`) is judged on a render.
+
+**Cache.** The pass-1 fingerprint gains a `pih3` entry `[base file, steps]` in this mode only.
+
+## pi-H3 refine: pass 2 on the DWD head, no video VAE decode
+
+`pass2_engine` = "pi-H3 refine (DWD, no VAE decode)" (default "LoRA refine", the DMAD refine as before) makes pass 2 the pi-H3 DWD model. Pass 1 is independent: Pika, pi-H3 or anything else. Needs the ComfyUI-piFlow pack and `pih3_base_file` (the FL2VA base) plus `pi_h3_2step_dwd_adapter_int8_convrot.safetensors`.
+
+- **Pass-2 model:** the FL2VA base with the 2-step DWD adapter loaded through piFlow's own `LakonLabAdapterLoader`, so the `dwd_*` head and its OUTER_SAMPLE wrapper are installed exactly as the vendor does, then SigmaShift 12 / 3 and the pass-2 sparse-attention handling.
+- **Sigmas:** one step, the last of the 2-step pi-Flow grid computed by the `pi-Flow Scheduler` on the shifted pass-2 model: `[grid[1], 0]` (about `[0.8653, 0]`). The upscaled pass-1 latent is re-noised to `grid[1]` by the sampler exactly as the DMAD tail is. Euler, CFG 1. `pass2_denoise`, `pass2_steps`, the pass-2 LoRA, the pass-2 scheduler and windowed pass 2 (`pass2_chunk_*`) do not apply: it is one run over the whole clip.
+- **Last-step detection:** lakonlab's wrapped `_run_blocks` decodes the final hidden states when the current step's sigma equals the last non-zero sigma of the sampling schedule and `cond_or_uncond == [0]` (the positive pass). With a one-step schedule `[s, 0]` the only step is the last one, and at CFG 1 ComfyUI runs only the positive pass, so the head fires once.
+- **Output:** right after pass 2 the clip's pixels are taken from lakonlab's `DWD_PIXELS` (found by the fingerprint of the output video latent) into the extender's frame registry (`motion_context_disk.register_dwd_frames`) and the stash is emptied. The latent is stored exactly as before, so chaining, motion context, chain memory and the caches are unchanged; the audio VAE still decodes the audio. Every final-video path (`_render_one_final_video_segment`: Full Batch cache, previews, repairs, final decode) uses the DWD pixels instead of `decode_video_latent` when the clip has them, and the VAE otherwise (a clip from an earlier job, a missing stash). The identity guide frame (last frame) also comes from them.
+- **Stitching:** a chained clip's VAE path decodes `[previous clip's tail | current clip from the warm-up start]` as one buffer, picks the seam shift, crops `[previous + warm-up + shift : +continued]` and colour-matches to the previous tail. The DWD path builds the same buffer from the two clips' DWD pixels (the previous clip keeps only its tail frames, `previous_frames` of them) and runs the same `_decode_pair_video` and `_correct_current_segment`, so frame count, seam shift, crop, correction and the stream-copy assembly are the same code. A frame count other than the VAE's (17k+5) is refused and that clip falls back to the VAE.
+- **Memory:** a clip's pixels are about 2 GB (fp16, 1280x736, 15 s). Each clip's full pixels are released when its final video segment is built; only its few tail frames stay for the next clip. The registry holds at most 4 clips and is cleared at the start and end of a job.
+- **Shared model with a pi-H3 pass 1:** with pass 1 on pi-H3 2-step, pass 1 uses the same patched model (head kept; its pass-1 pixels are discarded), so the adapter is patched once. Another adapter for pass 1 loads its own copy (the base is shared). The patched models are cached across clips (at most two); the pass-1 model is evicted before pass 2.
+- **Not combinable with** an X2 / upscaling `final_decode`: validation and the run reject it with a message (the DWD pixels are 1x).
+- **Log lines:** `Clip N: pass 2 sampling X s`, `H3 video output (DWD): clip N, F frames, X s (no VAE decode)`.
+
+### Choosing the refine adapter and tail
+
+`pih3_refine_steps` (2 or 4, default 2) picks the pass-2 DWD adapter (`pi_h3_2step_dwd_adapter_int8_convrot` / `pi_h3_4step_dwd_adapter_int8_convrot`); `pih3_refine_tail` (default 1, 1..steps, checked) is how many of the LAST steps of that adapter's pi-Flow grid pass 2 runs. The grid is computed on the shifted pass-2 model and the upscaled pass-1 latent is re-noised to the first sigma of the tail. Grids measured on the box:
+
+| adapter | grid | tail 1 | tail 2 |
+|---|---|---|---|
+| 2-step | `[0.9938, 0.8653, 0]` | `[0.8653, 0]` | `[0.9938, 0.8653, 0]` |
+| 4-step | `[0.9965, 0.9645, 0.8993, 0.6957, 0]` | `[0.6957, 0]` | `[0.8993, 0.6957, 0]` |
+
+The DWD head fires only when the current step's sigma equals the last non-zero sigma of the whole schedule, so a multi-step tail still produces pixels once, on its last step. The patched pass-2 model is cached per adapter file, so a 2-step and a 4-step model are never confused; a pi-H3 pass 1 shares the pass-2 model only when it uses the same adapter.
+
+**Presets** (panel Preset dropdown): "Standard · Pika + DMAD" (unchanged, now also sets `pass2_engine` to LoRA refine), "Pika + pi-H3 refine 2-step" (2-step adapter, tail 1) and "Pika + pi-H3 refine 4-step" (4-step adapter, tail 2, starting at sigma 0.8993). The three share the Standard Pika pass-1 values and 608x352 -> 1280x720.
+
+**Engine dropdown.** The panel offers only "Turbo LoRA" and "pi-H3 (FL2VA adapter)". HyperFlow Flash, the Pika -> Flash hand-off, Base + CFG, CFG -> Pika hand-off and the HyperFlow 8-step options are hidden from the dropdown but stay in the backend, so saved workflows and API graphs that use them still validate and render; a node that already holds one shows it and keeps it selectable.
+

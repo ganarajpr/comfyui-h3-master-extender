@@ -668,6 +668,41 @@
   "min": 0,
   "max": 8
  },
+ "pass2_engine": {
+  "options": [
+   "LoRA refine",
+   "pi-H3 refine (DWD, no VAE decode)"
+  ]
+ },
+ "pih3_refine_steps": {
+  "type": "INT",
+  "min": 2,
+  "max": 4
+ },
+ "pih3_refine_tail": {
+  "type": "INT",
+  "min": 1,
+  "max": 4
+ },
+ "diversity_lora": {
+  "options": [
+   "none",
+   "h3\\rediverse_pika_h3_flex_ft_comfyui.safetensors"
+  ]
+ },
+ "diversity_lora_strength": {
+  "type": "FLOAT",
+  "min": 0.0,
+  "max": 2.0
+ },
+ "diversity_steps": {
+  "type": "INT",
+  "min": 1,
+  "max": 7
+ },
+ "cache_clips": {
+  "type": "BOOLEAN"
+ },
  "clips_in": {
   "type": "STRING"
  }

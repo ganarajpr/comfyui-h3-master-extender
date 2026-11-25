@@ -223,5 +223,34 @@ class Shrink(unittest.TestCase):
         self.assertTrue(torch.equal(out, f))
 
 
+class EarlyPickMapping(unittest.TestCase):
+    def test_no_shift(self):
+        info = {"index": 100, "shot_end": 150, "fallback": False}
+        self.assertEqual(cm.map_early_pick(info, 0, 200), (100, 50))
+
+    def test_shift_moves_both(self):
+        info = {"index": 100, "shot_end": 150, "fallback": False}
+        self.assertEqual(cm.map_early_pick(info, 2, 200), (98, 52))
+
+    def test_clamped(self):
+        info = {"index": 1, "shot_end": 2, "fallback": False}
+        self.assertEqual(cm.map_early_pick(info, 2, 200), (0, 199))
+        info = {"index": 199, "shot_end": 300, "fallback": False}
+        self.assertEqual(cm.map_early_pick(info, 0, 200), (199, 0))
+
+    def test_fallback_is_last_frame(self):
+        self.assertEqual(cm.map_early_pick({"index": 199, "shot_end": 200, "fallback": True}, 2, 200), (199, 0))
+
+
+class EarlyPickThread(unittest.TestCase):
+    def test_missing_thread_gives_none(self):
+        self.assertIsNone(cm.EarlyPick("x").result(0.1))
+
+    def test_failure_gives_none(self):
+        pick = cm.EarlyPick("x").start(None)
+        self.assertIsNone(pick.result(5))
+        self.assertIsNotNone(pick.error)
+
+
 if __name__ == "__main__":
     unittest.main()

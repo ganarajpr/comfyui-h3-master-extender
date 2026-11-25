@@ -233,3 +233,59 @@ export function cfgHandoffStepsValue(value) {
 export function negativePromptValue(value) {
     return typeof value === "string" ? value : "";
 }
+
+// pih3_base_file and pih3_steps are appended after chain_memory: a workflow saved before them carries master_ui's "" (or nothing)
+// in those slots. "" / unknown file = the FL2VA pruned INT8 convrot build, else the first option; steps other than 2 / 4 = 2.
+export const PIH3_BASE_DEFAULT = "minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+export const PIH3_STEPS_DEFAULT = 2;
+export function pih3StepsValue(value) {
+    return value === 2 || value === 4 ? value : PIH3_STEPS_DEFAULT;
+}
+export function pih3BaseFileValue(value, options) {
+    if (typeof value === "string" && value !== "" && (!Array.isArray(options) || options.includes(value))) return value;
+    if (Array.isArray(options) && options.length) return options.includes(PIH3_BASE_DEFAULT) ? PIH3_BASE_DEFAULT : options[0];
+    return PIH3_BASE_DEFAULT;
+}
+
+// pass2_engine is appended after pih3_steps: a workflow saved before it carries master_ui's "" (or nothing) in that slot.
+// Anything that is not one of the options = the LoRA refine, which is what those workflows rendered with.
+export const PASS2_ENGINE_LORA = "LoRA refine";
+export const PASS2_ENGINE_PIH3 = "pi-H3 refine (DWD, no VAE decode)";
+export function pass2EngineValue(value) {
+    return value === PASS2_ENGINE_PIH3 ? PASS2_ENGINE_PIH3 : PASS2_ENGINE_LORA;
+}
+
+// pih3_refine_steps and pih3_refine_tail are appended after pass2_engine: a workflow saved before them carries master_ui's "" (or
+// nothing) in those slots. Steps other than 2 / 4 = 2; a tail outside 1..steps = 1, which is what those workflows rendered.
+export function pih3RefineStepsValue(value) {
+    return value === 2 || value === 4 ? value : 2;
+}
+export function pih3RefineTailValue(value, steps) {
+    return Number.isInteger(value) && value >= 1 && value <= pih3RefineStepsValue(steps) ? value : 1;
+}
+
+// diversity_lora, diversity_lora_strength and diversity_steps are appended after pih3_refine_tail: a workflow saved before them
+// carries master_ui's "" (or nothing) in those slots. "" / unknown file = none (off), which is what those workflows rendered.
+export function diversityLoraValue(value, options) {
+    return typeof value === "string" && value !== "" && (!Array.isArray(options) || options.includes(value)) ? value : "none";
+}
+export function diversityStrengthValue(value) {
+    return typeof value === "number" && Number.isFinite(value) ? value : 1.0;
+}
+export function diversityStepsValue(value) {
+    return Number.isInteger(value) && value >= 1 ? value : 1;
+}
+
+// The engine dropdown offers only these two. Every other accel_mode stays in the backend (saved workflows and API graphs that use
+// one still validate and render); a node that already holds one keeps it selectable so the value is shown, never rewritten.
+export const VISIBLE_ACCEL_MODES = ["Turbo LoRA", "pi-H3 (FL2VA adapter)"];
+export function visibleAccelModes(options, current) {
+    return (options || []).filter(v => VISIBLE_ACCEL_MODES.includes(v) || v === current);
+}
+
+// cache_clips is appended after diversity_steps (before the time_gate_json socket): a workflow saved before it carries master_ui's ""
+// (or nothing) in that slot. Clip caching is opt-in, so anything that is not a literal true is OFF.
+export function cacheClipsValue(value) {
+    return value === true;
+}
+

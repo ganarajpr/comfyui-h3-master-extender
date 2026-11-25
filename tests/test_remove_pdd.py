@@ -35,7 +35,7 @@ class RemovePDDTests(unittest.TestCase):
         self.assertEqual(norm("HyperFlow Flash (GGUF)"), "HyperFlow Flash (GGUF)")
         self.assertEqual(norm("HyperFlow 8-step \u00b7 dual sampling"), "HyperFlow 8-step \u00b7 dual sampling")
         self.assertEqual(self.ns["ACCEL_MODES"], ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", "Base + CFG (undistilled)", "CFG \u2192 Pika hand-off",
-                                                  "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"])
+                                                  "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "pi-H3 (FL2VA adapter)"])
 
     def test_pdd_file_keeps_its_slot_and_accepts_any_string(self):
         text = SOURCE.read_text(encoding="utf-8")

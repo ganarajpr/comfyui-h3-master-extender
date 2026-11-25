@@ -302,3 +302,53 @@ def _streams_from_latent(latent):
     if audio.ndim == 3:
         audio = audio.unsqueeze(0)
     return video, audio
+
+
+def map_early_pick(info, shift, final_total):
+    """(index, tail_after_shot) in the FINAL decoded clip for a pick made on the pass-1 draft.
+
+    The draft pick runs on the draft's frames from the join's trim onward, so index 0 is the clip's first
+    own frame. The final clip starts ``shift`` frames later in the same numbering (the seam shift chosen
+    by the pair decode), so a draft index ``j`` is final index ``j - shift``. A draft pick that fell back
+    to the last frame stays the final clip's last frame with no tail.
+    """
+    last = int(final_total) - 1
+    if info.get("fallback"):
+        return last, 0
+    index = min(max(int(info["index"]) - int(shift), 0), last)
+    shot_end = min(max(int(info["shot_end"]) - int(shift), index + 1), int(final_total))
+    return index, max(0, int(final_total) - shot_end)
+
+
+class EarlyPick:
+    """The memory-frame pick for one clip, run on a CPU thread over the pass-1 draft while pass 2 samples."""
+
+    def __init__(self, decoder="", decode_seconds=0.0):
+        self.decoder = decoder
+        self.decode_seconds = decode_seconds
+        self.info = None
+        self.error = None
+        self._thread = None
+
+    def start(self, frames):
+        import threading
+
+        def run():
+            try:
+                _frame, self.info = select_memory_frame(frames)
+            except Exception as exc:  # noqa: BLE001 -- an early pick that fails just means "use the slow path"
+                self.error = str(exc)
+                _LOG.warning("Chain memory: early pick failed (%s); the final decode will pick the frame", exc)
+
+        self._thread = threading.Thread(target=run, name="chain-memory-early-pick", daemon=True)
+        self._thread.start()
+        return self
+
+    def result(self, timeout=120.0):
+        """The pick's info dict, or None when it failed or is not done within ``timeout`` seconds."""
+        if self._thread is not None:
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                _LOG.warning("Chain memory: early pick not finished after %.0f s; the final decode will pick the frame", timeout)
+                return None
+        return self.info

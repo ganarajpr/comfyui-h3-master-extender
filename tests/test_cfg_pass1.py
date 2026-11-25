@@ -43,7 +43,7 @@ class Modes(unittest.TestCase):
                     and any(getattr(t, "id", "") == "ACCEL_MODES" for t in n.targets))
         self.assertEqual(ast.literal_eval(node.value),
                          ["Turbo LoRA", "HyperFlow Flash (GGUF)", "Pika \u2192 Flash hand-off", CFG_MODE, HANDOFF_MODE,
-                          "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling"])
+                          "HyperFlow 8-step", "HyperFlow 8-step \u00b7 dual sampling", "pi-H3 (FL2VA adapter)"])
         self.assertEqual(NS["CFG_ACCEL_MODE"], CFG_MODE)
         self.assertEqual(NS["CFG_HANDOFF_ACCEL_MODE"], HANDOFF_MODE)
 

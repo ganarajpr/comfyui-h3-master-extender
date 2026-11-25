@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import time
 import torch
 import comfy.model_management
 import comfy.sample
@@ -271,6 +272,134 @@ def _flash_pack():
     return pack
 
 
+PIH3_ACCEL_MODE = "pi-H3 (FL2VA adapter)"
+PIH3_STEPS = (2, 4)
+PIH3_BASE_DEFAULT = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+PIH3_ADAPTER_FILES = {
+    2: "pi_h3_2step_dwd_adapter_int8_convrot.safetensors",
+    4: "pi_h3_4step_dwd_adapter_int8_convrot.safetensors",
+}
+# (min_raw_t, max_raw_t, final_step_size_scale) of the pi-Flow Scheduler, from Lakonik/ComfyUI-piFlow docs/piH3.md.
+PIH3_SCHEDULE = {2: (0.0, 0.93, 0.6), 4: (0.0, 0.96, 0.6)}
+PASS2_ENGINE_LORA = "LoRA refine"
+PASS2_ENGINE_PIH3 = "pi-H3 refine (DWD, no VAE decode)"
+PASS2_ENGINES = [PASS2_ENGINE_LORA, PASS2_ENGINE_PIH3]
+PIH3_REFINE_STEPS = 2
+_PIH3_CACHE = {}
+_PIH3_BASE_CACHE = {}
+_PIH3_CACHE_MAX = 2
+
+
+def check_pih3_steps(steps):
+    try:
+        steps = int(steps)
+    except (TypeError, ValueError):
+        steps = 2
+    if steps not in PIH3_STEPS:
+        raise ValueError(f"pih3_steps must be one of {list(PIH3_STEPS)}, got {steps}")
+    return steps
+
+
+def check_pih3_tail(tail, steps):
+    """Number of last steps of the refine adapter's grid that pass 2 runs: 1..steps."""
+    try:
+        tail = int(tail)
+    except (TypeError, ValueError):
+        tail = 1
+    if tail < 1 or tail > int(steps):
+        raise ValueError(f"pih3_refine_tail must be between 1 and pih3_refine_steps ({int(steps)}), got {tail}")
+    return tail
+
+
+def pih3_tail_sigmas(grid, tail):
+    """The last `tail` steps of a pi-Flow grid (steps + 1 points, ending in 0): [first sigma of the tail, ..., 0]."""
+    return grid[-(int(tail) + 1):]
+
+
+def pih3_adapter_file(steps):
+    return PIH3_ADAPTER_FILES[check_pih3_steps(steps)]
+
+
+def pih3_pack_module():
+    """The ComfyUI-piFlow module that holds the adapter loader (patch_model_with_adapter, ADAPTER_KEY_RULES), found through
+    its 'Load LakonLab Adapter' node class; None when the pack is not installed."""
+    cls = nodes.NODE_CLASS_MAPPINGS.get("Load LakonLab Adapter")
+    return sys.modules[cls.__module__] if cls is not None else None
+
+
+def pih3_missing_pack_error():
+    return RuntimeError("pi-H3 needs the ComfyUI-piFlow node pack (Load LakonLab Adapter, pi-Flow Scheduler) in custom_nodes: "
+                        "git clone https://github.com/Lakonik/ComfyUI-piFlow, then restart ComfyUI.")
+
+
+def _pih3_pack():
+    pack = pih3_pack_module()
+    if pack is None or not hasattr(pack, "patch_model_with_adapter") or not hasattr(pack, "ADAPTER_KEY_RULES"):
+        raise pih3_missing_pack_error()
+    return pack
+
+
+def load_pih3_model(pack, base_file, adapter_file, strength=1.0, keep_dwd=False, base_cache=None):
+    """The pi-H3 ModelPatcher: the FL2VA base with the pi-H3 adapter patched in, as the vendor graph does (UNETLoader ->
+    Load LakonLab Adapter, strength 1).
+
+    keep_dwd=False (pass 1): the adapter's `dwd_` tensors are dropped before patching. They are only the pixel head that
+    decodes frames at the last step; without them the model never stashes pixels (a few GB per clip in lakonlab's
+    DWD_PIXELS) and never fingerprints the output latent, and the sampler's latent is the same.
+    keep_dwd=True (pass 2 refine): piFlow's own LakonLabAdapterLoader installs the head and its OUTER_SAMPLE wrapper.
+    `base_cache` (a dict) keeps the loaded base so both variants are clones of one base load."""
+    import comfy.sd
+    import comfy.utils
+    import folder_paths
+    model = base_cache.get(base_file) if base_cache is not None else None
+    if model is None:
+        model = comfy.sd.load_diffusion_model(folder_paths.get_full_path_or_raise("diffusion_models", base_file), model_options={})
+        if base_cache is not None:
+            base_cache.clear()
+            base_cache[base_file] = model
+    unet_config = model.model.model_config.unet_config
+    image_model = unet_config.get("image_model")
+    if image_model not in pack.ADAPTER_KEY_RULES:
+        raise ValueError(f"pi-H3 adapters are not supported on {image_model} models; pih3_base_file {base_file} must be the "
+                         "MiniMax H3 FL2VA base")
+    if keep_dwd:
+        patched = pack.LakonLabAdapterLoader().load_adapter(model, adapter_file, float(strength))[0]
+        _LOG.info("pi-H3: loaded %s + %s with the dwd_ head kept", base_file, adapter_file)
+        return patched
+    key_mapping = pack.ADAPTER_KEY_RULES[image_model](unet_config)
+    adapter_sd = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", adapter_file))
+    dwd = [k for k in list(adapter_sd) if k.startswith("dwd_")]
+    for k in dwd:
+        del adapter_sd[k]
+    patched = pack.patch_model_with_adapter(model, adapter_sd, key_mapping, float(strength))
+    _LOG.info("pi-H3: loaded %s + %s (%d adapter tensors, %d dwd_ head tensors dropped)", base_file, adapter_file,
+              len(adapter_sd), len(dwd))
+    return patched
+
+
+def pih3_dwd_module(pack):
+    """The piFlow module holding the DWD pixel stash (DWD_PIXELS, latent_fingerprint)."""
+    return sys.modules[pack.get_dwd_pixels.__module__]
+
+
+def cache_pih3_model(key, loader):
+    """Patched pi-H3 models, newest last, at most _PIH3_CACHE_MAX (pass 1 and the DWD refine can differ)."""
+    patcher = _PIH3_CACHE.get(key)
+    if patcher is not None:
+        return patcher, True
+    while len(_PIH3_CACHE) >= _PIH3_CACHE_MAX:
+        _PIH3_CACHE.pop(next(iter(_PIH3_CACHE)))
+    patcher = loader()
+    _PIH3_CACHE[key] = patcher
+    return patcher, False
+
+
+def pih3_sigmas(scheduler_cls, model, steps):
+    """The pi-Flow Scheduler's sigmas for the 2 / 4-step adapter, on `model`'s own (shifted) model sampling."""
+    min_raw_t, max_raw_t, final_scale = PIH3_SCHEDULE[check_pih3_steps(steps)]
+    return scheduler_cls().get_sigmas(model, int(steps), min_raw_t, max_raw_t, final_scale)[0]
+
+
 def pass_sampler_name(turbo_mode, sampler_name):
     """HyperFlow was distilled for plain Euler; only Turbo LoRA mode uses the user's sampler."""
     return sampler_name if turbo_mode else "euler"
@@ -304,6 +433,28 @@ def split_handoff_sigmas(pika_sigmas, k, flash_grid):
     sigma = pika[k]
     flash = [sigma] + [float(g) for g in flash_grid if float(g) < sigma - 1e-6]
     return pika[:k + 1], flash, sigma
+
+
+TURBO_ACCEL_MODE = "Turbo LoRA"
+
+
+def clamp_diversity_steps(k, nfe):
+    """Diversity-LoRA steps: 1..nfe-1 of the nfe-step turbo schedule (at least one step must stay plain turbo)."""
+    return max(1, min(int(k), int(nfe) - 1))
+
+
+def split_diversity_sigmas(sigmas, k):
+    """(diversity_segment, turbo_segment): the diversity LoRA samples sigmas[0..k], plain turbo continues from sigmas[k]."""
+    s = [float(x) for x in sigmas]
+    return s[:k + 1], s[k:]
+
+
+def diversity_p1_settings(accel_mode, lora, strength, steps):
+    """Pass-1 fingerprint entry of the first-step diversity LoRA (None when it is off or not applicable, so every other
+    pass-1 cache keeps its fingerprint)."""
+    if str(accel_mode) != TURBO_ACCEL_MODE or lora in (None, "", "none"):
+        return None
+    return [str(lora), round(float(strength), 4), int(steps)]
 
 
 def is_cfg_accel_mode(accel_mode):
@@ -463,6 +614,11 @@ class MasterEngine:
         hyperflow_flash_steps=6,
         hyperflow_flash_lora="none",
         hyperflow_flash_lora_strength=1.0,
+        pih3_base_file=PIH3_BASE_DEFAULT,
+        pih3_steps=2,
+        pass2_engine=PASS2_ENGINE_LORA,
+        pih3_refine_steps=PIH3_REFINE_STEPS,
+        pih3_refine_tail=1,
         handoff_step=HANDOFF_STEP_DEFAULT,
         pass1_cfg=PASS1_CFG_DEFAULT,
         cfg_steps=CFG_STEPS_DEFAULT,
@@ -496,6 +652,17 @@ class MasterEngine:
         self.flash_lora_strength = float(hyperflow_flash_lora_strength if hyperflow_flash_lora_strength is not None else 1.0)
         self.flash_model = None
         self.flash_raw = None
+        self.pih3_mode = self.accel_mode == PIH3_ACCEL_MODE
+        self.pih3_base_file = str(pih3_base_file or PIH3_BASE_DEFAULT)
+        self.pih3_steps = int(pih3_steps or 2)
+        self.pih3_model = None
+        self.pih3_raw = None
+        self.pih3_refine = str(pass2_engine) == PASS2_ENGINE_PIH3
+        self.pih3_refine_steps = check_pih3_steps(pih3_refine_steps)
+        self.pih3_refine_tail = check_pih3_tail(pih3_refine_tail, self.pih3_refine_steps)
+        self.pih3_refine_model = None
+        self.pih3_refine_raw = None
+        self.dwd_sink = None
         self.hyperflow_file = str(hyperflow_file)
         self.hyperflow_curve_refit = bool(hyperflow_curve_refit)
         self.hyperflow_strength = float(hyperflow_strength)
@@ -503,6 +670,10 @@ class MasterEngine:
         self.hyperflow_pruned_refit = False
         self.turbo_lora = turbo_lora if turbo_lora and turbo_lora != "none" else None
         self.turbo_lora_strength = float(turbo_lora_strength)
+        self.diversity_lora = None
+        self.diversity_lora_strength = 1.0
+        self.diversity_steps = 1
+        self.diversity_model = None
         self.sampler_name = sampler_name
         self.scheduler_name = scheduler_name
         self.sla_enabled = bool(sla_enabled)
@@ -554,6 +725,8 @@ class MasterEngine:
             accel_desc = f"Turbo LoRA: {self.turbo_lora or 'none'} ({self.turbo_steps} steps)"
         elif self.flash_mode:
             accel_desc = f"HyperFlow Flash (GGUF): {self.flash_file}, {self.flash_steps} steps"
+        elif self.pih3_mode:
+            accel_desc = f"pi-H3: {self.pih3_base_file} + {pih3_adapter_file(self.pih3_steps)}, {self.pih3_steps} steps"
         else:
             accel_desc = f"HyperFlow 8-step: {self.hyperflow_file}"
         _LOG.info(f"Initializing Master Engine: Shift ({self.shift_video}, {self.shift_audio}), {accel_desc}")
@@ -569,6 +742,8 @@ class MasterEngine:
             accelerated, sigmas_p1 = self._prepare_turbo_model(shifted_model)
         elif self.flash_mode:
             accelerated, sigmas_p1 = self._prepare_flash_base(shifted_model)
+        elif self.pih3_mode:
+            accelerated, sigmas_p1 = self._prepare_pih3_base(shifted_model)
         else:
             accelerated, sigmas_p1 = self._prepare_hyperflow_model(shifted_model)
         self.accel_model = accelerated
@@ -661,9 +836,105 @@ class MasterEngine:
         self.flash_model = self._finish_model(self._apply_sigma_shift(patcher), tst=True)
         return self.flash_model
 
+    def _prepare_pih3_base(self, model):
+        """pi-H3 mode: the base model (SigmaShift) is the pass-2 / audio-refine model; pass 1 is the pi-H3 model, loaded lazily by
+        initialize_pih3_model. Only its sigmas are needed here (pass-2 tails and cached clips)."""
+        self.pih3_steps = check_pih3_steps(self.pih3_steps)
+        self.turbo_steps = "8"
+        _pih3_pack()
+        scheduler_cls = nodes.NODE_CLASS_MAPPINGS.get("pi-Flow Scheduler")
+        if scheduler_cls is None:
+            raise pih3_missing_pack_error()
+        _LOG.info("pi-H3: pass 1 runs %s + %s (%d steps, euler, cfg 1); the base model input and any LoRAs stacked on it "
+                  "are NOT used for pass 1, only for pass 2 / audio refine; pdd_nfe and the turbo sampler / scheduler do not apply",
+                  self.pih3_base_file, pih3_adapter_file(self.pih3_steps), self.pih3_steps)
+        if self.shift_video != 12.0:
+            _LOG.warning("pi-H3: shift_video is %.2f but the pi-H3 adapters are trained for 12.0", self.shift_video)
+        return model, pih3_sigmas(scheduler_cls, model, self.pih3_steps).clone().cpu()
+
+    def initialize_pih3_model(self):
+        """Pass-1 model in pi-H3 mode: the FL2VA base with the adapter patched in (cached across clips and jobs, so clip 2 reuses
+        it and the adapter is never patched twice), then SigmaShift, the dense attention backend and sparse attention like
+        for the base model."""
+        if self.pih3_model is not None:
+            return self.pih3_model
+        self.initialize_model()
+        pack = _pih3_pack()
+        steps = check_pih3_steps(self.pih3_steps)
+        adapter = pih3_adapter_file(steps)
+        keep_dwd = self.pih3_refine and adapter == PIH3_ADAPTER_FILES[self.pih3_refine_steps]
+        key = (self.pih3_base_file, adapter, keep_dwd)
+        patcher, hit = cache_pih3_model(key, lambda: load_pih3_model(
+            pack, self.pih3_base_file, adapter, keep_dwd=keep_dwd, base_cache=_PIH3_BASE_CACHE))
+        if hit:
+            _LOG.info("pi-H3: %s + %s already loaded, reusing", self.pih3_base_file, adapter)
+        else:
+            _LOG.info("pi-H3: loaded %s + %s%s", self.pih3_base_file, adapter,
+                      " (shared with the pi-H3 refine: the head fires on pass 1's last step and its pixels are discarded)" if keep_dwd else "")
+        self.pih3_raw = patcher
+        shifted = self._apply_sigma_shift(patcher)
+        scheduler_cls = nodes.NODE_CLASS_MAPPINGS["pi-Flow Scheduler"]
+        sigmas = pih3_sigmas(scheduler_cls, shifted, steps).clone().cpu()
+        self.pass1_sigmas = sigmas
+        if self.sla_enabled:
+            _LOG.info("pi-H3: sparse attention ON for pass 1 (%s)", self.sparse_method)
+        _LOG.info("pi-H3: grid %s, sampler euler, cfg 1", [round(float(x), 4) for x in sigmas])
+        self.pih3_model = self._finish_model(shifted, tst=True)
+        return self.pih3_model
+
+    def initialize_pih3_refine_model(self):
+        """Pass-2 model of the pi-H3 refine: the FL2VA base + the 2-step DWD adapter with its head kept (piFlow's own loader
+        installs the head and its OUTER_SAMPLE wrapper), SigmaShift 12 / 3 and the pass-2 sparse-attention handling."""
+        if self.pih3_refine_model is not None:
+            return self.pih3_refine_model
+        self.initialize_model()
+        pack = _pih3_pack()
+        if not hasattr(pack, "LakonLabAdapterLoader") or not hasattr(pack, "get_dwd_pixels"):
+            raise pih3_missing_pack_error()
+        adapter = PIH3_ADAPTER_FILES[self.pih3_refine_steps]
+        key = (self.pih3_base_file, adapter, True)
+        patcher, hit = cache_pih3_model(key, lambda: load_pih3_model(
+            pack, self.pih3_base_file, adapter, keep_dwd=True, base_cache=_PIH3_BASE_CACHE))
+        _LOG.info("pi-H3 refine: pass 2 on %s + %s (DWD head kept, last %d step(s), euler, cfg 1)%s", self.pih3_base_file, adapter,
+                  self.pih3_refine_tail,
+                  ", model already loaded" if hit else "")
+        self.pih3_refine_raw = patcher
+        self.pih3_refine_model = self._finish_model(self._apply_sigma_shift(patcher), sparsity=self._pass2_sla_override())
+        return self.pih3_refine_model
+
+    def _collect_dwd_pixels(self, latent, clip_index):
+        """Move the DWD pixels of the pass-2 run that returned `latent` out of lakonlab's stash (found by the fingerprint of its
+        video latent, the stash's own key) into the extender's frame registry, and empty the stash so nothing piles up. The
+        latent is not touched. Without pixels the clip simply falls back to the VAE decode."""
+        dwd = pih3_dwd_module(_pih3_pack())
+        video = _streams_from_latent(latent, "samples")[0]
+        pixels = dwd.DWD_PIXELS.pop(dwd.latent_fingerprint(video), None)
+        dwd.DWD_PIXELS.clear()
+        if pixels is None:
+            _LOG.warning("Clip %d: pi-H3 refine produced no DWD pixels (the head did not fire on the last step); "
+                         "this clip is decoded with the VAE", clip_index + 1)
+            return False
+        sink = self.dwd_sink
+        if sink is None:
+            from .motion_context_disk import register_dwd_frames as sink
+        return bool(sink(video, pixels))
+
+    def _discard_dwd_stash(self):
+        """Pass 1 on the shared DWD model: its head fired on pass 1's last step; drop those pixels."""
+        try:
+            pih3_dwd_module(_pih3_pack()).DWD_PIXELS.clear()
+        except Exception as exc:
+            _LOG.warning("pi-H3: could not clear the DWD stash after pass 1 (%s)", exc)
+
     def _unload_flash(self):
         """Evict ONLY the Flash transformer from the GPU, so it and the base model are never resident together."""
-        flash = self.flash_raw
+        self._unload_pass1_model(self.flash_raw, "HyperFlow Flash")
+
+    def _unload_pih3(self):
+        """Evict ONLY the pi-H3 model from the GPU, so it and the base model are never resident together."""
+        self._unload_pass1_model(self.pih3_raw, "pi-H3")
+
+    def _unload_pass1_model(self, flash, label):
         if flash is None:
             return
         mm = comfy.model_management
@@ -675,10 +946,10 @@ class MasterEngine:
             before = mm.get_free_memory(mm.get_torch_device())
             mm.free_memory(1e30, mm.get_torch_device(), keep_loaded=keep)
             mm.soft_empty_cache(force=True)
-            _LOG.info("HyperFlow Flash: transformer offloaded before pass 2: free %.1f -> %.1f GB",
+            _LOG.info("%s: transformer offloaded before pass 2: free %.1f -> %.1f GB", label,
                       before / 1024 ** 3, mm.get_free_memory(mm.get_torch_device()) / 1024 ** 3)
         except Exception as exc:
-            _LOG.warning("HyperFlow Flash: could not offload the transformer explicitly (%s); pass 2's VRAM reclaim evicts it", exc)
+            _LOG.warning("%s: could not offload the transformer explicitly (%s); pass 2's VRAM reclaim evicts it", label, exc)
 
     def _finish_model(self, model, sparse=True, sparsity=None, tst=False):
         """Dense attention backend, then TST (pass-1 models only, when on), then optional block-sparse
@@ -745,7 +1016,7 @@ class MasterEngine:
         self.pass2_lora = lora if lora and lora != "none" else None
         self.pass2_lora_strength = float(strength)
         self.pass2_lora_mode = "replace" if str(mode).lower().startswith("replace") else "stack"
-        if self.flash_mode and self.pass2_lora_mode != "replace":
+        if (self.flash_mode or getattr(self, "pih3_mode", False)) and self.pass2_lora_mode != "replace":
             self.pass2_lora_mode = "replace"
         if self.hyperflow_mode and self.pass2_lora and self.pass2_lora_mode != "replace":
             _LOG.info("HyperFlow: pass-2 LoRA forces 'replace' mode (pass 2 runs on the SigmaShift model + this "
@@ -787,7 +1058,48 @@ class MasterEngine:
         if self.handoff_mode or self.cfg_handoff_mode:
             _LOG.warning("Clip %d: time_gate_json is not applied in the hand-off modes (the second segment runs another model)", clip_index + 1)
             return contextlib.nullcontext()
+        if self._diversity_active():
+            _LOG.warning("Clip %d: time_gate_json acts on the plain turbo segment only; the diversity LoRA segment runs without it", clip_index + 1)
         return time_gate_lora.scope(model, self.time_gate, clip_index, trim_frames)
+
+    def configure_diversity(self, lora="none", strength=1.0, steps=1):
+        """First-step diversity LoRA (ReDiverse): applied on top of the turbo LoRA for the first `steps` pass-1 steps only.
+        Plain Turbo LoRA mode with a turbo LoRA only; ignored (and logged once) otherwise."""
+        self.diversity_lora = None
+        self.diversity_model = None
+        if lora in (None, "", "none"):
+            return
+        if self.accel_mode != TURBO_ACCEL_MODE or self.turbo_lora is None:
+            _LOG.warning("Diversity LoRA %s ignored: it needs accel_mode Turbo LoRA with a turbo_lora (mode is %s)",
+                         lora, self.accel_mode)
+            return
+        self.diversity_lora = str(lora)
+        self.diversity_lora_strength = float(strength if strength is not None else 1.0)
+        self.diversity_steps = clamp_diversity_steps(steps or 1, int(self.turbo_steps))
+
+    def _diversity_active(self):
+        return self.diversity_lora is not None
+
+    def initialize_diversity_model(self):
+        """Pass-1 model of the first segment: the turbo model + the diversity LoRA, finished like the pass-1 model."""
+        if self.diversity_model is None:
+            self.initialize_model()
+            lora_cls = nodes.NODE_CLASS_MAPPINGS.get("LoraLoaderModelOnly")
+            res = lora_cls().load_lora_model_only(self.accel_model, self.diversity_lora, self.diversity_lora_strength)
+            self.diversity_model = self._finish_model(_safe_get_output(res, 0, "model"), tst=True)
+        return self.diversity_model
+
+    def _sample_diversity(self, turbo_model, sigmas, positive, latent, seed):
+        """Pass 1 with a diversity first segment: turbo + diversity LoRA samples steps 1..k, then the plain turbo model
+        continues from that noise level with no added noise (same seed, same split pattern as the hand-offs)."""
+        k = clamp_diversity_steps(self.diversity_steps, len(sigmas) - 1)
+        div_seg, turbo_seg = split_diversity_sigmas(sigmas, k)
+        _LOG.info("Diversity LoRA: %s @ %.2f on steps 1..%d (sigma 1.0->%.4f), then %s alone",
+                  self.diversity_lora, self.diversity_lora_strength, k, turbo_seg[0], self.turbo_lora)
+        mid = self._sample_euler(self.initialize_diversity_model(), positive, latent,
+                                 torch.tensor(div_seg, dtype=torch.float32), seed)
+        return self._sample_euler(turbo_model, positive, mid, torch.tensor(turbo_seg, dtype=torch.float32), seed,
+                                  add_noise=False)
 
     def configure_pass1_steps(self, steps=0):
         """Opt-in: stop HyperFlow's pass 1 after `steps` of its 8 steps and hand the model's clean x0 estimate to the
@@ -897,6 +1209,8 @@ class MasterEngine:
     def initialize_pass2_model(self):
         """Model used for the refine pass: the pass-1 model unless a pass-2 LoRA is set."""
         prepared, _ = self.initialize_model()
+        if getattr(self, "pih3_refine", False):
+            return self.initialize_pih3_refine_model()
         p2_sparsity = self._pass2_sla_override()
         if not self._pass2_lora_active():
             if p2_sparsity is None and not self._tst_active():
@@ -1108,6 +1422,16 @@ class MasterEngine:
         round(steps x denoise) steps of the turbo schedule. With a pass-2 LoRA
         the schedule length can differ from pass 1 (pass2_steps), and in
         "replace" mode the pass-1 grid no longer applies."""
+        if getattr(self, "pih3_refine", False):
+            scheduler_cls = nodes.NODE_CLASS_MAPPINGS.get("pi-Flow Scheduler")
+            if scheduler_cls is None:
+                raise pih3_missing_pack_error()
+            steps, n = self.pih3_refine_steps, self.pih3_refine_tail
+            tail = pih3_tail_sigmas(pih3_sigmas(scheduler_cls, model, steps), n)
+            _LOG.info("pi-H3 refine: pass 2 is the last %d step(s) of the %d-step pi-Flow grid on the shifted pass-2 model: %s "
+                      "(pass2_denoise, pass2_steps and the pass-2 scheduler do not apply)", n, steps,
+                      [round(float(x), 4) for x in tail])
+            return tail
         if self.dual_active:
             tail = dual_pass2_sigmas(self.pass1_sigmas, self.dual_split_step)
             _LOG.info("HyperFlow dual sampling: pass 2 runs grid[%d:] (%d steps): %s",
@@ -1117,7 +1441,11 @@ class MasterEngine:
         if self.flash_mode and not self._pass2_lora_active():
             _LOG.warning("HyperFlow Flash without a pass-2 LoRA: pass 2 runs the tail of the Flash grid on the plain "
                          "base model, which has no few-step distillation. Pick a pass-2 LoRA (DMAD).")
-        if (self.hyperflow_mode or self.flash_mode) and not self._pass2_lora_active():
+        pih3 = getattr(self, "pih3_mode", False)
+        if pih3 and not self._pass2_lora_active():
+            _LOG.warning("pi-H3 without a pass-2 LoRA: pass 2 runs the tail of the pi-H3 grid on the plain base model, which "
+                         "has no few-step distillation. Pick a pass-2 LoRA (DMAD).")
+        if (self.hyperflow_mode or self.flash_mode or pih3) and not self._pass2_lora_active():
             tail = hyperflow_tail_sigmas(self.pass1_sigmas, pass2_denoise)
             _LOG.info("HyperFlow: pass 2 uses the tail of HyperFlow's own grid (%d steps): %s",
                       len(tail) - 1, [round(float(x), 4) for x in tail])
@@ -1266,6 +1594,8 @@ class MasterEngine:
     # Chunked pass 2 (temporal windows via MMH3SplitUpscale)
     # ------------------------------------------------------------------
     def _pass2_chunking_active(self, frame_count, width=None, height=None):
+        if getattr(self, "pih3_refine", False):
+            return False  # one DWD run over the whole clip: windows would each produce their own pixels
         if self.pass2_chunk_frames <= 0:
             return False
         if int(frame_count) <= int(self.pass2_chunk_frames):
@@ -1556,6 +1886,65 @@ class MasterEngine:
 
         return upscaled
 
+    def _preview_decoder(self):
+        """The tiny H3 preview decoder (taeh3) when this ComfyUI can load it, else None (cached after the first try)."""
+        if getattr(self, "_preview_vae_tried", False):
+            return getattr(self, "_preview_vae", None)
+        self._preview_vae_tried = True
+        self._preview_vae = None
+        try:
+            import comfy.sd
+            import comfy.utils
+            import folder_paths
+
+            for folder in ("vae_approx", "vae"):
+                for name in folder_paths.get_filename_list(folder):
+                    if "taeh3" in name.lower():
+                        path = folder_paths.get_full_path(folder, name)
+                        self._preview_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(path))
+                        _LOG.info("Chain memory: preview decoder %s/%s loaded", folder, name)
+                        return self._preview_vae
+        except Exception as exc:  # noqa: BLE001 -- no preview decoder means the normal VAE is used
+            _LOG.info("Chain memory: no preview decoder (%s); the pass-1 draft is decoded with the video VAE", exc)
+        return None
+
+    @torch.no_grad()
+    def _start_memory_pick(self, sampled_p1, trim_frames, clip_index):
+        """Decode the pass-1 draft before pass 2 and start the CPU pick of the chain-memory frame on it.
+
+        Returns an EarlyPick, or None when anything fails (the final decode then picks the frame as before).
+        """
+        import time as _time
+
+        started = _time.time()
+        try:
+            video_p1 = _streams_from_latent(sampled_p1, "samples")[0]
+            expected = sum((1, 4, 4, 4, 4)[k % 5] for k in range(int(video_p1.shape[2])))
+            frames = None
+            decoder = "video VAE"
+            tiny = self._preview_decoder()
+            if tiny is not None:
+                try:
+                    out = tiny.decode(video_p1)
+                    if out.ndim == 5:
+                        out = out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
+                    if int(out.shape[0]) == expected:
+                        frames, decoder = out, "taeh3"
+                    else:
+                        _LOG.info("Chain memory: preview decoder gave %d frames, expected %d; using the video VAE", int(out.shape[0]), expected)
+                except Exception as exc:  # noqa: BLE001
+                    _LOG.info("Chain memory: preview decode failed (%s); using the video VAE", exc)
+            if frames is None:
+                out = self.vae.decode(video_p1)
+                if out.ndim == 5:
+                    out = out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
+                frames = out
+            frames = frames[int(trim_frames):].to(device="cpu", dtype=torch.float32)
+            return chain_memory.EarlyPick(decoder, round(_time.time() - started, 2)).start(frames)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("Chain memory: clip %d early pick not started (%s); the final decode will pick the frame", clip_index + 1, exc)
+            return None
+
     def render_clip(
         self,
         clip_index: int,
@@ -1715,6 +2104,7 @@ class MasterEngine:
         # If extending (clip_index > 0) and previous latent available: attach motion context
         self.last_trim_frames = 0
         self.last_draft = None
+        self.memory_pick = None
         if not cached and clip_index > 0 and previous_draft is not None:
             _LOG.info(f"Clip {clip_index + 1}: Applying Pass 1 motion context ({context_length}f video)")
             pos_p1, trim_p1, _, _, _ = self.motion_ram.apply(
@@ -1779,6 +2169,9 @@ class MasterEngine:
             if self.flash_mode:
                 model = self.initialize_flash_model()
                 sigmas_p1 = self.pass1_sigmas
+            elif self.pih3_mode:
+                model = self.initialize_pih3_model()
+                sigmas_p1 = self.pass1_sigmas
             # Sample Pass 1 with the pass-1 sigmas
             early_stop = self.dual_active and self.pass1_early_stop and pass2_enabled
             if (not early_stop and self.pass1_steps > 0 and not self.dual_active and pass2_enabled
@@ -1799,6 +2192,8 @@ class MasterEngine:
                 elif self.cfg_handoff_mode:
                     sampled_p1 = self._sample_cfg_handoff(self.initialize_cfg_model(), model, sigmas_p1, pos_p1, neg_p1,
                                                           latent_p1, seed)
+                elif self._diversity_active() and not early_stop:
+                    sampled_p1 = self._sample_diversity(model, sigmas_p1, pos_p1, latent_p1, seed)
                 else:
                     sampled_p1 = self._sample_euler(
                         model=model,
@@ -1813,10 +2208,17 @@ class MasterEngine:
                     )
             if (self.flash_mode or self.handoff_mode) and pass2_enabled:
                 self._unload_flash()
+            elif self.pih3_mode and pass2_enabled:
+                if self.pih3_refine:
+                    self._discard_dwd_stash()
+                self._unload_pih3()
 
         if not pass2_enabled:
             self.last_draft = None if cached else sampled_p1
             return sampled_p1, None
+
+        if getattr(self, "chain_memory_pick", False):
+            self.memory_pick = self._start_memory_pick(sampled_p1, self.last_trim_frames, clip_index)
 
         # =====================================================================
         # LATENT 3D UPSCALE & ALIGNMENT
@@ -1863,6 +2265,7 @@ class MasterEngine:
 
         # Sample Pass 2 (High-Res Refine): whole clip, or overlapping temporal
         # windows when the clip is longer than pass2_chunk_frames.
+        pass2_started = time.time()
         if self._pass2_chunking_active(frame_count, w2, h2):
             final_sampled = self._sample_pass2_chunked(
                 model=model_p2,
@@ -1879,6 +2282,9 @@ class MasterEngine:
                 sigmas=sigmas_p2,
                 seed=seed,
             )
+        _LOG.info("Clip %d: pass 2 sampling %.1f s", clip_index + 1, time.time() - pass2_started)
+        if self.pih3_refine:
+            self._collect_dwd_pixels(final_sampled, clip_index)
 
         if getattr(self, "pass2_audio_from_p1", False):
             video_p2, _ = _streams_from_latent(final_sampled, "samples")

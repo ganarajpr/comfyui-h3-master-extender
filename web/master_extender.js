@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { createProjectControls } from "./master_projects.js";
-import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue } from "./widget_migration.js";
+import { migrateSavedValues, tstOffForSavedValues, chainMemoryOffForSavedValues, HYPERFLOW_WIDGETS, DUAL_WIDGETS, DUAL_MODE, isHyperflowMode, dualWidgetValue, hyperflowWidgetValue, normalizeReasoningBudget, pass2ChunkWhenValue, pass2SlaSparsityValue, pass2SchedulerValue, pass2AudioValue, flashStepsValue, flashFileValue, flashLoraValue, flashLoraStrengthValue, handoffStepValue, pih3StepsValue, pih3BaseFileValue, pass2EngineValue, cacheClipsValue, PASS2_ENGINE_PIH3, pih3RefineStepsValue, pih3RefineTailValue, visibleAccelModes, pass1CfgValue, cfgStepsValue, cfgHandoffStepsValue, negativePromptValue, diversityLoraValue, diversityStrengthValue, diversityStepsValue } from "./widget_migration.js";
 
 // Optional: if presets.js fails to load the panel simply has no Preset row.
 let presetsMod = null;
@@ -40,18 +40,79 @@ const H3_SECTIONS = new Set([
     "camera", "style", "negative", "audio", "music", "voice", "shots",
 ]);
 
+// Returns true only when the text really reached the clipboard. The clipboard API needs https or localhost; a plain
+// http page (ComfyUI opened from another machine, e.g. through the gateway) falls back to execCommand, which can fail
+// WITHOUT throwing, so its return value is checked. Callers show the text to copy by hand when this returns false.
 async function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-        return;
+        try { await navigator.clipboard.writeText(text); return true; } catch (error) { /* try the fallback */ }
     }
     const area = document.createElement("textarea");
     area.value = text;
-    area.style.cssText = "position: fixed; left: -9999px;";
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position: fixed; left: -9999px; top: 0;";
+    // ComfyUI's own copy handler (copies nodes) must not see this event.
+    area.addEventListener("copy", (e) => e.stopPropagation());
     document.body.appendChild(area);
+    const previous = document.activeElement;
+    area.focus();
     area.select();
-    document.execCommand("copy");
+    let ok = false;
+    try { ok = document.execCommand("copy") === true; } catch (error) { ok = false; }
     area.remove();
+    if (previous && typeof previous.focus === "function") previous.focus();
+    return ok;
+}
+
+// When the browser would not copy: a box with the text already selected, to copy with Ctrl+C / Cmd+C.
+function showCopyBox(text, what) {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center;";
+    const box = document.createElement("div");
+    box.style.cssText = "background: #1e1e2a; border: 1px solid #3f3f58; border-radius: 8px; padding: 14px; width: min(760px, 92vw); display: flex; flex-direction: column; gap: 8px; font: 12px sans-serif; color: #ddd;";
+    const title = document.createElement("div");
+    title.textContent = `This browser would not copy ${what} by itself (the page is not https or localhost). The text below is selected: press Ctrl+C (Cmd+C on a Mac), then Close.`;
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.readOnly = true;
+    area.spellcheck = false;
+    area.style.cssText = "width: 100%; height: 50vh; box-sizing: border-box; background: #111118; color: #ddd; border: 1px solid #444; border-radius: 5px; font: 11px monospace; padding: 8px; resize: vertical;";
+    const status = document.createElement("div");
+    status.style.cssText = "min-height: 14px; color: #8fb0e6;";
+    const row = document.createElement("div");
+    row.style.cssText = "display: flex; gap: 8px; justify-content: flex-end;";
+    const btnStyle = "padding: 4px 14px; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px;";
+    const copy = document.createElement("button");
+    copy.textContent = "Copy";
+    copy.style.cssText = btnStyle + "background: #3f3f58; border: 1px solid #ddd; color: #fff;";
+    const close = document.createElement("button");
+    close.textContent = "Close";
+    close.style.cssText = btnStyle + "background: transparent; border: 1px solid #555; color: #ccc;";
+    row.append(copy, close);
+    box.append(title, area, status, row);
+    overlay.appendChild(box);
+    // Keep ComfyUI's canvas shortcuts (Ctrl+C copies nodes, Delete removes them) out of the box.
+    for (const type of ["keydown", "keyup", "keypress", "paste", "copy", "cut"]) {
+        overlay.addEventListener(type, (e) => e.stopPropagation());
+    }
+    area.addEventListener("copy", () => { status.textContent = "Copied."; });
+    const done = () => overlay.remove();
+    close.onclick = done;
+    copy.onclick = () => {
+        // A visible, selected text box copies with execCommand even on plain http.
+        area.focus();
+        area.select();
+        let ok = false;
+        try { ok = document.execCommand("copy") === true; } catch (error) { ok = false; }
+        status.style.color = ok ? "#8fb0e6" : "#f87171";
+        status.textContent = ok ? "Copied." : "Still blocked: press Ctrl+C (Cmd+C on a Mac) with the text selected.";
+        area.select();
+    };
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) done(); });
+    area.addEventListener("keydown", (e) => { if (e.key === "Escape") done(); });
+    document.body.appendChild(overlay);
+    area.focus();
+    area.select();
 }
 
 // Copy all clips / Paste clips: one Extender's whole clip list moves to another in one go.
@@ -267,6 +328,7 @@ function clampDuration(sec, beyond) {
 // Conditional widget visibility on the Master node. A hidden widget keeps its
 // value and its slot in widgets_values; it just draws with zero height.
 const TURBO_ONLY_WIDGETS = ["turbo_lora", "turbo_lora_strength", "turbo_sampler", "turbo_scheduler"];
+const DIVERSITY_WIDGETS = ["diversity_lora", "diversity_lora_strength", "diversity_steps"];
 // pdd_file is retired: it keeps its slot in widgets_values (saved workflows) but is never shown.
 const ALWAYS_HIDDEN_WIDGETS = ["pdd_file"];
 const TURBO_STEPS_WIDGETS = ["pdd_nfe"];
@@ -282,6 +344,11 @@ const isDualMode = (value) => String(value ?? "") === DUAL_MODE;
 const FLASH_MODE = "HyperFlow Flash (GGUF)";
 const FLASH_WIDGETS = ["hyperflow_flash_file", "hyperflow_flash_steps", "hyperflow_flash_lora", "hyperflow_flash_lora_strength"];
 const isFlashMode = (value) => String(value ?? "") === FLASH_MODE;
+// pi-H3 (Lakonik/ComfyUI-piFlow) engine: the FL2VA base + a 2 / 4-step adapter for pass 1, its own two widgets, shown only in that mode.
+const PIH3_MODE = "pi-H3 (FL2VA adapter)";
+const PIH3_WIDGETS = ["pih3_base_file", "pih3_steps"];
+const PIH3_REFINE_WIDGETS = ["pih3_refine_steps", "pih3_refine_tail"];
+const isPih3Mode = (value) => String(value ?? "") === PIH3_MODE;
 // Pika \u2192 Flash hand-off: Pika (the turbo widgets) runs the first handoff_step steps, Flash (its widgets) the rest.
 const HANDOFF_MODE = "Pika \u2192 Flash hand-off";
 const isHandoffMode = (value) => String(value ?? "") === HANDOFF_MODE;
@@ -427,6 +494,24 @@ function repairDualWidgets(node, defaults) {
     // Chain memory (after pass1_steps): a workflow saved before it, or from when it was a toggle, carries a value that is not one of the modes: OFF.
     const chainMemory = node.widgets?.find(x => x.name === "chain_memory");
     if (chainMemory && !["off", "picture", "context", "picture + context"].includes(chainMemory.value)) chainMemory.value = "off";
+    const pih3File = node.widgets?.find(x => x.name === "pih3_base_file");
+    if (pih3File) pih3File.value = pih3BaseFileValue(pih3File.value, comboValues(pih3File));
+    const pih3Steps = node.widgets?.find(x => x.name === "pih3_steps");
+    if (pih3Steps) pih3Steps.value = pih3StepsValue(pih3Steps.value);
+    const cacheClips = node.widgets?.find(x => x.name === "cache_clips");
+    if (cacheClips) cacheClips.value = cacheClipsValue(cacheClips.value);
+    const pass2Engine = node.widgets?.find(x => x.name === "pass2_engine");
+    if (pass2Engine) pass2Engine.value = pass2EngineValue(pass2Engine.value);
+    const refineSteps = node.widgets?.find(x => x.name === "pih3_refine_steps");
+    if (refineSteps) refineSteps.value = pih3RefineStepsValue(refineSteps.value);
+    const refineTail = node.widgets?.find(x => x.name === "pih3_refine_tail");
+    if (refineTail) refineTail.value = pih3RefineTailValue(refineTail.value, refineSteps?.value);
+    const divLora = node.widgets?.find(x => x.name === "diversity_lora");
+    if (divLora) divLora.value = diversityLoraValue(divLora.value, comboValues(divLora));
+    const divStrength = node.widgets?.find(x => x.name === "diversity_lora_strength");
+    if (divStrength) divStrength.value = diversityStrengthValue(divStrength.value);
+    const divSteps = node.widgets?.find(x => x.name === "diversity_steps");
+    if (divSteps) divSteps.value = diversityStepsValue(divSteps.value);
 }
 
 // A workflow saved before TST existed has no value for tst_tau (its values stop at tst_enabled's slot, which holds master_ui's ""
@@ -480,7 +565,12 @@ function setupModeWidgets(node) {
         DUAL_DETAIL_WIDGETS.forEach(n => setWidgetVisible(byName(n), dualOn));
         setWidgetVisible(byName(PASS1_STEPS_WIDGET), hyperflow && !dualOn);
         FLASH_WIDGETS.forEach(n => setWidgetVisible(byName(n), flash));
+        const refineOn = byName("pass2_engine")?.value === PASS2_ENGINE_PIH3;
+        setWidgetVisible(byName("pih3_base_file"), isPih3Mode(accel?.value) || refineOn);
+        setWidgetVisible(byName("pih3_steps"), isPih3Mode(accel?.value));
+        PIH3_REFINE_WIDGETS.forEach(n => setWidgetVisible(byName(n), refineOn));
         setWidgetVisible(byName("handoff_step"), handoff);
+        DIVERSITY_WIDGETS.forEach(n => setWidgetVisible(byName(n), mode === "turbo lora"));
         CFG_WIDGETS.forEach(n => setWidgetVisible(byName(n), cfgOnly || cfgHandoff));
         setWidgetVisible(byName("cfg_handoff_steps"), cfgHandoff);
         ALWAYS_HIDDEN_WIDGETS.forEach(n => setWidgetVisible(byName(n), false));
@@ -494,7 +584,7 @@ function setupModeWidgets(node) {
     };
     node.applyModeWidgets = apply;
 
-    for (const w of [accel, sla, byName(DUAL_WIDGET)]) {
+    for (const w of [accel, sla, byName(DUAL_WIDGET), byName("pass2_engine")]) {
         if (!w) continue;
         const original = w.callback;
         w.callback = function () {
@@ -728,6 +818,9 @@ app.registerExtension({
             let cacheStates = [];
             let cacheVideos = [];
             let cacheTimer = 0;
+            // Clip caching is opt-in (the cache_clips widget, OFF by default). True while this node is executing: the toggle is locked then.
+            let nodeRunning = false;
+            function cacheOn() { return node.widgets?.find(x => x.name === "cache_clips")?.value === true; }
             try {
                 clipsState = JSON.parse(clipsWidget.value || "[]");
             } catch (e) {
@@ -788,6 +881,10 @@ app.registerExtension({
             function refreshCacheStatus() {
                 clearTimeout(cacheTimer);
                 cacheTimer = setTimeout(async () => {
+                    if (!cacheOn()) {
+                        if (cacheStates.length || cacheVideos.length) { cacheStates = []; cacheVideos = []; renderUI(); }
+                        return;
+                    }
                     try {
                         const response = await api.fetchApi("/minimax_master/cache_status", {
                             method: "POST", headers: { "Content-Type": "application/json" },
@@ -816,12 +913,13 @@ app.registerExtension({
                 none: ["○ not cached", "#6b7280", "Not rendered yet for these inputs."],
             };
             function cacheBadge(index) {
+                if (!cacheOn()) return "";
                 const badge = CACHE_BADGES[cacheStates[index]];
                 return badge ? `<span title="${badge[2]}" style="color: ${badge[1]}; font-size: 10px; white-space: nowrap;">${badge[0]}</span>` : "";
             }
 
             function clipVideo(index, style) {
-                const info = cacheVideos[index];
+                const info = cacheOn() ? cacheVideos[index] : null;
                 if (!info) return null;
                 const video = document.createElement("video");
                 const query = new URLSearchParams({ filename: info.filename, subfolder: info.subfolder, type: "output", t: String(info.mtime) });
@@ -887,11 +985,12 @@ app.registerExtension({
                 button.style.cssText = "background: #252536; border: 1px solid #3f3f58; color: #ddd; border-radius: 3px; cursor: pointer; padding: 1px 6px; font-size: 10px; white-space: nowrap;";
                 button.onclick = async (e) => {
                     e.stopPropagation();
-                    try {
-                        await copyText(clip.prompt || "");
+                    const text = clip.prompt || "";
+                    if (await copyText(text)) {
                         button.textContent = "✓ Copied";
-                    } catch (error) {
-                        button.textContent = "Copy failed";
+                    } else {
+                        button.textContent = "Copy by hand";
+                        showCopyBox(text, "the prompt");
                     }
                     setTimeout(() => { button.textContent = "⧉ Copy"; }, 1200);
                 };
@@ -990,6 +1089,7 @@ app.registerExtension({
             const isTurbo = () => String(getW("accel_mode", "")).toLowerCase().startsWith("turbo");
             const isHandoff = () => isHandoffMode(getW("accel_mode", ""));
             const isFlash = () => isFlashMode(getW("accel_mode", ""));
+            const isPih3 = () => isPih3Mode(getW("accel_mode", ""));
             const isCfg = () => isCfgMode(getW("accel_mode", ""));
             const isCfgHandoff = () => isCfgHandoffMode(getW("accel_mode", ""));
             const isHyperflow = () => isHyperflowMode(getW("accel_mode", ""));
@@ -1037,12 +1137,13 @@ app.registerExtension({
             function engineSummary() {
                 const steps = getW("pdd_nfe", "6");
                 const p2 = String(getW("pass2_lora", "none"));
-                const p2note = p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
+                const p2note = getW("pass2_engine", "") === PASS2_ENGINE_PIH3 ? ` · refine pi-H3 DWD ${getW("pih3_refine_steps", 2)}-step, last ${getW("pih3_refine_tail", 1)} (no VAE decode)` : p2 !== "none" ? ` · refine ${shortModelName(p2)}${String(getW("pass2_lora_mode", "")).startsWith("replace") ? " (replace)" : ""}` : "";
                 const bridge = String(getW("semantic_bridge", "none"));
                 const bridgeNote = bridge !== "none" ? ` · bridge α ${Number(getW("semantic_bridge_alpha", 0)).toFixed(2)}` : "";
                 if (isCfg()) return `Base + CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} · ${getW("cfg_steps", 24)} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
                 if (isCfgHandoff()) return `CFG ${Number(getW("pass1_cfg", 4.5)).toFixed(1)} \u2192 Pika @${getW("cfg_handoff_steps", 8)}/${getW("cfg_steps", 24)} · ${shortModelName(getW("turbo_lora"))} · ${steps} steps${p2note}${bridgeNote}`;
                 if (isHandoff()) return `Pika \u2192 Flash hand-off @${parseInt(getW("handoff_step", 3), 10) || 3} · ${shortModelName(getW("turbo_lora"))} → ${shortModelName(getW("hyperflow_flash_file"))}${p2note}${bridgeNote}`;
+                if (isPih3()) return `pi-H3 · ${shortModelName(getW("pih3_base_file"))} · ${getW("pih3_steps", 2)} steps · euler${p2note}${bridgeNote}`;
                 if (isFlash()) return `HyperFlow Flash (GGUF) · ${shortModelName(getW("hyperflow_flash_file"))} · ${getW("hyperflow_flash_steps", 6)} steps · euler${p2note}${bridgeNote}`;
                 if (isHyperflow()) {
                     const dualMode = isDualMode(getW("accel_mode", ""));
@@ -1052,7 +1153,8 @@ app.registerExtension({
                     const p1sNote = (!dualNote && p1s > 0) ? ` · pass 1 stops at step ${p1s}/8` : "";
                     return `HyperFlow 8-step (legacy) · ${shortModelName(getW("hyperflow_file"))} · refit ${getW("hyperflow_curve_refit", true) ? "on" : "off"} · euler${p2note}${dualNote}${p1sNote}${bridgeNote}`;
                 }
-                return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
+                const divNote = String(getW("diversity_lora", "none")) !== "none" ? ` · diversity ${shortModelName(getW("diversity_lora"))} x${Number(getW("diversity_lora_strength", 1)).toFixed(2)} first ${getW("diversity_steps", 1)}` : "";
+                return `Turbo LoRA · ${shortModelName(getW("turbo_lora"))}${divNote} · ${steps} steps · ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}${p2note}${bridgeNote}`;
             }
             function qualitySummary() {
                 const { preset, orientation } = currentPreset();
@@ -1067,7 +1169,9 @@ app.registerExtension({
                 return `${att} · ${sla} · ${chunk}${getW("smart_offload", true) ? "" : " · offload off"}${getW("async_decode", "off") !== "off" ? ` · async ${getW("async_decode")}` : ""}`;
             }
             function continuitySummary() {
-                return `motion ${getW("context_length", "22")} f · audio ${getW("audio_context_length", 0)} f · identity ${getW("identity_continuity", true) ? "on" : "off"}`;
+                const memory = W("chain_memory") ? `memory ${getW("chain_memory", "off")}` : "";
+                if (!expert()) return memory;
+                return `motion ${getW("context_length", "22")} f · audio ${getW("audio_context_length", 0)} f · identity ${getW("identity_continuity", true) ? "on" : "off"}` + (memory ? ` · ${memory}` : "");
             }
 
             function rewriterSummary() {
@@ -1213,13 +1317,13 @@ app.registerExtension({
                 const accelW = W("accel_mode");
                 // The HyperFlow 8-step options are offered only while the node already holds one (a workflow saved before
                 // 2026-11-17): the engine is retired as a choice, so a new pick never lands on it.
-                const accelOptions = comboValues(accelW).filter(v => !isHyperflowMode(v) || isHyperflowMode(accelW?.value));
+                const accelOptions = visibleAccelModes(comboValues(accelW), accelW?.value);
                 const accelSel = uiSelect(accelOptions, accelW?.value, (v) => {
                     setW("accel_mode", v, { rerender: false });
                     setW("pdd_nfe", String(v).toLowerCase().startsWith("turbo") || isHandoffMode(v) || isCfgMode(v) || isCfgHandoffMode(v) ? "6" : "8", { rerender: false });
                     renderUI();
                 }, { render: (v) => isHyperflowMode(v) ? `${v} (legacy)` : String(v) });
-                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model." + (isHyperflow() ? " HyperFlow 8-step is the retired legacy engine: it is here only so a workflow saved before 2026-11-17 re-renders as saved." : "") }));
+                wrap.appendChild(uiRow("engine", accelSel, { hint: "Turbo LoRA: any turbo LoRA with its own step count (default: Pika, 6 steps, with the DMAD refiner). HyperFlow Flash (GGUF): Video Rebirth's compressed few-step transformer for pass 1 (4/6/8 steps), pass 2 on the base model. pi-H3 (FL2VA adapter): the pi-H3 2/4-step adapter on the FL2VA base for pass 1 (needs ComfyUI-piFlow), pass 2 on the base model." + (isHyperflow() ? " HyperFlow 8-step is the retired legacy engine: it is here only so a workflow saved before 2026-11-17 re-renders as saved." : "") }));
                 if (isHyperflow()) {
                     wrap.appendChild(uiHint("Legacy engine (retired 2026-11-17): this workflow was saved with HyperFlow 8-step and re-renders with it as saved. Switch the engine to Turbo LoRA for Pika + DMAD."));
                     wrap.appendChild(uiRow("hyperflow file", bindSelect("hyperflow_file", { render: shortModelName }),
@@ -1270,6 +1374,12 @@ app.registerExtension({
                     wrap.appendChild(uiRow("flash lora", bindSelect("hyperflow_flash_lora")));
                     wrap.appendChild(uiRow("flash lora strength", bindNumber("hyperflow_flash_lora_strength")));
                     wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
+                } else if (isPih3()) {
+                    wrap.appendChild(uiRow("pi-H3 base", bindSelect("pih3_base_file", { render: shortModelName }),
+                        { hint: "Pass 1 patches the pi-H3 adapter onto this FL2VA base (conditioning is still the extender's Ref2VA). The base model input is used for pass 2 only." }));
+                    wrap.appendChild(uiRow("pi-H3 steps", bindNumber("pih3_steps"),
+                        { hint: "2 or 4 steps: picks the adapter and the pi-Flow schedule. Euler, CFG 1. Needs the ComfyUI-piFlow node pack." }));
+                    wrap.appendChild(uiHint("Pass 2 is the refine LoRA on the base model (pick DMAD)."));
                 } else if (isFlash()) {
                     wrap.appendChild(uiRow("flash file", bindSelect("hyperflow_flash_file", { render: shortModelName }),
                         { hint: "Pass 1 runs this Flash transformer (ref2va build, GGUF or INT8 convrot safetensors). The base model input is used for pass 2 only." }));
@@ -1283,6 +1393,15 @@ app.registerExtension({
                 } else if (isTurbo()) {
                     wrap.appendChild(uiRow("turbo lora", bindSelect("turbo_lora", { render: shortModelName })));
                     wrap.appendChild(uiRow("steps", bindSelect("pdd_nfe")));
+                    if (W("diversity_lora")) {
+                        wrap.appendChild(uiRow("diversity lora", bindSelect("diversity_lora", { render: shortModelName }),
+                            { hint: "Applied on top of the turbo LoRA for the first N pass-1 steps only (ReDiverse restores the variety distillation removes). none = off." }));
+                        if (getW("diversity_lora", "none") !== "none") {
+                            wrap.appendChild(uiRow("diversity strength", bindNumber("diversity_lora_strength"), { indent: true }));
+                            wrap.appendChild(uiRow("diversity steps", bindNumber("diversity_steps"),
+                                { indent: true, hint: "How many of the first steps carry the diversity LoRA (1 = the author's recipe). Clamped to steps - 1." }));
+                        }
+                    }
                     if (expert()) {
                         wrap.appendChild(uiRow("lora strength", bindNumber("turbo_lora_strength"), { indent: true }));
                         wrap.appendChild(uiRow("sampler", bindSelect("turbo_sampler"), { indent: true }));
@@ -1291,10 +1410,21 @@ app.registerExtension({
                         wrap.appendChild(uiHint(`sampler ${getW("turbo_sampler", "")} / ${getW("turbo_scheduler", "")}, strength ${Number(getW("turbo_lora_strength", 1)).toFixed(2)} — switch to Expert to change`));
                     }
                 }
+                if (W("pass2_engine")) wrap.appendChild(uiRow("refine engine", bindSelect("pass2_engine"),
+                    { hint: "LoRA refine: base + the pass-2 LoRA, then the video VAE decode. pi-H3 refine (DWD, no VAE decode): pass 2 is one pi-H3 step (FL2VA base + 2-step DWD adapter) whose DWD head outputs the clip's frames, so the video VAE decode is skipped. Needs ComfyUI-piFlow and the standard final decode." }));
+                const refineOn = getW("pass2_engine", "") === PASS2_ENGINE_PIH3;
+                if (refineOn) {
+                    if (!isPih3()) wrap.appendChild(uiRow("pi-H3 base", bindSelect("pih3_base_file", { render: shortModelName }),
+                        { hint: "The FL2VA base the pi-H3 DWD adapter is patched onto for pass 2." }));
+                    wrap.appendChild(uiRow("refine adapter steps", bindNumber("pih3_refine_steps"),
+                        { hint: "2 or 4: which pi-H3 DWD adapter (and pi-Flow grid) pass 2 runs." }));
+                    wrap.appendChild(uiRow("refine tail steps", bindNumber("pih3_refine_tail"),
+                        { hint: "Pass 2 runs the LAST this-many steps of that grid (1..adapter steps); the latent is re-noised to the first sigma of the tail. The DWD head's pixels are the frames." }));
+                }
                 const p2lora = String(getW("pass2_lora", "none"));
-                wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
+                if (!refineOn) wrap.appendChild(uiRow("refine lora", bindSelect("pass2_lora", { render: shortModelName }),
                     { hint: "LoRA applied only on the pass-2 refine tail. none = same model as pass 1." }));
-                if (p2lora !== "none") {
+                if (!refineOn && p2lora !== "none") {
                     wrap.appendChild(uiRow("refine lora strength", bindNumber("pass2_lora_strength"), { indent: true }));
                     wrap.appendChild(uiRow("mode", bindSelect("pass2_lora_mode", { render: (v) => String(v).replace(" engine LoRA", "") }),
                         { indent: true, hint: "stack: on top of the engine LoRA. replace: base model + this LoRA only (step-distilled LoRAs)." }));
@@ -1360,6 +1490,10 @@ app.registerExtension({
             }
 
             function buildContinuity(wrap) {
+                if (!expert()) {
+                    if (W("chain_memory")) wrap.appendChild(uiRow("chain memory", bindSelect("chain_memory"), { hint: "Carries positions, contact, clothing and marks across a cut-away between chained clips. picture + context by default; off turns it off." }));
+                    return;
+                }
                 wrap.appendChild(uiRow("motion context frames", bindSelect("context_length"), { hint: "Video frames from the previous clip fed into the next one." }));
                 wrap.appendChild(uiRow("audio context frames", bindNumber("audio_context_length")));
                 wrap.appendChild(uiRow("identity continuity", bindToggle("identity_continuity"), { hint: "Use an empty picture slot for the previous clip's last frame." }));
@@ -1778,16 +1912,30 @@ app.registerExtension({
                 header.innerHTML = `
                     <div style="display: flex; align-items: center; gap: 10px;">
                         <span style="font-size: 15px; font-weight: 700; color: #9d8cff; letter-spacing: -0.2px;">🎬 MiniMax H3 Master</span>
-                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow \u00b7 dual sampling (legacy)" : isHyperflow() ? "HyperFlow 8-step (legacy)" : `${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : "Turbo"} \u00b7 ${isFlash() ? getW("hyperflow_flash_steps", 6) : getW("pdd_nfe", "6")} steps`} · 2-pass</span>
+                        <span style="background: #252538; color: #a5a5c5; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid #383852;">${isDualMode(getW("accel_mode", "")) ? "HyperFlow \u00b7 dual sampling (legacy)" : isHyperflow() ? "HyperFlow 8-step (legacy)" : `${isHandoff() ? "Pika \u2192 Flash" : isFlash() ? "HyperFlow Flash" : isPih3() ? "pi-H3" : "Turbo"} \u00b7 ${isFlash() ? getW("hyperflow_flash_steps", 6) : isPih3() ? getW("pih3_steps", 2) : getW("pdd_nfe", "6")} steps`} · 2-pass</span>
                         <button id="mode-toggle" title="Simple shows the eight decisions that matter; Expert shows every field." style="background: ${expert() ? "#4a3c22" : "#2b3a55"}; color: ${expert() ? "#e6c28f" : "#8fb0e6"}; border: 1px solid ${expert() ? "#6b5530" : "#3c5480"}; padding: 2px 9px; border-radius: 10px; font-size: 10.5px; font-weight: 600; cursor: pointer;">${expert() ? "Expert" : "Simple"}</button>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px;">
+                        <button id="cache-toggle" style="background: ${cacheOn() ? "#173a26" : "#252538"}; color: ${cacheOn() ? "#4ade80" : "#a5a5c5"}; border: 1px solid ${cacheOn() ? "#2e6a45" : "#383852"}; padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 600; cursor: ${nodeRunning ? "not-allowed" : "pointer"}; opacity: ${nodeRunning ? "0.5" : "1"};">Cache clips: ${cacheOn() ? "ON" : "OFF"}</button>
                         <span style="color: #9292ab; font-size: 11px; font-weight: 500;">
                             ${clipsState.length} Clips (${totalSec.toFixed(1)}s / ${totalFrames} frames)
                         </span>
                     </div>
                 `;
                 container.appendChild(header);
+                const cacheBtn = header.querySelector("#cache-toggle");
+                cacheBtn.disabled = nodeRunning;
+                cacheBtn.title = nodeRunning
+                    ? "Locked while this node is running: set it before queueing."
+                    : cacheOn()
+                        ? "ON: rendered clips are kept on disk and reused on the next run when the inputs match (validated clips, re-rolls). Click to turn off."
+                        : "OFF: every run renders every clip; nothing is kept or reused across runs. Click to keep and reuse rendered clips. Set it before queueing a run.";
+                cacheBtn.onclick = () => {
+                    if (nodeRunning) return;
+                    setW("cache_clips", !cacheOn(), { rerender: false });
+                    refreshCacheStatus();
+                    renderUI();
+                };
                 header.querySelector("#mode-toggle").onclick = () => {
                     ui.mode = expert() ? "simple" : "expert";
                     renderUI();
@@ -1817,7 +1965,8 @@ app.registerExtension({
 
                 // 3. Continuity (expert only) + Performance sit above the clips, so the
                 // clip cards are the last thing before the run bar.
-                if (expert()) container.appendChild(section("continuity", "Continuity", continuitySummary, buildContinuity));
+                // Continuity shows in Simple mode too, but then holds only the chain memory row (the rest stays Expert-only).
+                if (expert() || W("chain_memory")) container.appendChild(section("continuity", "Continuity", continuitySummary, buildContinuity));
                 container.appendChild(section("performance", "Performance", performanceSummary, buildPerformance));
                 container.appendChild(section("rewriter", "Prompt Rewriter", rewriterSummary, buildRewriter));
 
@@ -1906,10 +2055,30 @@ app.registerExtension({
                     copyAllBtn.onclick = async (e) => {
                         e.stopPropagation();
                         const text = packClips(clipsState);
-                        let ok = false;
-                        try { await copyText(text); ok = true; } catch (error) { /* clipboard blocked */ }
-                        copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy failed";
+                        const ok = await copyText(text);
+                        copyAllBtn.textContent = ok ? `✓ Copied ${clipsState.length}` : "Copy by hand";
+                        if (!ok) showCopyBox(text, `the ${clipsState.length} clips`);
                         setTimeout(() => { copyAllBtn.textContent = "⧉ Copy all"; }, 1500);
+                    };
+                    // Save every clip to a file on the ComfyUI machine (user/default/master_extender/clips.json), for lists too
+                    // big for a remote-desktop clipboard (Parsec carries at most ~100 KB). Fetch it elsewhere as plain JSON, e.g.
+                    // on a Mac: ssh <box> "type <ComfyUI>\user\default\master_extender\clips.json" | pbcopy
+                    const saveBtn = document.createElement("button");
+                    saveBtn.textContent = "Save clips";
+                    saveBtn.title = "Save every clip as JSON to user/default/master_extender/clips.json on the ComfyUI machine (overwrites the last save). Use it when the list is too big to copy through Parsec.";
+                    saveBtn.style.cssText = bulkStyle.replace("#2e6a45", "#3f3f58").replace("#4ade80", "#ddd");
+                    saveBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        const text = packClips(clipsState);
+                        let ok = false;
+                        try {
+                            const response = await api.fetchApi(`/userdata/${encodeURIComponent("master_extender/clips.json")}?overwrite=true`, {
+                                method: "POST", headers: { "Content-Type": "application/json" }, body: text,
+                            });
+                            ok = response.ok;
+                        } catch (error) { ok = false; }
+                        saveBtn.textContent = ok ? `✓ Saved ${clipsState.length} (${Math.round(text.length / 1024)} KB)` : "Save failed";
+                        setTimeout(() => { saveBtn.textContent = "Save clips"; }, 2500);
                     };
                     const pasteBtn = document.createElement("button");
                     pasteBtn.textContent = "Paste clips";
@@ -1920,7 +2089,7 @@ app.registerExtension({
                         const incoming = await askForClipsText();
                         if (incoming) pasteClips(incoming);
                     };
-                    actions.append(copyAllBtn, pasteBtn, clearRewritesBtn, validateAllBtn, invalidateAllBtn, clearBtn, addBtn);
+                    actions.append(copyAllBtn, saveBtn, pasteBtn, clearRewritesBtn, ...(cacheOn() ? [validateAllBtn, invalidateAllBtn] : []), clearBtn, addBtn);
                     container.appendChild(uiSectionHeader("Clips", { summary: `${clipsState.length} clip${clipsState.length === 1 ? "" : "s"} · ${totalSecClips.toFixed(0)} s`, collapsible: false, actions }));
                 }
                 container.appendChild(projectControls.references());
@@ -1948,7 +2117,7 @@ app.registerExtension({
                 `;
 
                 clipsState.forEach((clip, index) => {
-                    const isValidated = Boolean(clip.validated);
+                    const isValidated = cacheOn() && Boolean(clip.validated);
                     if (isValidated && !expandedValidated.has(clip.id)) {
                         const row = document.createElement("div");
                         row.className = "minimax-clip-card";
@@ -2004,10 +2173,10 @@ app.registerExtension({
                                 ${clip.prompt_rewritten ? `<span title="Rewritten by the built-in prompt rewriter${clip.rewrite_meta ? ` (${clip.rewrite_meta.model || ""}, ${clip.rewrite_meta.task || ""}${clip.rewrite_meta.thinking ? ", thinking" : ""}, ${clip.rewrite_meta.seconds || 0}s)` : ""}. It is not rewritten again; use 'Restore raw' in the prompt panel to redo it." style="background: #3a2e14; color: #fcd34d; padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 500;">✎ rewritten</span>` : ''}
                             </div>
                             <div style="display: flex; align-items: center; gap: 6px;">
-                                <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; color: ${isValidated ? "#4ade80" : "#aaa"}; font-size: 11px;">
+                                ${cacheOn() ? `<label style="display: flex; align-items: center; gap: 4px; cursor: pointer; color: ${isValidated ? "#4ade80" : "#aaa"}; font-size: 11px;">
                                     <input type="checkbox" class="val-check" ${isValidated ? "checked" : ""}>
                                     <span>Validated</span>
-                                </label>
+                                </label>` : ""}
                                 ${isValidated ? `<button class="fold-btn" title="Collapse this validated clip" style="background: transparent; border: none; color: #6b8f7a; cursor: pointer; font-size: 12px; padding: 0 2px;">▴</button>` : ''}
                                 ${clipsState.length > 1 ? `<button class="del-btn" title="Delete Clip" style="background: transparent; border: none; color: #ef4444; cursor: pointer; font-size: 14px; padding: 0 2px;">✕</button>` : ''}
                             </div>
@@ -2138,7 +2307,7 @@ app.registerExtension({
                     };
 
                     const valCheck = card.querySelector(".val-check");
-                    valCheck.onchange = () => {
+                    if (valCheck) valCheck.onchange = () => {
                         clip.validated = valCheck.checked;
                         expandedValidated.delete(clip.id);
                         saveState();
@@ -2361,12 +2530,26 @@ app.registerExtension({
                 }
             };
             api.addEventListener(EVENT_REWRITE, rewriteHandler);
+            // The cache toggle is locked while this node executes (backend reads cache_clips once at the start of the run).
+            const setRunning = (value) => { if (nodeRunning !== value) { nodeRunning = value; renderUI(); } };
+            const executingHandler = (event) => {
+                const detail = event.detail;
+                const id = detail && typeof detail === "object" ? detail.node : detail;
+                if (id == null) setRunning(false);
+                else setRunning(String(id) === String(node.id));
+            };
+            const idleHandler = () => setRunning(false);
+            const idleEvents = ["execution_success", "execution_error", "execution_interrupted"];
+            api.addEventListener("executing", executingHandler);
+            for (const name of idleEvents) api.addEventListener(name, idleHandler);
             const onRemoved = node.onRemoved;
             node.onRemoved = function () {
                 api.removeEventListener(EVENT_PROGRESS, progressHandler);
                 api.removeEventListener(EVENT_CLIPS, clipsHandler);
                 api.removeEventListener(EVENT_PLAN, planHandler);
                 api.removeEventListener(EVENT_REWRITE, rewriteHandler);
+                api.removeEventListener("executing", executingHandler);
+                for (const name of idleEvents) api.removeEventListener(name, idleHandler);
                 return onRemoved?.apply(this, arguments);
             };
         };
