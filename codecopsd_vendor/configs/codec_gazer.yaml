@@ -1,0 +1,104 @@
+# On-Policy Codec Distillation for Efficient All-in-One Video Generation (CodecOPSD).
+#
+# Authors: Boyang Wang, Kevin Blackburn-Matzen, Oindrila Saha, Matheus Gadelha, Zezhou Cheng
+#
+# Copyright (c) 2026 The CodecOPSD Authors. All rights reserved.
+#
+# Codec pruning is a contribution of this paper; please cite it if you use, modify, or port this code.
+
+# Codec gazer: which reference / condition tokens the CodecOPSD students are given (src/codecopsd/codec_gazer).
+# These are the settings the students were trained with (codec gazer 1.1.3); any change changes the masks.
+
+token_px: 32            # one token = 32 x 32 pixels in one token frame (MiniMax-H3: VAE stride 16 x patch 2)
+min_kept_tokens: 1      # an all-dropped mask keeps its first token
+
+encode:                 # x264 re-encode of the uint8 RGB frames
+  fps: 16
+  pix_fmt: yuv444p
+  x264_params: scenecut=0:bframes=0:ref=1:aq-mode=0   # after keyint = min-keyint = gop
+  threads: one per two 16-px macroblock rows          # x264's own choice on a machine with many CPUs, fixed for every machine
+
+decide:                 # per token: largest motion vector, mean |luma residual|; skipped macroblocks count as 0
+  motion_scale: sqrt(H * W / (480 * 640))   # the motion threshold is given at 480 x 640
+  residual_scale: sqrt(s0 / max(s0, min(H, W)))   # a form with residual_short_side s0: its residual threshold is
+                                                  # given at short side s0 and falls with the square root above it
+
+kinds:                  # the two forms a reference or condition is gazed in
+  video:                # videos (RGB references and condition videos)
+    preset: ultrafast
+    crf: 33
+    gop: 250
+    motion_px: 5.0      # keep when the largest motion reaches this
+    residual: 1.0       # or when the mean |residual| exceeds this
+    residual_short_side: null   # the residual threshold is the same at every size
+  image:                # pictures: one intra frame
+    preset: superfast
+    crf: 35
+    gop: 1
+    motion_px: 4.0
+    residual: 1.5
+    residual_short_side: 1024   # 1.5 is set at short side 1024 (2026-11-13): a larger picture uses
+                                # 1.5 x sqrt(1024 / short side) (1536: 1.22, 2048: 1.06); 1024 and below: 1.5
+
+# Per-condition settings: a condition named here is gazed with its form's settings above, these entries replacing
+# theirs (`keep_mask(condition, kind="motion_track")`). A condition not named here uses its form as is.
+# `<condition>.<mode>` is one drawing mode of a condition. The MiniMax-H3 students use only the plain `video` / `image`
+# settings; none of these entries apply to them.
+# Suggested settings (2026-11-12): motion_track 1.0 px (was 2.0), and human_pose / segmentation 3.5 px / 0.75 and
+# first_last_frame 4.0 px / 0.75 instead of the plain video 5.0 px / 1.0, so that slowly moving marks and slowly
+# changing given frames are kept more often. They come from a codec-only check (15 clips per condition at 480 x 832,
+# 124 frames; share of changed mark pixels inside kept tokens: motion tracks 73.5 -> 94.0 %, pose 96.0 -> 98.6 %,
+# segmentation 64.4 -> 69.8 %, first / last frames 82.2 -> 88.0 %); no released student was trained with them and
+# their effect on generation quality is not measured yet.
+conditions:
+  motion_track:                       # sparse point tracks: small markers that move a little
+    motion_px: 1.0
+    residual: 0.5
+  human_pose:                         # skeletons: thin lines that often move slowly (suggested, see above)
+    motion_px: 3.5
+    residual: 0.75
+  segmentation:                       # object masks, one flat colour per object (suggested); the box modes below keep theirs
+    motion_px: 3.5
+    residual: 0.75
+  first_last_frame:                   # given frames of a real video (suggested)
+    motion_px: 4.0
+    residual: 0.75
+  bbox:                               # layout boxes: flat shapes fixed by their corners, which move from 1 px / frame
+    motion_px: 1.0
+    residual: 0.1
+  segmentation.layout_bbox_filled:    # the same boxes drawn by the segmentation condition, filled
+    motion_px: 1.0
+    residual: 0.1
+  segmentation.layout_bbox_outline:   # ... or as outlines
+    motion_px: 1.0
+    residual: 0.1
+  degradation:                        # degraded real video (blur, low resolution): a finer motion search
+    preset: veryfast
+  interpolation:                      # given frames of a real video, grey in between
+    preset: veryfast
+  inpainting:                         # a real video with holes
+    preset: veryfast
+
+priority_drop:          # drop exactly a share of a video's tokens, lowest priority r * (1 + lam * m) first (r, m:
+                        # percentile ranks of residual / motion among all the video's tokens; ties: earlier token kept)
+  lam: 1.0
+  video_default: 0.70   # the default for video references: 70 % dropped at every resolution and length (MiniMax-H3)
+  select: max           # max: a video whose threshold decision already drops more than the share keeps that decision
+                        # (drop = max(threshold drop, share)); exact: always exactly the share
+
+vlm_drop:               # the student's text encoder reads only these vision tokens of its references
+  video: dit            # video: the transformer's own tokens (its priority-drop mask, reused); "threshold": the
+                        # threshold decision OR the transformer's mask
+  picture_threshold_scale: 0.25   # picture: the image thresholds x 0.25 (more kept than for the transformer) OR the
+                                  # transformer's mask (the short-side scaling applies as for the transformer);
+                                  # MiniMax-H3-Image too (its v2 LoRA file records 1.0; 0.25 stays closer to the
+                                  # teacher: LPIPS 0.184 -> 0.145 on 24 cases, 9 % more denoise time)
+
+elastic_drop:           # optional, RGB videos only (pictures keep the threshold decision): a video the thresholds keep
+                        # densely gives fewer tokens, by how much the thresholds alone drop (d)
+  max_drop: 0.85        # d >= 0.85: the threshold decision as is; the elastic drop never exceeds 0.85
+  min_drop: 0.50        # the elastic drop is at least 0.50 (and never below d)
+  static_drop: 0.50     # d >= 0.50 counts as static / low motion
+  keep_static: 0.50     # static: token frame 0's kept tokens + 50 % of the later frames' kept tokens
+  keep_moving: 0.75     # moving: token frame 0's kept tokens + 75 % of the later frames' kept tokens
+  lam: 1.0              # the later tokens by priority r * (1 + lam * m) (r, m: residual / motion percentile ranks)

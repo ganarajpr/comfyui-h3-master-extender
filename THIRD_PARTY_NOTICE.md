@@ -58,3 +58,12 @@ documentation. Original author references in the source are retained.
 
 The GPL-3.0 license text in LICENSE was copied from the local ComfyUI source
 distribution. The prior Apache-2.0 license text is retained under licenses/.
+
+## CodecOPSD codec gazer (reference-token pruning)
+
+codecopsd_vendor/ is the codec gazer from CodecOPSD (Boyang Wang et al., arXiv:2611.31184,
+https://github.com/Kiteretsu77/CodecOPSD), taken via the ComfyUI port
+aaalll12322/ComfyUI-MiniMaxH3-CodecPrune (MIT, da078fe) which vendors it with one Windows
+temp-file fix. Copyright (c) 2026 The CodecOPSD Authors; the file headers are kept. Used by
+codec_prune.py for the optional ref_codec_prune input. The H.264 reader binary
+(bin/codec_reader.exe) is built separately and is not part of this repository.

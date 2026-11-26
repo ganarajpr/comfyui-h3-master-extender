@@ -98,7 +98,7 @@ def _audio_refine_signature(steps, denoise, cache):
         return None
 
 
-def _clip_fingerprint(previous, clip, seed, audio_refine=None, single_te=False, pass2_audio_p1=False, chain_memory=False):
+def _clip_fingerprint(previous, clip, seed, audio_refine=None, single_te=False, pass2_audio_p1=False, chain_memory=False, ref_codec=None):
     """Fingerprint of clip i = its inputs + seed + everything before it. ``audio_refine`` (see
     _audio_refine_signature) is added only when on, so fingerprints of clips rendered without
     it are unchanged."""
@@ -111,6 +111,8 @@ def _clip_fingerprint(previous, clip, seed, audio_refine=None, single_te=False, 
         parts.append("pass2_audio_pass1")
     if chain_memory:
         parts.append("chain_memory_v1" if chain_memory is True else f"chain_memory_v1:{chain_memory}")
+    if ref_codec:
+        parts.append(["ref_codec", *ref_codec])
     blob = json.dumps(parts, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 

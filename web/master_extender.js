@@ -500,6 +500,10 @@ function repairDualWidgets(node, defaults) {
     if (pih3Steps) pih3Steps.value = pih3StepsValue(pih3Steps.value);
     const cacheClips = node.widgets?.find(x => x.name === "cache_clips");
     if (cacheClips) cacheClips.value = cacheClipsValue(cacheClips.value);
+    const refImageSize = node.widgets?.find(x => x.name === "ref_image_size");
+    if (refImageSize && !["match", "max"].includes(refImageSize.value)) refImageSize.value = "match";
+    const refCodecPrune = node.widgets?.find(x => x.name === "ref_codec_prune");
+    if (refCodecPrune) refCodecPrune.value = refCodecPrune.value === true;
     const pass2Engine = node.widgets?.find(x => x.name === "pass2_engine");
     if (pass2Engine) pass2Engine.value = pass2EngineValue(pass2Engine.value);
     const refineSteps = node.widgets?.find(x => x.name === "pih3_refine_steps");

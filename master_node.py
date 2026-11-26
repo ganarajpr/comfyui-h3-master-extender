@@ -614,6 +614,9 @@ class MiniMaxH3MasterExtender:
                 "diversity_steps": ("INT", {"default": 1, "min": 1, "max": 7, "step": 1, "tooltip": "How many of the first pass-1 steps run with the diversity LoRA on top of the turbo LoRA (clamped to the turbo step count - 1). 1 is the author's recipe: sigma 1.0 -> 0.973 of the 6-step Pika grid."}),
                 # --- Clip caching (appended after diversity_steps, before the time_gate_json socket) ---
                 "cache_clips": ("BOOLEAN", {"default": False, "label_on": "Cache clips: ON", "label_off": "Cache clips: OFF", "tooltip": "Cache clips: keep rendered clips on disk (output/MasterExtender_cache) and reuse them on the next run when the inputs match (validated clips, re-rolls, BUST). OFF (default): nothing is reused or kept across runs; the run chains through a scratch folder that is wiped at the start of every run. Read once when the run starts; set it before queueing."}),
+                # --- CodecOPSD reference pictures (appended after cache_clips, before the time_gate_json socket) ---
+                "ref_image_size": (["match", "max"], {"default": "match", "tooltip": "Size of the reference pictures. match (default): each picture is scaled down to the generation's pixel area, as the core node does. max: 2048 px short edge (never upscaled), far more reference tokens per picture, so slower and much heavier on VRAM unless ref_codec_prune is on. Part of the clip cache key when not match."}),
+                "ref_codec_prune": ("BOOLEAN", {"default": False, "tooltip": "CodecOPSD: drop the reference-picture tokens an H.264 codec predicts for free (flat and static regions). Kept tokens keep their original position, so the sequence just gets shorter. Pairs with ref_image_size max. Needs bin/codec_reader.exe next to the extender (the render errors out if it is missing). Off = the core behaviour, nothing patched. Part of the clip cache key when on."}),
                 "time_gate_json": ("STRING", {"default": "", "forceInput": True, "tooltip": "Per-frame time-gated LoRA on pass 1 only. Empty = off. {\"lora\": \"h3\\\\action\\\\X.safetensors\", \"other_tokens\": 1.0, \"clips\": {\"0\": [[start_s, end_s, strength], ...]}}: clip index (0-based, clips_json order), spans in that clip's own seconds (0 = first new frame), strength per span. Clips not listed render without the LoRA. other_tokens = the LoRA scale on text and reference tokens; motion-context tokens get 0."}),
                 # --- Clips from the H3 Shot Writer (appended last; a socket, so it adds no widget value) ---
                 "clips_in": ("STRING", {"forceInput": True, "lazy": True, "tooltip": "The H3 Shot Writer's clips output. Evaluated only when the clip list has no clip with a prompt: then every clip becomes a raw prompt (its shot list, not yet rewritten) with a fixed seed, and the planner (auto_clips) is skipped. With clips in the list it is ignored and the writer does not run. References, per-clip refs, the rewriter and rendering work as for typed clips."}),
@@ -1144,6 +1147,10 @@ class MiniMaxH3MasterExtender:
         # pass-2 text embedding and only its reference latents are re-encoded at the pass-1 size.
         single_te = True
         engine.single_text_encode = single_te
+        ref_image_size = kwargs.get("ref_image_size")
+        engine.ref_image_size = ref_image_size if ref_image_size in ("match", "max") else "match"
+        engine.ref_codec_prune = kwargs.get("ref_codec_prune") is True
+        ref_codec_key = [engine.ref_image_size, True] if engine.ref_codec_prune else ([engine.ref_image_size, False] if engine.ref_image_size != "match" else None)
         bridge = kwargs.get("semantic_bridge", "none")
         if bridge in SEMANTIC_BRIDGE_RETIRED:
             _LOG.info("Semantic bridge %s is retired; using %s", bridge, SEMANTIC_BRIDGE_RETIRED[bridge])
@@ -1184,6 +1191,9 @@ class MiniMaxH3MasterExtender:
             "single_te": bool(single_te),
             "refs": _media_digest([refs, ref_videos, ref_video_audios, ref_audios]),
         }
+        if engine.ref_image_size != "match" or engine.ref_codec_prune:
+            # Only when not the default, so every clip cached before these inputs existed keeps its fingerprint.
+            p1_settings["ref_codec"] = [engine.ref_image_size, bool(engine.ref_codec_prune)]
         if time_gate_cfg:
             # Only when set, so every pass-1 cache written without a time gate keeps its fingerprint.
             p1_settings["time_gate"] = hashlib.sha256(json.dumps(time_gate_cfg, sort_keys=True).encode()).hexdigest()[:16]
@@ -1273,7 +1283,7 @@ class MiniMaxH3MasterExtender:
             if is_on_disk and (is_validated or not rerolls):
                 try:
                     expected_fp = _clip_fingerprint(previous_fp, clip_cfg, clip_cfg.get("seed", 42), audio_refine, single_te, pass2_audio_p1,
-                                                    chain_memory=cm_mode if (chain_memory_on and i > 0) else False)
+                                                    chain_memory=cm_mode if (chain_memory_on and i > 0) else False, ref_codec=ref_codec_key)
                 except (TypeError, ValueError):
                     expected_fp = None
                 stored = _stored_fingerprints(data_path, manifest_path)
@@ -1374,7 +1384,7 @@ class MiniMaxH3MasterExtender:
                 seed_val = max(0, seed_val - 1)
                 clip_cfg["seed"] = seed_val
             clip_fp = _clip_fingerprint(previous_fp, clip_cfg, seed_val, audio_refine, single_te, pass2_audio_p1,
-                                        chain_memory=cm_mode if (chain_memory_on and i > 0) else False)
+                                        chain_memory=cm_mode if (chain_memory_on and i > 0) else False, ref_codec=ref_codec_key)
             clip_p1_fp = _pass1_fingerprint(previous_p1_fp, clip_cfg, seed_val, clip_p1_settings(i))
 
             # A pass-1 result rendered from exactly these pass-1 inputs is loaded instead of

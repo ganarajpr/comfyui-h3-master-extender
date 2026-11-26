@@ -36,6 +36,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 from . import chain_memory
+from . import codec_prune
 from . import x0_debug
 from . import time_gate_lora
 
@@ -1163,6 +1164,20 @@ class MasterEngine:
         self.semantic_bridge_alpha = float(alpha)
         self.semantic_bridge_match = str(magnitude_match or "per_token")
 
+    def _ref2va(self, *, width, height, length, ref_images=None, ref_videos=None, **kw):
+        """Core MiniMaxH3ReferenceToVideo with this render's ref_image_size; with ref_codec_prune the
+        reference blocks also carry codec keep masks (and the runtime patch is installed first)."""
+        size_mode = getattr(self, "ref_image_size", "match")
+        out = MiniMaxH3ReferenceToVideo.execute(width=width, height=height, length=length, ref_image_size=size_mode,
+                                                ref_images=ref_images, ref_videos=ref_videos, **kw)
+        if not getattr(self, "ref_codec_prune", False):
+            return out
+        codec_prune.ensure_reader()
+        codec_prune.install()
+        cond = codec_prune.attach_keep(_safe_get_output(out, 0, "positive"), ref_images, width, height, size_mode,
+                                       ref_videos=ref_videos, length=length)
+        return cond, _safe_get_output(out, 1, "latent")
+
     def _pass1_from_pass2(self, out_p2, ref_images, w1, h1, frame_count, clip_index):
         """Pass-1 conditioning + empty latent from the pass-2 encode: the text embedding is reused,
         only the image-reference latents are re-encoded at the pass-1 size, with the sizing
@@ -1181,14 +1196,24 @@ class MasterEngine:
             _LOG.info("Clip %d: single text encode unavailable (%d image blocks for %d reference images), using two encodes",
                       clip_index + 1, len(image_slots), len(images))
             return None
+        size_mode = getattr(self, "ref_image_size", "match")
+        prune = bool(getattr(self, "ref_codec_prune", False))
         for slot, img in zip(image_slots, images):
             h, w = img.shape[1], img.shape[2]
+            if size_mode == "max":
+                # "max" sizing does not depend on the generation size: the pass-2 block (keep mask included) is already right
+                continue
             scale = min(1.0, math.sqrt((w1 * h1) / (w * h)))
             tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
             th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
             resized = _resize(img[:1], tw, th, "disabled")
             blocks[slot] = {"kind": "image", "latent_h": th // 16, "latent_w": tw // 16,
                             "latent": self.vae.encode(resized)}
+            if prune:
+                keep = codec_prune.picture_keep(resized)
+                blocks[slot]["keep"] = keep
+                _LOG.info("[codecprune] pass-1 picture %dx%d: kept %d/%d tokens (%.1f%%)", tw, th,
+                          int(keep.sum()), keep.numel(), 100.0 * float(keep.float().mean()))
         cond_p1 = [[t.clone() if torch.is_tensor(t) else t, dict(d)] for t, d in cond]
         if blocks:
             cond_p1 = node_helpers.conditioning_set_values(cond_p1, {"minimax_refs": blocks})
@@ -2042,7 +2067,7 @@ class MasterEngine:
             # single encode runs at ``p1_text_size`` (the size a standard final would use) to give the
             # same pass-1 conditioning as a full render that is finalised at that size.
             enc_w, enc_h = (w2, h2) if pass2_enabled or not p1_text_size else p1_text_size
-            out_p2 = MiniMaxH3ReferenceToVideo.execute(
+            out_p2 = self._ref2va(
                 clip=self.clip,
                 vae=self.vae,
                 audio_vae=self.audio_vae,
@@ -2050,7 +2075,6 @@ class MasterEngine:
                 width=enc_w,
                 height=enc_h,
                 length=frame_count,
-                ref_image_size="match",
                 ref_images=ref_images,
                 ref_videos=ref_videos or None,
                 ref_video_audios=ref_video_audios or None,
@@ -2058,7 +2082,7 @@ class MasterEngine:
             )
             out_p1 = self._pass1_from_pass2(out_p2, ref_images, w1, h1, frame_count, clip_index)
         if out_p1 is None and not cached:
-            out_p1 = MiniMaxH3ReferenceToVideo.execute(
+            out_p1 = self._ref2va(
                 clip=self.clip,
                 vae=self.vae,
                 audio_vae=self.audio_vae,
@@ -2066,7 +2090,6 @@ class MasterEngine:
                 width=w1,
                 height=h1,
                 length=frame_count,
-                ref_image_size="match",
                 ref_images=ref_images,
                 ref_videos=ref_videos or None,
                 ref_video_audios=ref_video_audios or None,
@@ -2082,7 +2105,7 @@ class MasterEngine:
         # difference, not the references. Not bridged: the semantic bridge is tuned to a real prompt.
         neg_p1 = None
         if not cached and self.cfg_active:
-            out_neg = MiniMaxH3ReferenceToVideo.execute(
+            out_neg = self._ref2va(
                 clip=self.clip,
                 vae=self.vae,
                 audio_vae=self.audio_vae,
@@ -2090,7 +2113,6 @@ class MasterEngine:
                 width=w1,
                 height=h1,
                 length=frame_count,
-                ref_image_size="match",
                 ref_images=ref_images,
                 ref_videos=ref_videos or None,
                 ref_video_audios=ref_video_audios or None,
@@ -2131,7 +2153,7 @@ class MasterEngine:
         # UNet can stay resident straight through pass 1 -> upscale -> pass 2
         # and the text-encoder/UNet round trip per clip is halved.
         if pass2_enabled and out_p2 is None:
-            out_p2 = MiniMaxH3ReferenceToVideo.execute(
+            out_p2 = self._ref2va(
                 clip=self.clip,
                 vae=self.vae,
                 audio_vae=self.audio_vae,
@@ -2139,7 +2161,6 @@ class MasterEngine:
                 width=w2,
                 height=h2,
                 length=frame_count,
-                ref_image_size="match",
                 ref_images=ref_images,
                 ref_videos=ref_videos or None,
                 ref_video_audios=ref_video_audios or None,

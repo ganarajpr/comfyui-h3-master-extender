@@ -72,7 +72,7 @@ class Wiring(unittest.TestCase):
         names = re.findall(r'^\s{16}"(\w+)": \(', NODE_TEXT[NODE_TEXT.index("def INPUT_TYPES"):], re.M)
         i = names.index("diversity_lora")
         self.assertEqual(names[i - 1], "pih3_refine_tail")
-        self.assertEqual(names[i:i + 6], ["diversity_lora", "diversity_lora_strength", "diversity_steps", "cache_clips", "time_gate_json", "clips_in"])
+        self.assertEqual(names[i:i + 8], ["diversity_lora", "diversity_lora_strength", "diversity_steps", "cache_clips", "ref_image_size", "ref_codec_prune", "time_gate_json", "clips_in"])
 
     def test_defaults_are_off_at_the_node_level(self):
         self.assertRegex(NODE_TEXT, r'"diversity_lora": \(\["none"\] \+ folder_paths\.get_filename_list\("loras"\), \{"default": "none"')
